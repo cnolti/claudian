@@ -63,8 +63,9 @@
 }
 
 .claude-agent-message-assistant {
-  background: var(--background-secondary);
-  align-self: flex-start;
+  background: transparent;
+  align-self: flex-end;
+  max-width: 100%;
   border-bottom-left-radius: 4px;
 }
 
@@ -80,6 +81,8 @@
 /* Message content */
 .claude-agent-message-content {
   line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* Text blocks within message content */
@@ -258,6 +261,8 @@
   max-height: 300px;
   overflow-y: auto;
   color: var(--text-normal);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 
