@@ -28,19 +28,24 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
-  toolUse?: ToolUseInfo[];
+  toolCalls?: ToolCallInfo[];
 }
 
-export interface ToolUseInfo {
+// Enhanced tool call tracking with status and result
+export interface ToolCallInfo {
+  id: string;
   name: string;
   input: Record<string, unknown>;
+  status: 'running' | 'completed' | 'error';
+  result?: string;
+  isExpanded?: boolean;
 }
 
 // Stream chunk types from Claude Agent SDK
 export type StreamChunk =
   | { type: 'text'; content: string }
-  | { type: 'tool_use'; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; content: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; id: string; content: string; isError?: boolean }
   | { type: 'error'; content: string }
   | { type: 'blocked'; content: string }
   | { type: 'done' };

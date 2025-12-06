@@ -14,6 +14,28 @@ jest.mock('fs');
 // Now import after all mocks are set up
 import { ClaudeAgentService } from '../src/ClaudeAgentService';
 
+// Helper to create SDK-format assistant message with tool_use
+function createAssistantWithToolUse(toolName: string, toolInput: Record<string, unknown>, toolId = 'tool-123') {
+  return {
+    type: 'assistant',
+    message: {
+      content: [
+        { type: 'tool_use', id: toolId, name: toolName, input: toolInput },
+      ],
+    },
+  };
+}
+
+// Helper to create SDK-format user message with tool_result
+function createUserWithToolResult(content: string, parentToolUseId = 'tool-123') {
+  return {
+    type: 'user',
+    parent_tool_use_id: parentToolUseId,
+    tool_use_result: content,
+    message: { content: [] },
+  };
+}
+
 // Create a mock plugin
 function createMockPlugin(settings = {}) {
   return {
@@ -54,17 +76,11 @@ describe('ClaudeAgentService', () => {
 
   describe('shouldBlockCommand', () => {
     it('should block dangerous rm commands', async () => {
-      // Set up mock for fs.existsSync to find claude CLI
       (fs.existsSync as jest.Mock).mockReturnValue(true);
 
-      // Set up mock messages that include a dangerous bash command
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'rm -rf /' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'rm -rf /' }),
         { type: 'result' },
       ]);
 
@@ -73,7 +89,6 @@ describe('ClaudeAgentService', () => {
         chunks.push(chunk);
       }
 
-      // Should have a blocked chunk
       const blockedChunk = chunks.find((c) => c.type === 'blocked');
       expect(blockedChunk).toBeDefined();
       expect(blockedChunk?.content).toContain('rm -rf');
@@ -84,11 +99,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'chmod 777 /etc/passwd' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'chmod 777 /etc/passwd' }),
         { type: 'result' },
       ]);
 
@@ -107,11 +118,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'ls -la' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'ls -la' }),
         { type: 'result' },
       ]);
 
@@ -120,11 +127,9 @@ describe('ClaudeAgentService', () => {
         chunks.push(chunk);
       }
 
-      // Should NOT have a blocked chunk
       const blockedChunk = chunks.find((c) => c.type === 'blocked');
       expect(blockedChunk).toBeUndefined();
 
-      // Should have the tool_use chunk
       const toolUseChunk = chunks.find((c) => c.type === 'tool_use');
       expect(toolUseChunk).toBeDefined();
     });
@@ -137,11 +142,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'rm -rf /' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'rm -rf /' }),
         { type: 'result' },
       ]);
 
@@ -150,11 +151,9 @@ describe('ClaudeAgentService', () => {
         chunks.push(chunk);
       }
 
-      // Should NOT have a blocked chunk when blocklist is disabled
       const blockedChunk = chunks.find((c) => c.type === 'blocked');
       expect(blockedChunk).toBeUndefined();
 
-      // Should have the tool_use chunk
       const toolUseChunk = chunks.find((c) => c.type === 'tool_use');
       expect(toolUseChunk).toBeDefined();
     });
@@ -164,11 +163,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'mkfs.ext4 /dev/sda1' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'mkfs.ext4 /dev/sda1' }),
         { type: 'result' },
       ]);
 
@@ -187,11 +182,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'dd if=/dev/zero of=/dev/sda' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'dd if=/dev/zero of=/dev/sda' }),
         { type: 'result' },
       ]);
 
@@ -215,7 +206,6 @@ describe('ClaudeAgentService', () => {
         return p === expectedPath;
       });
 
-      // We need to trigger query to have it find the CLI
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
         { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello' }] } },
@@ -226,7 +216,6 @@ describe('ClaudeAgentService', () => {
         chunks.push(chunk);
       }
 
-      // Should not have error about CLI not found
       const errorChunk = chunks.find(
         (c) => c.type === 'error' && c.content.includes('Claude CLI not found')
       );
@@ -271,14 +260,10 @@ describe('ClaudeAgentService', () => {
       expect(textChunk?.content).toBe('This is a test response');
     });
 
-    it('should transform tool_use messages', async () => {
+    it('should transform tool_use from assistant message content', async () => {
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Read',
-          input: { file_path: '/test/file.txt' },
-        },
+        createAssistantWithToolUse('Read', { file_path: '/test/file.txt' }, 'read-tool-1'),
       ]);
 
       const chunks: any[] = [];
@@ -290,15 +275,14 @@ describe('ClaudeAgentService', () => {
       expect(toolUseChunk).toBeDefined();
       expect(toolUseChunk?.name).toBe('Read');
       expect(toolUseChunk?.input).toEqual({ file_path: '/test/file.txt' });
+      expect(toolUseChunk?.id).toBe('read-tool-1');
     });
 
-    it('should transform tool_result messages', async () => {
+    it('should transform tool_result from user message', async () => {
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_result',
-          content: 'File contents here',
-        },
+        createAssistantWithToolUse('Read', { file_path: '/test/file.txt' }, 'read-tool-1'),
+        createUserWithToolResult('File contents here', 'read-tool-1'),
       ]);
 
       const chunks: any[] = [];
@@ -309,6 +293,7 @@ describe('ClaudeAgentService', () => {
       const toolResultChunk = chunks.find((c) => c.type === 'tool_result');
       expect(toolResultChunk).toBeDefined();
       expect(toolResultChunk?.content).toBe('File contents here');
+      expect(toolResultChunk?.id).toBe('read-tool-1');
     });
 
     it('should transform error messages', async () => {
@@ -340,8 +325,6 @@ describe('ClaudeAgentService', () => {
         chunks.push(chunk);
       }
 
-      // The session ID should be captured internally
-      // We can verify this by checking if we get a valid response
       expect(chunks.some((c) => c.type === 'text')).toBe(true);
     });
 
@@ -370,6 +353,33 @@ describe('ClaudeAgentService', () => {
       const options = getLastOptions();
       expect(options?.resume).toBe('resume-session');
     });
+
+    it('should extract multiple content blocks from assistant message', async () => {
+      setMockMessages([
+        { type: 'system', subtype: 'init', session_id: 'test-session' },
+        {
+          type: 'assistant',
+          message: {
+            content: [
+              { type: 'text', text: 'Let me read that file.' },
+              { type: 'tool_use', id: 'tool-abc', name: 'Read', input: { file_path: '/foo.txt' } },
+            ],
+          },
+        },
+      ]);
+
+      const chunks: any[] = [];
+      for await (const chunk of service.query('read foo.txt')) {
+        chunks.push(chunk);
+      }
+
+      const textChunk = chunks.find((c) => c.type === 'text');
+      expect(textChunk?.content).toBe('Let me read that file.');
+
+      const toolUseChunk = chunks.find((c) => c.type === 'tool_use');
+      expect(toolUseChunk?.name).toBe('Read');
+      expect(toolUseChunk?.id).toBe('tool-abc');
+    });
   });
 
   describe('cancel', () => {
@@ -381,13 +391,9 @@ describe('ClaudeAgentService', () => {
         { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello' }] } },
       ]);
 
-      // Start a query
       const queryGenerator = service.query('hello');
-
-      // Get first chunk to start the query
       await queryGenerator.next();
 
-      // Cancel should not throw
       expect(() => service.cancel()).not.toThrow();
     });
 
@@ -402,8 +408,6 @@ describe('ClaudeAgentService', () => {
       ]);
 
       const generator = service.query('streaming');
-
-      // Prime the stream
       await generator.next();
 
       service.cancel();
@@ -419,7 +423,6 @@ describe('ClaudeAgentService', () => {
     });
 
     it('should handle cancel when no query is running', () => {
-      // Cancel when no query should not throw
       expect(() => service.cancel()).not.toThrow();
     });
   });
@@ -477,11 +480,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'rm   -rf /home' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'rm   -rf /home' }),
         { type: 'result' },
       ]);
 
@@ -504,11 +503,7 @@ describe('ClaudeAgentService', () => {
 
       setMockMessages([
         { type: 'system', subtype: 'init', session_id: 'test-session' },
-        {
-          type: 'tool_use',
-          name: 'Bash',
-          input: { command: 'something with [invalid regex inside' },
-        },
+        createAssistantWithToolUse('Bash', { command: 'something with [invalid regex inside' }),
         { type: 'result' },
       ]);
 

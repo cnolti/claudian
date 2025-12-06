@@ -8,6 +8,7 @@ An Obsidian plugin that embeds Claude Code as a sidebar chat interface. Your vau
 - **Full Claude Code capabilities**: Read, write, edit files, run bash commands
 - **Vault-aware**: Claude operates with your vault as the working directory
 - **Streaming responses**: See Claude's responses in real-time
+- **Tool call visualization**: Collapsible UI showing tool inputs and results (like Claude Code CLI)
 - **Session persistence**: Conversation context maintained within a session
 - **Safety blocklist**: Optionally block dangerous commands
 
@@ -50,8 +51,9 @@ npm run build
 ## Usage
 
 1. Click the bot icon in the ribbon (left sidebar) to open Claude Agent
-2. Type your message and press Cmd/Ctrl+Enter or click Send
+2. Type your message and press Enter to send (Shift+Enter for newline)
 3. Claude can read, write, and edit files in your vault
+4. Click on tool call headers to expand and see inputs/results
 
 ### Example prompts
 
@@ -82,11 +84,12 @@ npm run build
 
 ```
 src/
-├── main.ts              # Plugin entry point
-├── ClaudeAgentView.ts   # Sidebar chat UI
+├── main.ts               # Plugin entry point
+├── ClaudeAgentView.ts    # Sidebar chat UI with tool call display
 ├── ClaudeAgentService.ts # Claude Agent SDK wrapper
 ├── ClaudeAgentSettings.ts # Settings tab
-└── types.ts             # Type definitions
+├── systemPrompt.ts       # System prompt for Claude
+└── types.ts              # Type definitions
 ```
 
 ## Roadmap

@@ -100,17 +100,17 @@ export class ClaudeAgentService {
           break;
         }
 
-        const transformed = this.transformSDKMessage(message);
-        if (transformed) {
+        // transformSDKMessage now yields multiple chunks
+        for (const chunk of this.transformSDKMessage(message)) {
           // Check blocklist for bash commands
-          if (transformed.type === 'tool_use' && transformed.name === 'Bash') {
-            const command = (transformed as any).input?.command || '';
+          if (chunk.type === 'tool_use' && chunk.name === 'Bash') {
+            const command = chunk.input?.command as string || '';
             if (this.shouldBlockCommand(command)) {
               yield { type: 'blocked', content: `Blocked command: ${command}` };
               continue;
             }
           }
-          yield transformed;
+          yield chunk;
         }
       }
     } catch (error) {
@@ -123,8 +123,17 @@ export class ClaudeAgentService {
 
   /**
    * Transform SDK message to our StreamChunk format
+   * Returns an array since one SDK message can contain multiple chunks
+   * (e.g., assistant message with both text and tool_use blocks)
+   *
+   * SDK Message Types:
+   * - 'system' - init, status, etc.
+   * - 'assistant' - assistant response with content blocks (text, tool_use)
+   * - 'user' - user messages, includes tool_use_result for tool outputs
+   * - 'stream_event' - streaming deltas
+   * - 'result' - final result
    */
-  private transformSDKMessage(message: any): StreamChunk | null {
+  private *transformSDKMessage(message: any): Generator<StreamChunk> {
     switch (message.type) {
       case 'system':
         // Capture session ID from init message
@@ -132,48 +141,86 @@ export class ClaudeAgentService {
           this.sessionId = message.session_id;
         }
         // Don't yield system messages to the UI
-        return null;
+        break;
 
       case 'assistant':
-        // Extract text from content blocks
-        if (message.message?.content) {
-          const textBlocks = message.message.content
-            .filter((block: any) => block.type === 'text')
-            .map((block: any) => block.text)
-            .join('');
-          if (textBlocks) {
-            return { type: 'text', content: textBlocks };
+        // Extract ALL content blocks - both text and tool_use
+        if (message.message?.content && Array.isArray(message.message.content)) {
+          for (const block of message.message.content) {
+            if (block.type === 'text' && block.text) {
+              yield { type: 'text', content: block.text };
+            } else if (block.type === 'tool_use') {
+              yield {
+                type: 'tool_use',
+                id: block.id || `tool-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                name: block.name,
+                input: block.input || {},
+              };
+            }
           }
         }
         break;
 
-      case 'tool_use':
-        return {
-          type: 'tool_use',
-          name: message.name,
-          input: message.input || {},
-        };
+      case 'user':
+        // User messages can contain tool results
+        if (message.tool_use_result !== undefined && message.parent_tool_use_id) {
+          yield {
+            type: 'tool_result',
+            id: message.parent_tool_use_id,
+            content: typeof message.tool_use_result === 'string'
+              ? message.tool_use_result
+              : JSON.stringify(message.tool_use_result, null, 2),
+            isError: false,
+          };
+        }
+        // Also check message.message.content for tool_result blocks
+        if (message.message?.content && Array.isArray(message.message.content)) {
+          for (const block of message.message.content) {
+            if (block.type === 'tool_result') {
+              yield {
+                type: 'tool_result',
+                id: block.tool_use_id || message.parent_tool_use_id || '',
+                content: typeof block.content === 'string'
+                  ? block.content
+                  : JSON.stringify(block.content, null, 2),
+                isError: block.is_error || false,
+              };
+            }
+          }
+        }
+        break;
 
-      case 'tool_result':
-        return {
-          type: 'tool_result',
-          content: typeof message.content === 'string'
-            ? message.content
-            : JSON.stringify(message.content),
-        };
+      case 'stream_event':
+        // Handle streaming events for real-time updates
+        const event = message.event;
+        if (event?.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+          yield {
+            type: 'tool_use',
+            id: event.content_block.id || `tool-${Date.now()}`,
+            name: event.content_block.name,
+            input: event.content_block.input || {},
+          };
+        } else if (event?.type === 'content_block_start' && event.content_block?.type === 'text') {
+          if (event.content_block.text) {
+            yield { type: 'text', content: event.content_block.text };
+          }
+        } else if (event?.type === 'content_block_delta') {
+          if (event.delta?.type === 'text_delta' && event.delta.text) {
+            yield { type: 'text', content: event.delta.text };
+          }
+        }
+        break;
 
       case 'result':
-        // Skip - result is the terminal message
+        // Final result - no text to extract, result is a string summary
         break;
 
       case 'error':
         if (message.error) {
-          return { type: 'error', content: message.error };
+          yield { type: 'error', content: message.error };
         }
         break;
     }
-
-    return null;
   }
 
   /**
