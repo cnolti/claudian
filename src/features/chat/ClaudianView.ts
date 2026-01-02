@@ -260,7 +260,7 @@ export class ClaudianView extends ItemView {
         getExcludedTags: () => this.plugin.settings.excludedTags,
         onFileOpen: async () => {},
         onChipsChanged: () => this.renderer?.scrollToBottomIfNeeded(),
-        getContextPaths: () => this.plugin.settings.allowedContextPaths,
+        getContextPaths: () => this.contextPathSelector?.getContextPaths() || [],
       }
     );
     this.plugin.agentService.setFileEditTracker(this.fileContextManager);
@@ -314,7 +314,6 @@ export class ClaudianView extends ItemView {
         model: this.plugin.settings.model,
         thinkingBudget: this.plugin.settings.thinkingBudget,
         permissionMode: this.plugin.settings.permissionMode,
-        allowedContextPaths: this.plugin.settings.allowedContextPaths,
         lastNonPlanPermissionMode: this.plugin.settings.lastNonPlanPermissionMode,
       }),
       getEnvironmentVariables: () => this.plugin.getActiveEnvironmentVariables(),
@@ -366,12 +365,6 @@ export class ClaudianView extends ItemView {
 
         this.updatePlanModeUiState();
       },
-      onContextPathsChange: async (paths) => {
-        this.plugin.settings.allowedContextPaths = paths;
-        await this.plugin.saveSettings();
-        // Pre-scan newly added paths to warm the cache
-        this.fileContextManager?.preScanContextPaths();
-      },
     });
 
     this.modelSelector = toolbarComponents.modelSelector;
@@ -385,6 +378,11 @@ export class ClaudianView extends ItemView {
     this.mcpServerSelector.setMcpService(this.plugin.mcpService);
     this.fileContextManager.setOnMcpMentionChange((servers) => {
       this.mcpServerSelector?.addMentionedServers(servers);
+    });
+
+    // Wire context path changes to pre-scan files
+    this.contextPathSelector.setOnChange(() => {
+      this.fileContextManager?.preScanContextPaths();
     });
   }
 
@@ -429,6 +427,7 @@ export class ClaudianView extends ItemView {
         getFileContextManager: () => this.fileContextManager,
         getImageContextManager: () => this.imageContextManager,
         getMcpServerSelector: () => this.mcpServerSelector,
+        getContextPathSelector: () => this.contextPathSelector,
         clearQueuedMessage: () => this.inputController?.clearQueuedMessage(),
         getApprovedPlan: () => this.plugin.agentService.getApprovedPlanContent(),
         setApprovedPlan: (plan) => this.plugin.agentService.setApprovedPlanContent(plan),

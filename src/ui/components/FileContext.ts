@@ -15,8 +15,8 @@ import { MentionDropdownController } from './file-context/mention/MentionDropdow
 import { EditedFilesTracker } from './file-context/state/EditedFilesTracker';
 import { FileContextState } from './file-context/state/FileContextState';
 import { MarkdownFileCache } from './file-context/state/MarkdownFileCache';
-import { FileChipsView } from './file-context/view/FileChipsView';
 import { openFileFromChip } from './file-context/utils/FileOpener';
+import { FileChipsView } from './file-context/view/FileChipsView';
 
 /** Callbacks for file context interactions. */
 export interface FileContextCallbacks {

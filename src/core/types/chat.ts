@@ -66,6 +66,8 @@ export interface Conversation {
   sessionId: string | null;
   messages: ChatMessage[];
   attachedFiles?: string[];
+  /** Session-specific context paths (read-only external directories). Resets on new session. */
+  sessionContextPaths?: string[];
   /** Context window usage information. */
   usage?: UsageInfo;
   /** Approved implementation plan for this conversation. */

@@ -1,10 +1,7 @@
 import { ImageContextManager } from '@/ui/components/ImageContext';
 
-function createMockElement() {
-  return {
-    createDiv: jest.fn(() => createMockElement()),
-    createSpan: jest.fn(() => createMockElement()),
-    createEl: jest.fn(() => createMockElement()),
+function createMockElement(): any {
+  const el: any = {
     setText: jest.fn(),
     setAttribute: jest.fn(),
     addClass: jest.fn(),
@@ -13,7 +10,11 @@ function createMockElement() {
     querySelector: jest.fn(() => null),
     insertBefore: jest.fn(),
     style: {},
-  } as any;
+  };
+  el.createDiv = jest.fn(() => createMockElement());
+  el.createSpan = jest.fn(() => createMockElement());
+  el.createEl = jest.fn(() => createMockElement());
+  return el;
 }
 
 function createManager() {

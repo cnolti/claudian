@@ -529,7 +529,7 @@ export class ImageContextManager {
     let cleaned = token.trim();
     cleaned = cleaned.replace(/^["'`]+|["'`]+$/g, '');
     cleaned = cleaned.replace(/^!\[[^\]]*]\(/, '');
-    cleaned = cleaned.replace(/^[\[(<]+/, '');
+    cleaned = cleaned.replace(/^[[(<]+/, '');
     cleaned = cleaned.replace(/[)\],.;>]+$/g, '');
     return cleaned || null;
   }

@@ -49,7 +49,7 @@ export function createFileHashPreHook(
   return {
     matcher: 'Write|Edit|NotebookEdit',
     hooks: [
-      async (hookInput, toolUseId) => {
+      async (hookInput, toolUseId, _options) => {
         const input = hookInput as {
           tool_name: string;
           tool_input: Record<string, unknown>;
@@ -106,7 +106,7 @@ export function createFileHashPostHook(
   return {
     matcher: 'Write|Edit|NotebookEdit',
     hooks: [
-      async (hookInput, toolUseId) => {
+      async (hookInput, toolUseId, _options) => {
         const input = hookInput as {
           tool_name: string;
           tool_input: Record<string, unknown>;

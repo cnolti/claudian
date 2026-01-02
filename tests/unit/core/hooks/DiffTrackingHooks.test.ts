@@ -28,10 +28,15 @@ describe('DiffTrackingHooks path normalization', () => {
 
     await hook.hooks[0](
       {
+        hook_event_name: 'PreToolUse',
+        session_id: 'test-session',
+        transcript_path: '/tmp/transcript',
+        cwd: vaultPath,
         tool_name: 'Write',
         tool_input: { file_path: '~/notes/a.md' },
-      },
-      'tool-1'
+      } as any,
+      'tool-1',
+      { signal: new AbortController().signal }
     );
 
     expect(existsSpy).toHaveBeenCalledWith('/home/test/notes/a.md');
@@ -52,11 +57,16 @@ describe('DiffTrackingHooks path normalization', () => {
 
     await hook.hooks[0](
       {
+        hook_event_name: 'PostToolUse',
+        session_id: 'test-session',
+        transcript_path: '/tmp/transcript',
+        cwd: vaultPath,
         tool_name: 'Write',
         tool_input: { file_path: `$${envKey}/notes/a.md` },
         tool_result: { is_error: false },
-      },
-      'tool-2'
+      } as any,
+      'tool-2',
+      { signal: new AbortController().signal }
     );
 
     expect(existsSpy).toHaveBeenCalledWith('/tmp/claudian/notes/a.md');

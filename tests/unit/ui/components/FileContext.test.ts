@@ -16,7 +16,7 @@ jest.mock('obsidian', () => ({
 
 let mockVaultPath = '/vault';
 jest.mock('@/utils/path', () => {
-  const actual = jest.requireActual('@/utils/path') as typeof import('@/utils/path');
+  const actual = jest.requireActual('@/utils/path');
   return {
     ...actual,
     getVaultPath: jest.fn(() => mockVaultPath),

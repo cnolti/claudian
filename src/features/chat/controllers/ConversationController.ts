@@ -9,7 +9,7 @@ import { setIcon } from 'obsidian';
 
 import type { Conversation } from '../../../core/types';
 import type ClaudianPlugin from '../../../main';
-import type { FileContextManager, ImageContextManager, McpServerSelector } from '../../../ui';
+import type { ContextPathSelector, FileContextManager, ImageContextManager, McpServerSelector } from '../../../ui';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { AsyncSubagentManager } from '../services/AsyncSubagentManager';
 import type { TitleGenerationService } from '../services/TitleGenerationService';
@@ -36,6 +36,7 @@ export interface ConversationControllerDeps {
   getFileContextManager: () => FileContextManager | null;
   getImageContextManager: () => ImageContextManager | null;
   getMcpServerSelector: () => McpServerSelector | null;
+  getContextPathSelector: () => ContextPathSelector | null;
   clearQueuedMessage: () => void;
   /** Get current approved plan content from agent service. */
   getApprovedPlan: () => string | null;
@@ -113,6 +114,7 @@ export class ConversationController {
 
     this.deps.getImageContextManager()?.clearImages();
     this.deps.getMcpServerSelector()?.clearEnabled();
+    this.deps.getContextPathSelector()?.clearContextPaths();
     this.deps.clearQueuedMessage();
 
     this.callbacks.onNewConversation?.();
@@ -156,6 +158,14 @@ export class ConversationController {
       fileCtx?.setAttachedFiles(conversation.attachedFiles);
     } else if (isNewConversation || !hasMessages) {
       fileCtx?.autoAttachActiveFile();
+    }
+
+    // Restore session context paths (or clear for new conversation)
+    const contextPathSelector = this.deps.getContextPathSelector();
+    if (conversation.sessionContextPaths && conversation.sessionContextPaths.length > 0) {
+      contextPathSelector?.setContextPaths(conversation.sessionContextPaths);
+    } else {
+      contextPathSelector?.clearContextPaths();
     }
 
     const welcomeEl = renderer.renderMessages(
@@ -215,6 +225,17 @@ export class ConversationController {
       fileCtx?.setAttachedFiles(conversation.attachedFiles);
     }
 
+    // Restore session context paths (or clear if none)
+    const contextPathSelector = this.deps.getContextPathSelector();
+    if (conversation.sessionContextPaths && conversation.sessionContextPaths.length > 0) {
+      contextPathSelector?.setContextPaths(conversation.sessionContextPaths);
+    } else {
+      contextPathSelector?.clearContextPaths();
+    }
+
+    // Clear MCP server selections on session switch (session-only)
+    this.deps.getMcpServerSelector()?.clearEnabled();
+
     const welcomeEl = renderer.renderMessages(
       state.messages,
       () => this.getGreeting()
@@ -240,12 +261,15 @@ export class ConversationController {
     const sessionId = plugin.agentService.getSessionId();
     const fileCtx = this.deps.getFileContextManager();
     const attachedFiles = fileCtx ? Array.from(fileCtx.getAttachedFiles()) : [];
+    const contextPathSelector = this.deps.getContextPathSelector();
+    const sessionContextPaths = contextPathSelector?.getContextPaths() ?? [];
     const approvedPlan = this.deps.getApprovedPlan();
 
     const updates: Partial<Conversation> = {
       messages: state.getPersistedMessages(),
       sessionId: sessionId,
       attachedFiles: attachedFiles,
+      sessionContextPaths: sessionContextPaths.length > 0 ? sessionContextPaths : undefined,
       usage: state.usage ?? undefined,
       approvedPlan: approvedPlan ?? undefined,
       pendingPlanContent: state.pendingPlanContent ?? undefined,

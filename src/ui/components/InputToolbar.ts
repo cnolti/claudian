@@ -23,7 +23,6 @@ export interface ToolbarSettings {
   model: ClaudeModel;
   thinkingBudget: ThinkingBudget;
   permissionMode: PermissionMode;
-  allowedContextPaths: string[];
   lastNonPlanPermissionMode?: 'yolo' | 'normal';
 }
 
@@ -32,7 +31,6 @@ export interface ToolbarCallbacks {
   onModelChange: (model: ClaudeModel) => Promise<void>;
   onThinkingBudgetChange: (budget: ThinkingBudget) => Promise<void>;
   onPermissionModeChange: (mode: PermissionMode) => Promise<void>;
-  onContextPathsChange: (paths: string[]) => Promise<void>;
   getSettings: () => ToolbarSettings;
   getEnvironmentVariables?: () => string;
   /** Whether plan mode was initiated by the agent (EnterPlanMode tool). */
@@ -298,11 +296,38 @@ export class ContextPathSelector {
   private badgeEl: HTMLElement | null = null;
   private dropdownEl: HTMLElement | null = null;
   private callbacks: ToolbarCallbacks;
+  /** Session-specific context paths (resets on new conversation). */
+  private sessionContextPaths: string[] = [];
+  private onChangeCallback: ((paths: string[]) => void) | null = null;
 
   constructor(parentEl: HTMLElement, callbacks: ToolbarCallbacks) {
     this.callbacks = callbacks;
     this.container = parentEl.createDiv({ cls: 'claudian-context-path-selector' });
     this.render();
+  }
+
+  /** Set callback for when context paths change. */
+  setOnChange(callback: (paths: string[]) => void): void {
+    this.onChangeCallback = callback;
+  }
+
+  /** Get current session context paths. */
+  getContextPaths(): string[] {
+    return [...this.sessionContextPaths];
+  }
+
+  /** Set session context paths (for restoring from conversation). */
+  setContextPaths(paths: string[]): void {
+    this.sessionContextPaths = [...paths];
+    this.updateDisplay();
+    this.renderDropdown();
+  }
+
+  /** Clear session context paths (call on new conversation). */
+  clearContextPaths(): void {
+    this.sessionContextPaths = [];
+    this.updateDisplay();
+    this.renderDropdown();
   }
 
   private render() {
@@ -339,23 +364,22 @@ export class ContextPathSelector {
 
       if (!result.canceled && result.filePaths.length > 0) {
         const selectedPath = result.filePaths[0];
-        const paths = this.callbacks.getSettings().allowedContextPaths;
 
         // Check for duplicate
-        if (paths.includes(selectedPath)) {
+        if (this.sessionContextPaths.includes(selectedPath)) {
           return;
         }
 
         // Check for nested/overlapping paths
-        const conflict = findConflictingPath(selectedPath, paths);
+        const conflict = findConflictingPath(selectedPath, this.sessionContextPaths);
         if (conflict) {
           // Show warning notice
           this.showConflictNotice(selectedPath, conflict);
           return;
         }
 
-        const newPaths = [...paths, selectedPath];
-        await this.callbacks.onContextPathsChange(newPaths);
+        this.sessionContextPaths = [...this.sessionContextPaths, selectedPath];
+        this.onChangeCallback?.(this.sessionContextPaths);
         this.updateDisplay();
         this.renderDropdown();
       }
@@ -383,8 +407,6 @@ export class ContextPathSelector {
     if (!this.dropdownEl) return;
     this.dropdownEl.empty();
 
-    const paths = this.callbacks.getSettings().allowedContextPaths;
-
     // Header
     const headerEl = this.dropdownEl.createDiv({ cls: 'claudian-context-path-header' });
     headerEl.setText('Context Paths (Read-Only)');
@@ -392,11 +414,11 @@ export class ContextPathSelector {
     // Path list
     const listEl = this.dropdownEl.createDiv({ cls: 'claudian-context-path-list' });
 
-    if (paths.length === 0) {
+    if (this.sessionContextPaths.length === 0) {
       const emptyEl = listEl.createDiv({ cls: 'claudian-context-path-empty' });
       emptyEl.setText('Click folder icon to add');
     } else {
-      for (const pathStr of paths) {
+      for (const pathStr of this.sessionContextPaths) {
         const itemEl = listEl.createDiv({ cls: 'claudian-context-path-item' });
 
         const pathTextEl = itemEl.createSpan({ cls: 'claudian-context-path-text' });
@@ -408,10 +430,10 @@ export class ContextPathSelector {
         const removeBtn = itemEl.createSpan({ cls: 'claudian-context-path-remove' });
         setIcon(removeBtn, 'x');
         removeBtn.setAttribute('title', 'Remove path');
-        removeBtn.addEventListener('click', async (e) => {
+        removeBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          const newPaths = paths.filter(p => p !== pathStr);
-          await this.callbacks.onContextPathsChange(newPaths);
+          this.sessionContextPaths = this.sessionContextPaths.filter(p => p !== pathStr);
+          this.onChangeCallback?.(this.sessionContextPaths);
           this.updateDisplay();
           this.renderDropdown();
         });
@@ -446,8 +468,7 @@ export class ContextPathSelector {
   updateDisplay() {
     if (!this.iconEl || !this.badgeEl) return;
 
-    const paths = this.callbacks.getSettings().allowedContextPaths;
-    const count = paths.length;
+    const count = this.sessionContextPaths.length;
 
     if (count > 0) {
       this.iconEl.addClass('active');

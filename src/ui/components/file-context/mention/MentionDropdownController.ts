@@ -10,7 +10,7 @@ import { getFolderName, normalizePathForComparison } from '../../../../utils/con
 import { type ContextPathFile, contextPathScanner } from '../../../../utils/contextPathScanner';
 import { extractMcpMentions } from '../../../../utils/mcp';
 import { SelectableDropdown } from '../../SelectableDropdown';
-import { createContextPathEntry, type ContextPathEntry, type MentionItem } from './types';
+import { type ContextPathEntry, createContextPathEntry, type MentionItem } from './types';
 
 export interface MentionDropdownOptions {
   fixed?: boolean;

@@ -17,26 +17,31 @@ describe('contextPath utilities', () => {
       Object.defineProperty(process, 'platform', { value: originalPlatform });
     });
 
+    // eslint-disable-next-line jest/expect-expect
     it('should convert backslashes to forward slashes', () => {
       expectNormalized('C:\\Users\\test', 'C:/Users/test');
       expectNormalized('path\\to\\file', 'path/to/file');
     });
 
+    // eslint-disable-next-line jest/expect-expect
     it('should remove trailing slashes', () => {
       expectNormalized('/path/to/dir/', '/path/to/dir');
       expectNormalized('/path/to/dir///', '/path/to/dir');
     });
 
+    // eslint-disable-next-line jest/expect-expect
     it('should handle combined cases', () => {
       expectNormalized('C:\\Users\\test\\', 'C:/Users/test');
       expectNormalized('C:\\Users\\test\\subdir\\', 'C:/Users/test/subdir');
     });
 
+    // eslint-disable-next-line jest/expect-expect
     it('should handle paths without trailing slashes', () => {
       expectNormalized('/path/to/dir', '/path/to/dir');
       expectNormalized('C:/Users/test', 'C:/Users/test');
     });
 
+    // eslint-disable-next-line jest/expect-expect
     it('should handle Unix-style paths', () => {
       expectNormalized('/home/user/project', '/home/user/project');
       expectNormalized('/home/user/project/', '/home/user/project');
