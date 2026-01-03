@@ -415,4 +415,5 @@ All classes use `.claudian-` prefix. Key patterns:
 
 - Test Driven Development
 - Generated docs go in `dev/`, move docs to `dev/archive` before commit
+- Generated agents communication notes in `.agents/`, move notes to `.agents/archive` before commit
 - Run `npm run typecheck`, `npm run lint`, `npm run build`, `npm run test` after editing
