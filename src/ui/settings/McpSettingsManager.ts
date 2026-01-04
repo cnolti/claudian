@@ -142,10 +142,10 @@ export class McpSettingsManager {
     // Actions
     const actionsEl = itemEl.createDiv({ cls: 'claudian-mcp-actions' });
 
-    // Test connection button
+    // Verify button (shows tools)
     const testBtn = actionsEl.createEl('button', {
       cls: 'claudian-mcp-action-btn',
-      attr: { 'aria-label': 'Test connection' },
+      attr: { 'aria-label': 'Verify (show tools)' },
     });
     setIcon(testBtn, 'zap');
     testBtn.addEventListener('click', () => this.testServer(server));
@@ -176,15 +176,76 @@ export class McpSettingsManager {
   }
 
   private async testServer(server: ClaudianMcpServer) {
-    const modal = new McpTestModal(this.plugin.app, server.name);
+    const modal = new McpTestModal(
+      this.plugin.app,
+      server.name,
+      server.disabledTools,
+      async (toolName, enabled) => {
+        await this.updateDisabledTool(server, toolName, enabled);
+      },
+      async (disabledTools) => {
+        await this.updateAllDisabledTools(server, disabledTools);
+      }
+    );
     modal.open();
 
     try {
       const result = await testMcpServer(server);
       modal.setResult(result);
     } catch (error) {
-      modal.setError(error instanceof Error ? error.message : 'Test failed');
+      modal.setError(error instanceof Error ? error.message : 'Verification failed');
     }
+  }
+
+  /**
+   * Helper to update server.disabledTools with save and reload.
+   * Rolls back on save failure; warns on reload failure (since save succeeded).
+   */
+  private async updateServerDisabledTools(
+    server: ClaudianMcpServer,
+    newDisabledTools: string[] | undefined
+  ): Promise<void> {
+    const previous = server.disabledTools ? [...server.disabledTools] : undefined;
+    server.disabledTools = newDisabledTools;
+
+    try {
+      await this.plugin.storage.mcp.save(this.servers);
+    } catch (error) {
+      server.disabledTools = previous;
+      throw error;
+    }
+
+    try {
+      await this.plugin.agentService.reloadMcpServers();
+    } catch (error) {
+      // Save succeeded but reload failed - don't rollback since disk has correct state
+      console.warn('[Claudian] MCP reload failed after save:', error);
+      new Notice('Setting saved but reload failed. Changes will apply on next session.');
+    }
+  }
+
+  private async updateDisabledTool(
+    server: ClaudianMcpServer,
+    toolName: string,
+    enabled: boolean
+  ) {
+    const disabledTools = new Set(server.disabledTools ?? []);
+    if (enabled) {
+      disabledTools.delete(toolName);
+    } else {
+      disabledTools.add(toolName);
+    }
+    await this.updateServerDisabledTools(
+      server,
+      disabledTools.size > 0 ? Array.from(disabledTools) : undefined
+    );
+  }
+
+  private async updateAllDisabledTools(server: ClaudianMcpServer, disabledTools: string[]) {
+    await this.updateServerDisabledTools(
+      server,
+      disabledTools.length > 0 ? disabledTools : undefined
+    );
   }
 
   private getServerPreview(server: ClaudianMcpServer, type: McpServerType): string {
