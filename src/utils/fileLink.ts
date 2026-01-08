@@ -18,7 +18,12 @@ import type { App, Component } from 'obsidian';
  *
  * Does NOT match image embeds ![[image.png]] (those are handled separately).
  */
-const WIKILINK_PATTERN = /(?<!!)\[\[([^\]|#^]+)(?:#[^\]|]+)?(?:\^[^\]|]+)?(?:\|[^\]]+)?\]\]/g;
+const WIKILINK_PATTERN_SOURCE = '(?<!!)\\[\\[([^\\]|#^]+)(?:#[^\\]|]+)?(?:\\^[^\\]|]+)?(?:\\|[^\\]]+)?\\]\\]';
+
+/** Creates a fresh regex instance to avoid global state issues */
+function createWikilinkPattern(): RegExp {
+  return new RegExp(WIKILINK_PATTERN_SOURCE, 'g');
+}
 
 interface WikilinkMatch {
   index: number;
@@ -39,11 +44,12 @@ export function extractLinkTarget(fullMatch: string): string {
  * Sorted by index descending for end-to-start processing.
  */
 function findWikilinks(app: App, text: string): WikilinkMatch[] {
-  WIKILINK_PATTERN.lastIndex = 0;
+  // Create fresh regex instance to avoid global state mutation issues
+  const pattern = createWikilinkPattern();
   const matches: WikilinkMatch[] = [];
 
   let match: RegExpExecArray | null;
-  while ((match = WIKILINK_PATTERN.exec(text)) !== null) {
+  while ((match = pattern.exec(text)) !== null) {
     const fullMatch = match[0];
     const linkPath = match[1];
     const linkTarget = extractLinkTarget(fullMatch);

@@ -215,16 +215,16 @@ export class StreamController {
           renderToolCall(state.currentContentEl, toolCall, state.toolCallElements);
         }
       }
-    } else {
+    } else if (state.currentContentEl) {
       msg.contentBlocks = msg.contentBlocks || [];
       msg.contentBlocks.push({ type: 'tool_use', toolId: chunk.id });
 
       if (isWriteEditTool(chunk.name)) {
-        const writeEditState = createWriteEditBlock(state.currentContentEl!, toolCall);
+        const writeEditState = createWriteEditBlock(state.currentContentEl, toolCall);
         state.writeEditStates.set(chunk.id, writeEditState);
         state.toolCallElements.set(chunk.id, writeEditState.wrapperEl);
       } else {
-        renderToolCall(state.currentContentEl!, toolCall, state.toolCallElements);
+        renderToolCall(state.currentContentEl, toolCall, state.toolCallElements);
       }
     }
 

@@ -10,7 +10,7 @@ import { MarkdownRenderer } from 'obsidian';
 
 import { getImageAttachmentDataUri } from '../../../core/images/imageLoader';
 import { isWriteEditTool, TOOL_TODO_WRITE } from '../../../core/tools/toolNames';
-import type { ChatMessage, ImageAttachment } from '../../../core/types';
+import type { ChatMessage, ImageAttachment, ToolCallInfo } from '../../../core/types';
 import {
   renderStoredAsyncSubagent,
   renderStoredSubagent,
@@ -210,14 +210,14 @@ export class MessageRenderer {
    * Renders a tool call with special handling for Write/Edit.
    * TodoWrite is not rendered inline - it only shows in the bottom panel.
    */
-  private renderToolCall(contentEl: HTMLElement, toolCall: { id: string; name: string; input: Record<string, unknown>; status?: string; result?: string }): void {
+  private renderToolCall(contentEl: HTMLElement, toolCall: ToolCallInfo): void {
     if (toolCall.name === TOOL_TODO_WRITE) {
       // TodoWrite is not rendered inline - only in bottom panel
       return;
     } else if (isWriteEditTool(toolCall.name)) {
-      renderStoredWriteEdit(contentEl, toolCall as any);
+      renderStoredWriteEdit(contentEl, toolCall);
     } else {
-      renderStoredToolCall(contentEl, toolCall as any);
+      renderStoredToolCall(contentEl, toolCall);
     }
   }
 

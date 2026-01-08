@@ -494,12 +494,14 @@ export class ExternalContextSelector {
       const normalizedHome = normalize(homeDir);
       const compareFull = process.platform === 'win32'
         ? normalizedFull.toLowerCase()
-        : normalizedFull;
+        : normalizedHome;
       const compareHome = process.platform === 'win32'
         ? normalizedHome.toLowerCase()
         : normalizedHome;
       if (compareFull.startsWith(compareHome)) {
-        return '~' + fullPath.slice(homeDir.length);
+        // Use normalized path length and normalize the result for consistent display
+        const remainder = normalizedFull.slice(normalizedHome.length);
+        return '~' + remainder;
       }
     } catch (error) {
       // Log for debugging but don't disrupt UX

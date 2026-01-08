@@ -377,7 +377,9 @@ async function testHttpServer(server: ClaudianMcpServer): Promise<McpTestResult>
           method: 'notifications/initialized',
         });
         // Fire and forget - some servers may not support it
-        httpRequest(url, headers, initializedNotification).catch(() => {});
+        httpRequest(url, headers, initializedNotification).catch((err) => {
+          console.debug('[McpTester] Initialized notification failed (expected for some servers):', err);
+        });
 
         // Step 3: Request tools list
         const toolsRequest = JSON.stringify({
@@ -497,7 +499,9 @@ async function testSseServer(server: ClaudianMcpServer): Promise<McpTestResult> 
           }
         }
       }
-    }).catch(() => {});
+    }).catch((err) => {
+      console.debug('[McpTester] SSE stream error (may be expected on abort):', err);
+    });
 
     let endpointTimeout: NodeJS.Timeout | null = null;
     const endpointTimeoutPromise = new Promise<URL>((_, reject) => {
@@ -524,10 +528,14 @@ async function testSseServer(server: ClaudianMcpServer): Promise<McpTestResult> 
     };
 
     const initResponsePromise = waitForRpcResponse(pending, 1, 8000);
-    initResponsePromise.catch(() => {});
+    initResponsePromise.catch((err) => {
+      console.debug('[McpTester] Init response promise rejected (may be expected):', err);
+    });
     const initPost = await postJsonRpc(postUrl, config.headers ?? {}, initRequest, postOptions);
     if (initPost.status >= 400) {
-      initResponsePromise.catch(() => {});
+      initResponsePromise.catch((err) => {
+        console.debug('[McpTester] Init response cleanup after HTTP error:', err);
+      });
       clearTimeout(timeout);
       controller.abort();
       return {
@@ -560,11 +568,15 @@ async function testSseServer(server: ClaudianMcpServer): Promise<McpTestResult> 
     await postJsonRpc(postUrl, config.headers ?? {}, {
       jsonrpc: '2.0',
       method: 'notifications/initialized',
-    }, postOptions).catch(() => {});
+    }, postOptions).catch((err) => {
+      console.debug('[McpTester] Initialized notification failed (expected for some servers):', err);
+    });
 
     // Request tools list
     const toolsResponsePromise = waitForRpcResponse(pending, 2, 8000);
-    toolsResponsePromise.catch(() => {});
+    toolsResponsePromise.catch((err) => {
+      console.debug('[McpTester] Tools response promise rejected (may be expected):', err);
+    });
     await postJsonRpc(postUrl, config.headers ?? {}, {
       jsonrpc: '2.0',
       id: 2,

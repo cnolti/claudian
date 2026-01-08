@@ -167,19 +167,3 @@ export function getLocaleDisplayName(locale: Locale): string {
 export function isValidLocale(locale: string): locale is Locale {
   return (translations as Record<string, any>)[locale] !== undefined;
 }
-
-/**
- * Load translations from external JSON files (for future extensibility)
- * This allows adding new languages without recompiling
- */
-export async function loadExternalTranslations(locale: Locale, path: string): Promise<boolean> {
-  try {
-    // In Obsidian plugin context, we'd use the app.vault.read()
-    // For now, this is a placeholder for future extension
-    console.log(`[i18n] External translation loading not yet implemented for ${locale}`);
-    return false;
-  } catch (error) {
-    console.error(`[i18n] Failed to load external translations for ${locale}:`, error);
-    return false;
-  }
-}

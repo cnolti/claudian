@@ -343,7 +343,11 @@ export class ConversationController {
       if (!isCurrent) {
         content.addEventListener('click', async (e) => {
           e.stopPropagation();
-          await this.switchTo(conv.id);
+          try {
+            await this.switchTo(conv.id);
+          } catch (error) {
+            console.error('[ConversationController] Failed to switch conversation:', error);
+          }
         });
       }
 
@@ -382,11 +386,15 @@ export class ConversationController {
       deleteBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (state.isStreaming) return;
-        await plugin.deleteConversation(conv.id);
-        this.updateHistoryDropdown();
+        try {
+          await plugin.deleteConversation(conv.id);
+          this.updateHistoryDropdown();
 
-        if (conv.id === state.currentConversationId) {
-          await this.loadActive();
+          if (conv.id === state.currentConversationId) {
+            await this.loadActive();
+          }
+        } catch (error) {
+          console.error('[ConversationController] Failed to delete conversation:', error);
         }
       });
     }
@@ -407,9 +415,13 @@ export class ConversationController {
     input.select();
 
     const finishRename = async () => {
-      const newTitle = input.value.trim() || currentTitle;
-      await this.deps.plugin.renameConversation(convId, newTitle);
-      this.updateHistoryDropdown();
+      try {
+        const newTitle = input.value.trim() || currentTitle;
+        await this.deps.plugin.renameConversation(convId, newTitle);
+        this.updateHistoryDropdown();
+      } catch (error) {
+        console.error('[ConversationController] Failed to rename conversation:', error);
+      }
     };
 
     input.addEventListener('blur', finishRename);
