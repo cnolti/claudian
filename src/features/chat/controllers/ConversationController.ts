@@ -407,14 +407,31 @@ export class ConversationController {
     const dropdown = this.deps.getHistoryDropdown();
     if (!dropdown) return;
 
+    this.renderHistoryItems(dropdown, {
+      onSelectConversation: (id) => this.switchTo(id),
+      onRerender: () => this.updateHistoryDropdown(),
+    });
+  }
+
+  /**
+   * Renders history dropdown items to a container.
+   * Shared implementation for updateHistoryDropdown() and renderHistoryDropdown().
+   */
+  private renderHistoryItems(
+    container: HTMLElement,
+    options: {
+      onSelectConversation: (id: string) => Promise<void>;
+      onRerender: () => void;
+    }
+  ): void {
     const { plugin, state } = this.deps;
 
-    dropdown.empty();
+    container.empty();
 
-    const dropdownHeader = dropdown.createDiv({ cls: 'claudian-history-header' });
+    const dropdownHeader = container.createDiv({ cls: 'claudian-history-header' });
     dropdownHeader.createSpan({ text: 'Conversations' });
 
-    const list = dropdown.createDiv({ cls: 'claudian-history-list' });
+    const list = container.createDiv({ cls: 'claudian-history-list' });
     const allConversations = plugin.getConversationList();
 
     if (allConversations.length === 0) {
@@ -448,9 +465,9 @@ export class ConversationController {
         content.addEventListener('click', async (e) => {
           e.stopPropagation();
           try {
-            await this.switchTo(conv.id);
+            await options.onSelectConversation(conv.id);
           } catch (error) {
-            console.error('[ConversationController] Failed to switch conversation:', error);
+            console.error('[ConversationController] Failed to select conversation:', error);
           }
         });
       }
@@ -492,7 +509,7 @@ export class ConversationController {
         if (state.isStreaming) return;
         try {
           await plugin.deleteConversation(conv.id);
-          this.updateHistoryDropdown();
+          options.onRerender();
 
           if (conv.id === state.currentConversationId) {
             await this.loadActive();
@@ -551,65 +568,43 @@ export class ConversationController {
     const day = now.getDay(); // 0 = Sunday, 6 = Saturday
     const name = this.deps.plugin.settings.userName?.trim();
 
-    // Day-specific greetings
-    const dayGreetings: Record<number, string[]> = name
-      ? {
-        0: [`Happy Sunday, ${name}`, 'Sunday session?', 'Welcome to the weekend'],
-        1: [`Happy Monday, ${name}`, `Back at it, ${name}`],
-        2: [`Happy Tuesday, ${name}`],
-        3: [`Happy Wednesday, ${name}`],
-        4: [`Happy Thursday, ${name}`],
-        5: [`Happy Friday, ${name}`, `That Friday feeling, ${name}`],
-        6: [`Happy Saturday, ${name}`, `Welcome to the weekend, ${name}`],
-      }
-      : {
-        0: ['Happy Sunday', 'Sunday session?', 'Welcome to the weekend'],
-        1: ['Happy Monday', 'Back at it!'],
-        2: ['Happy Tuesday'],
-        3: ['Happy Wednesday'],
-        4: ['Happy Thursday'],
-        5: ['Happy Friday', 'That Friday feeling'],
-        6: ['Happy Saturday!', 'Welcome to the weekend'],
-      };
+    // Helper to optionally personalize a greeting (with fallback for no-name case)
+    const personalize = (base: string, noNameFallback?: string): string =>
+      name ? `${base}, ${name}` : (noNameFallback ?? base);
+
+    // Day-specific greetings (some personalized, some universal)
+    const dayGreetings: Record<number, string[]> = {
+      0: [personalize('Happy Sunday'), 'Sunday session?', 'Welcome to the weekend'],
+      1: [personalize('Happy Monday'), personalize('Back at it', 'Back at it!')],
+      2: [personalize('Happy Tuesday')],
+      3: [personalize('Happy Wednesday')],
+      4: [personalize('Happy Thursday')],
+      5: [personalize('Happy Friday'), personalize('That Friday feeling')],
+      6: [personalize('Happy Saturday', 'Happy Saturday!'), personalize('Welcome to the weekend')],
+    };
 
     // Time-specific greetings
     const getTimeGreetings = (): string[] => {
       if (hour >= 5 && hour < 12) {
-        return name
-          ? [`Good morning, ${name}`, 'Coffee and Claudian time?']
-          : ['Good morning', 'Coffee and Claudian time?'];
+        return [personalize('Good morning'), 'Coffee and Claudian time?'];
       } else if (hour >= 12 && hour < 18) {
-        return name
-          ? [`Good afternoon, ${name}`, `Hey there, ${name}`, `How's it going, ${name}?`]
-          : ['Good afternoon', 'Hey there', "How's it going?"];
+        return [personalize('Good afternoon'), personalize('Hey there'), personalize("How's it going") + '?'];
       } else if (hour >= 18 && hour < 22) {
-        return name
-          ? [`Good evening, ${name}`, `Evening, ${name}`, `How was your day, ${name}?`]
-          : ['Good evening', 'Evening', "How was your day?"];
+        return [personalize('Good evening'), personalize('Evening'), personalize('How was your day') + '?'];
       } else {
-        return name
-          ? ['Hello, night owl', `Evening, ${name}`]
-          : ['Hello, night owl', 'Evening'];
+        return ['Hello, night owl', personalize('Evening')];
       }
     };
 
     // General greetings
-    const generalGreetings = name
-      ? [
-        `Hey there, ${name}`,
-        `Hi ${name}, how are you?`,
-        `How's it going, ${name}?`,
-        `Welcome back, ${name}!`,
-        `What's new, ${name}?`,
-        `${name} returns!`,
-      ]
-      : [
-        'Hey there',
-        'Hi, how are you?',
-        "How's it going?",
-        'Welcome back!',
-        "What's new?",
-      ];
+    const generalGreetings = [
+      personalize('Hey there'),
+      name ? `Hi ${name}, how are you?` : 'Hi, how are you?',
+      personalize("How's it going") + '?',
+      personalize('Welcome back') + '!',
+      personalize("What's new") + '?',
+      ...(name ? [`${name} returns!`] : []),
+    ];
 
     // Combine day + time + general greetings, pick randomly
     const allGreetings = [
@@ -751,100 +746,9 @@ export class ConversationController {
     container: HTMLElement,
     options: { onSelectConversation: (id: string) => Promise<void> }
   ): void {
-    const { plugin, state } = this.deps;
-
-    container.empty();
-
-    const dropdownHeader = container.createDiv({ cls: 'claudian-history-header' });
-    dropdownHeader.createSpan({ text: 'Conversations' });
-
-    const list = container.createDiv({ cls: 'claudian-history-list' });
-    const allConversations = plugin.getConversationList();
-
-    if (allConversations.length === 0) {
-      list.createDiv({ cls: 'claudian-history-empty', text: 'No conversations' });
-      return;
-    }
-
-    // Sort by lastResponseAt (fallback to createdAt) descending
-    const conversations = [...allConversations].sort((a, b) => {
-      return (b.lastResponseAt ?? b.createdAt) - (a.lastResponseAt ?? a.createdAt);
+    this.renderHistoryItems(container, {
+      onSelectConversation: options.onSelectConversation,
+      onRerender: () => this.renderHistoryDropdown(container, options),
     });
-
-    for (const conv of conversations) {
-      const isCurrent = conv.id === state.currentConversationId;
-      const item = list.createDiv({
-        cls: `claudian-history-item${isCurrent ? ' active' : ''}`,
-      });
-
-      const iconEl = item.createDiv({ cls: 'claudian-history-item-icon' });
-      setIcon(iconEl, isCurrent ? 'message-square-dot' : 'message-square');
-
-      const content = item.createDiv({ cls: 'claudian-history-item-content' });
-      const titleEl = content.createDiv({ cls: 'claudian-history-item-title', text: conv.title });
-      titleEl.setAttribute('title', conv.title);
-      content.createDiv({
-        cls: 'claudian-history-item-date',
-        text: isCurrent ? 'Current session' : this.formatDate(conv.lastResponseAt ?? conv.createdAt),
-      });
-
-      if (!isCurrent) {
-        content.addEventListener('click', async (e) => {
-          e.stopPropagation();
-          try {
-            await options.onSelectConversation(conv.id);
-          } catch (error) {
-            console.error('[ConversationController] Failed to select conversation:', error);
-          }
-        });
-      }
-
-      const actions = item.createDiv({ cls: 'claudian-history-item-actions' });
-
-      // Show regenerate button if title generation failed, or loading indicator if pending
-      if (conv.titleGenerationStatus === 'pending') {
-        const loadingEl = actions.createEl('span', { cls: 'claudian-action-btn claudian-action-loading' });
-        setIcon(loadingEl, 'loader-2');
-        loadingEl.setAttribute('aria-label', 'Generating title...');
-      } else if (conv.titleGenerationStatus === 'failed') {
-        const regenerateBtn = actions.createEl('button', { cls: 'claudian-action-btn' });
-        setIcon(regenerateBtn, 'refresh-cw');
-        regenerateBtn.setAttribute('aria-label', 'Regenerate title');
-        regenerateBtn.addEventListener('click', async (e) => {
-          e.stopPropagation();
-          try {
-            await this.regenerateTitle(conv.id);
-          } catch (error) {
-            console.error('[ConversationController] Failed to regenerate title:', error);
-          }
-        });
-      }
-
-      const renameBtn = actions.createEl('button', { cls: 'claudian-action-btn' });
-      setIcon(renameBtn, 'pencil');
-      renameBtn.setAttribute('aria-label', 'Rename');
-      renameBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        this.showRenameInput(item, conv.id, conv.title);
-      });
-
-      const deleteBtn = actions.createEl('button', { cls: 'claudian-action-btn claudian-delete-btn' });
-      setIcon(deleteBtn, 'trash-2');
-      deleteBtn.setAttribute('aria-label', 'Delete');
-      deleteBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (state.isStreaming) return;
-        try {
-          await plugin.deleteConversation(conv.id);
-          this.renderHistoryDropdown(container, options); // Re-render after delete
-
-          if (conv.id === state.currentConversationId) {
-            await this.loadActive();
-          }
-        } catch (error) {
-          console.error('[ConversationController] Failed to delete conversation:', error);
-        }
-      });
-    }
   }
 }

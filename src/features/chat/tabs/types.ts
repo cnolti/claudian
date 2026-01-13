@@ -57,12 +57,6 @@ export const MIN_TABS = 3;
 export const MAX_TABS = 10;
 
 /**
- * Threshold above which a warning is shown about resource usage.
- * More than this many tabs may impact performance.
- */
-export const HIGH_TAB_WARNING_THRESHOLD = 5;
-
-/**
  * Minimum max-height for textarea in pixels.
  * Used by autoResizeTextarea to ensure minimum usable space.
  */

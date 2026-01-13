@@ -64,7 +64,7 @@
   min-height: 60px;
   /* max-height dynamically set by JS: max(150px, 55% of view height) */
   resize: none;
-  padding: 10px;
+  padding: 8px 10px 10px 10px;
   border: none !important;
   border-radius: 6px;
   background: transparent !important;

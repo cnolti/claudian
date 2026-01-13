@@ -17,6 +17,7 @@ import {
   initializeTabControllers,
   initializeTabService,
   initializeTabUI,
+  setupApprovalCallback,
   wireTabInputEvents,
 } from './Tab';
 import {
@@ -434,12 +435,7 @@ export class TabManager implements TabManagerInterface {
 
     try {
       await initializeTabService(activeTab, this.plugin, this.mcpManager);
-      if (activeTab.service) {
-        activeTab.service.setApprovalCallback(
-          (toolName, input, description) =>
-            activeTab.controllers.inputController!.handleApprovalRequest(toolName, input, description)
-        );
-      }
+      setupApprovalCallback(activeTab);
     } catch (error) {
       console.warn(
         `[TabManager] Failed to pre-initialize active tab service:`,

@@ -207,6 +207,7 @@ jest.mock('@/features/chat/controllers', () => ({
 jest.mock('@/features/chat/services/AsyncSubagentManager', () => ({
   AsyncSubagentManager: jest.fn().mockImplementation(() => ({
     orphanAllActive: jest.fn(),
+    setCallback: jest.fn(),
   })),
 }));
 

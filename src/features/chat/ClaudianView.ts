@@ -13,7 +13,6 @@ import type ClaudianPlugin from '../../main';
 import { LOGO_SVG } from './constants';
 import { TabBar, TabManager } from './tabs';
 import type { TabData, TabId } from './tabs/types';
-import { MAX_TABS } from './tabs/types';
 
 /** Main sidebar chat view for interacting with Claude. */
 export class ClaudianView extends ItemView {
@@ -260,7 +259,8 @@ export class ClaudianView extends ItemView {
   private async handleNewTab(): Promise<void> {
     const tab = await this.tabManager?.createTab();
     if (!tab) {
-      new Notice(`Maximum ${MAX_TABS} tabs allowed`);
+      const maxTabs = this.plugin.settings.maxTabs ?? 3;
+      new Notice(`Maximum ${maxTabs} tabs allowed`);
       return;
     }
     this.updateTabBarVisibility();

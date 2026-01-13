@@ -19,6 +19,7 @@ const mockInitializeTabControllers = jest.fn();
 const mockInitializeTabService = jest.fn().mockResolvedValue(undefined);
 const mockWireTabInputEvents = jest.fn();
 const mockGetTabTitle = jest.fn().mockReturnValue('Test Tab');
+const mockSetupApprovalCallback = jest.fn();
 
 jest.mock('@/features/chat/tabs/Tab', () => ({
   createTab: (...args: any[]) => mockCreateTab(...args),
@@ -30,6 +31,7 @@ jest.mock('@/features/chat/tabs/Tab', () => ({
   initializeTabService: (...args: any[]) => mockInitializeTabService(...args),
   wireTabInputEvents: (...args: any[]) => mockWireTabInputEvents(...args),
   getTabTitle: (...args: any[]) => mockGetTabTitle(...args),
+  setupApprovalCallback: (...args: any[]) => mockSetupApprovalCallback(...args),
 }));
 
 // Helper to create mock DOM element

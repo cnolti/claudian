@@ -292,14 +292,10 @@ export async function initializeTabService(
 }
 
 /**
- * Initializes the tab's UI components.
- * Call this after the tab is created and before it becomes active.
+ * Initializes file and image context managers for a tab.
  */
-export function initializeTabUI(
-  tab: TabData,
-  plugin: ClaudianPlugin
-): void {
-  const { dom, state } = tab;
+function initializeContextManagers(tab: TabData, plugin: ClaudianPlugin): void {
+  const { dom } = tab;
   const app = plugin.app;
 
   // File context manager - chips in contextRowEl, dropdown in inputContainerEl
@@ -334,15 +330,17 @@ export function initializeTabUI(
     },
     dom.contextRowEl
   );
+}
 
-  // Selection indicator - add to contextRowEl
-  dom.selectionIndicatorEl = dom.contextRowEl.createDiv({ cls: 'claudian-selection-indicator' });
-  dom.selectionIndicatorEl.style.display = 'none';
+/**
+ * Initializes slash command manager and dropdown for a tab.
+ */
+function initializeSlashCommands(tab: TabData, plugin: ClaudianPlugin): void {
+  const { dom } = tab;
+  const vaultPath = getVaultPath(plugin.app);
 
-  // Slash command manager
-  const vaultPath = getVaultPath(app);
   if (vaultPath) {
-    tab.ui.slashCommandManager = new SlashCommandManager(app, vaultPath);
+    tab.ui.slashCommandManager = new SlashCommandManager(plugin.app, vaultPath);
     tab.ui.slashCommandManager.setCommands(plugin.settings.slashCommands);
 
     tab.ui.slashCommandDropdown = new SlashCommandDropdown(
@@ -355,8 +353,14 @@ export function initializeTabUI(
       }
     );
   }
+}
 
-  // Instruction mode manager
+/**
+ * Initializes instruction mode and todo panel for a tab.
+ */
+function initializeInstructionAndTodo(tab: TabData, plugin: ClaudianPlugin): void {
+  const { dom } = tab;
+
   tab.services.instructionRefineService = new InstructionRefineService(plugin);
   tab.services.titleGenerationService = new TitleGenerationService(plugin);
   tab.ui.instructionModeManager = new InstructionModeManagerClass(
@@ -369,11 +373,16 @@ export function initializeTabUI(
     }
   );
 
-  // Todo panel
   tab.ui.todoPanel = new TodoPanel();
   tab.ui.todoPanel.mount(dom.messagesEl);
+}
 
-  // Input toolbar
+/**
+ * Creates and wires the input toolbar for a tab.
+ */
+function initializeInputToolbar(tab: TabData, plugin: ClaudianPlugin): void {
+  const { dom } = tab;
+
   const inputToolbar = dom.inputWrapper.createDiv({ cls: 'claudian-input-toolbar' });
   const toolbarComponents = createInputToolbar(inputToolbar, {
     getSettings: () => ({
@@ -436,6 +445,33 @@ export function initializeTabUI(
     plugin.settings.persistentExternalContextPaths = paths;
     await plugin.saveSettings();
   });
+}
+
+/**
+ * Initializes the tab's UI components.
+ * Call this after the tab is created and before it becomes active.
+ */
+export function initializeTabUI(
+  tab: TabData,
+  plugin: ClaudianPlugin
+): void {
+  const { dom, state } = tab;
+
+  // Initialize context managers (file/image)
+  initializeContextManagers(tab, plugin);
+
+  // Selection indicator - add to contextRowEl
+  dom.selectionIndicatorEl = dom.contextRowEl.createDiv({ cls: 'claudian-selection-indicator' });
+  dom.selectionIndicatorEl.style.display = 'none';
+
+  // Initialize slash commands
+  initializeSlashCommands(tab, plugin);
+
+  // Initialize instruction mode and todo panel
+  initializeInstructionAndTodo(tab, plugin);
+
+  // Initialize input toolbar
+  initializeInputToolbar(tab, plugin);
 
   // Update ChatState callbacks for UI updates
   state.callbacks = {
@@ -464,11 +500,6 @@ export function initializeTabControllers(
   // Create renderer
   tab.renderer = new MessageRenderer(plugin, component, dom.messagesEl);
 
-  // Update async subagent manager callback
-  services.asyncSubagentManager = new AsyncSubagentManager(
-    (subagent) => tab.controllers.streamController?.onAsyncSubagentStateChange(subagent)
-  );
-
   // Selection controller
   tab.controllers.selectionController = new SelectionController(
     plugin.app,
@@ -489,6 +520,11 @@ export function initializeTabControllers(
     updateQueueIndicator: () => tab.controllers.inputController?.updateQueueIndicator(),
     getAgentService: () => tab.service,
   });
+
+  // Wire async subagent callback now that StreamController exists
+  services.asyncSubagentManager.setCallback(
+    (subagent) => tab.controllers.streamController?.onAsyncSubagentStateChange(subagent)
+  );
 
   // Conversation controller
   tab.controllers.conversationController = new ConversationController(
@@ -549,13 +585,7 @@ export function initializeTabControllers(
       }
       try {
         await initializeTabService(tab, plugin, mcpManager);
-        // Set approval callback after initialization
-        if (tab.service) {
-          tab.service.setApprovalCallback(
-            (toolName, input, description) =>
-              tab.controllers.inputController!.handleApprovalRequest(toolName, input, description)
-          );
-        }
+        setupApprovalCallback(tab);
         return true;
       } catch (error) {
         console.warn(`[Tab ${tab.id}] Service initialization failed:`, error);
@@ -718,4 +748,17 @@ export function getTabTitle(tab: TabData, plugin: ClaudianPlugin): string {
     }
   }
   return 'New Chat';
+}
+
+/**
+ * Sets up the approval callback for a tab's service.
+ * Extracted to avoid duplication between Tab.ts and TabManager.ts.
+ */
+export function setupApprovalCallback(tab: TabData): void {
+  if (tab.service && tab.controllers.inputController) {
+    tab.service.setApprovalCallback(
+      (toolName, input, description) =>
+        tab.controllers.inputController!.handleApprovalRequest(toolName, input, description)
+    );
+  }
 }
