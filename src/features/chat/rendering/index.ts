@@ -31,6 +31,7 @@ export {
   getToolLabel,
   getToolName,
   getToolSummary,
+  groupToolBlocks,
   isBlockedToolResult,
   renderStoredToolCall,
   renderToolCall,

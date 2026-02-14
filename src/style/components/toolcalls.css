@@ -229,3 +229,100 @@
   margin-bottom: 0;
 }
 
+/* ============================================
+   Tool Group - collapsed consecutive tool calls
+   ============================================ */
+.claudian-tool-group {
+  margin: 8px 0;
+}
+
+.claudian-tool-group-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+  user-select: none;
+  overflow: hidden;
+}
+
+.claudian-tool-group-summary:hover {
+  opacity: 0.85;
+}
+
+.claudian-tool-group-chevron {
+  color: var(--text-muted);
+  font-size: 10px;
+  transition: transform 150ms ease;
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.claudian-tool-group.expanded .claudian-tool-group-chevron {
+  transform: rotate(90deg);
+}
+
+.claudian-tool-group-label {
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.claudian-tool-group-status {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--color-green);
+}
+
+.claudian-tool-group-status.has-errors {
+  color: var(--color-red);
+}
+
+.claudian-tool-group-status svg {
+  width: 14px;
+  height: 14px;
+}
+
+.claudian-tool-group-content {
+  display: none;
+  padding-inline-start: 16px;
+  margin-inline-start: 7px;
+  border-inline-start: 2px solid var(--background-modifier-border);
+}
+
+.claudian-tool-group.expanded .claudian-tool-group-content {
+  display: block;
+}
+
+/* Make individual (non-grouped) tool calls visually compact.
+   Excludes interactive tools (AskUserQuestion, TodoWrite) via :has(). */
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)) {
+  margin: 2px 0;
+  opacity: 0.55;
+  transition: opacity 150ms ease;
+}
+
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)):hover,
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)).expanded {
+  opacity: 1;
+}
+
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)) .claudian-tool-header {
+  padding: 1px 0;
+}
+
+/* Make individual (non-grouped) thinking blocks compact */
+.claudian-message-content > .claudian-thinking-block {
+  margin: 2px 0;
+  opacity: 0.55;
+  transition: opacity 150ms ease;
+}
+
+.claudian-message-content > .claudian-thinking-block:hover,
+.claudian-message-content > .claudian-thinking-block.expanded {
+  opacity: 1;
+}
+

@@ -18,6 +18,9 @@ import {
   TOOL_WEB_SEARCH,
   TOOL_WRITE,
 } from '../../../core/tools/toolNames';
+
+const CHECKMARK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+const ERROR_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
 import type { ToolCallInfo } from '../../../core/types';
 import { MCP_ICON_SVG } from '../../../shared/icons';
 import { setupCollapsible } from './collapsible';
@@ -602,4 +605,145 @@ export function renderStoredToolCall(
   });
 
   return toolEl;
+}
+
+// ============================================
+// Tool Call Grouping
+// ============================================
+
+const MIN_GROUP_SIZE = 2;
+
+/**
+ * Returns true if the element is a groupable tool call or thinking block.
+ * Interactive tools (AskUserQuestion, TodoWrite) are excluded from grouping.
+ */
+function isGroupableElement(el: Element): boolean {
+  if (el.classList.contains('claudian-thinking-block')) return true;
+  if (!el.classList.contains('claudian-tool-call')) return false;
+  // Exclude interactive tool calls
+  if (el.querySelector('.claudian-tool-content-ask')) return false;
+  if (el.querySelector('.claudian-tool-content-todo')) return false;
+  return true;
+}
+
+/**
+ * Post-processes a message content element to group consecutive tool calls
+ * and thinking blocks into collapsible summary groups.
+ *
+ * Call after all content blocks have been rendered (stored replay or stream end).
+ */
+export function groupToolBlocks(contentEl: HTMLElement | null): void {
+  if (!contentEl) return;
+
+  const children = Array.from(contentEl.children);
+  if (children.length < MIN_GROUP_SIZE) return;
+
+  // Find consecutive runs of groupable elements
+  interface Run { start: number; end: number }
+  const runs: Run[] = [];
+  let runStart = -1;
+
+  for (let i = 0; i <= children.length; i++) {
+    const child = children[i];
+    if (child && isGroupableElement(child)) {
+      if (runStart === -1) runStart = i;
+    } else {
+      if (runStart !== -1 && (i - runStart) >= MIN_GROUP_SIZE) {
+        runs.push({ start: runStart, end: i - 1 });
+      }
+      runStart = -1;
+    }
+  }
+
+  if (runs.length === 0) return;
+
+  // Process runs in reverse to preserve DOM indices
+  for (let r = runs.length - 1; r >= 0; r--) {
+    const run = runs[r];
+    const elements = children.slice(run.start, run.end + 1);
+
+    const toolCount = elements.filter(e => e.classList.contains('claudian-tool-call')).length;
+    const thinkingEls = elements.filter(e => e.classList.contains('claudian-thinking-block'));
+    const thinkingCount = thinkingEls.length;
+
+    // Sum thinking durations from labels
+    let thinkingDuration = 0;
+    for (const el of thinkingEls) {
+      const label = el.querySelector('.claudian-thinking-label');
+      if (label?.textContent) {
+        const match = label.textContent.match(/(\d+)s/);
+        if (match) thinkingDuration += parseInt(match[1], 10);
+      }
+    }
+
+    // Detect errors
+    const hasErrors = elements.some(e => e.querySelector('.status-error'));
+
+    // Build label
+    const parts: string[] = [];
+    if (toolCount > 0) parts.push(`${toolCount} tool call${toolCount !== 1 ? 's' : ''}`);
+    if (thinkingCount > 0) {
+      parts.push(thinkingDuration > 0 ? `Thought for ${thinkingDuration}s` : `${thinkingCount} thinking`);
+    }
+    const labelText = parts.join(' \u00B7 ');
+
+    // Create wrapper
+    const wrapper = document.createElement('div');
+    wrapper.className = 'claudian-tool-group';
+
+    const summary = document.createElement('div');
+    summary.className = 'claudian-tool-group-summary';
+    summary.setAttribute('tabindex', '0');
+    summary.setAttribute('role', 'button');
+    summary.setAttribute('aria-expanded', 'false');
+    summary.setAttribute('aria-label', labelText);
+
+    const chevron = document.createElement('span');
+    chevron.className = 'claudian-tool-group-chevron';
+    chevron.textContent = '\u25B6';
+
+    const labelEl = document.createElement('span');
+    labelEl.className = 'claudian-tool-group-label';
+    labelEl.textContent = labelText;
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'claudian-tool-group-status';
+    if (hasErrors) {
+      statusEl.classList.add('has-errors');
+      statusEl.innerHTML = ERROR_SVG;
+    } else {
+      statusEl.innerHTML = CHECKMARK_SVG;
+    }
+
+    summary.appendChild(chevron);
+    summary.appendChild(labelEl);
+    summary.appendChild(statusEl);
+
+    const groupContent = document.createElement('div');
+    groupContent.className = 'claudian-tool-group-content';
+
+    wrapper.appendChild(summary);
+    wrapper.appendChild(groupContent);
+
+    // Insert wrapper before first element in the run
+    elements[0].parentNode!.insertBefore(wrapper, elements[0]);
+
+    // Move elements into group content
+    for (const el of elements) {
+      groupContent.appendChild(el);
+    }
+
+    // Toggle handler
+    summary.addEventListener('click', () => {
+      const isExpanded = wrapper.classList.toggle('expanded');
+      summary.setAttribute('aria-expanded', String(isExpanded));
+    });
+
+    summary.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        summary.click();
+      }
+    });
+  }
 }

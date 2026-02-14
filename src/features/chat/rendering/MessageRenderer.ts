@@ -14,7 +14,7 @@ import {
   renderStoredSubagent,
 } from './SubagentRenderer';
 import { renderStoredThinkingBlock } from './ThinkingBlockRenderer';
-import { renderStoredToolCall } from './ToolCallRenderer';
+import { groupToolBlocks, renderStoredToolCall } from './ToolCallRenderer';
 import { renderStoredWriteEdit } from './WriteEditRenderer';
 
 export type RenderContentFn = (el: HTMLElement, markdown: string) => Promise<void>;
@@ -270,6 +270,9 @@ export class MessageRenderer {
         }
       }
     }
+
+    // Group consecutive tool calls and thinking blocks into collapsible summaries
+    groupToolBlocks(contentEl);
 
     // Render response duration footer (skip when message contains a compaction boundary)
     const hasCompactBoundary = msg.contentBlocks?.some(b => b.type === 'compact_boundary');
