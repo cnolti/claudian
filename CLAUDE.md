@@ -67,7 +67,8 @@ Tests mirror `src/` structure in `tests/unit/` and `tests/integration/`.
   - Test behavior and public API, not internal implementation details
   - Skip TDD for trivial changes (renaming, moving files, config tweaks) — but still verify existing tests pass
 - Run `npm run typecheck && npm run lint && npm run test && npm run build` after editing
-- No `console.*` in production code 
+- **Deploy after every task**: After completing work, always commit, push, and run `npm run build` to deploy the new version to the Obsidian vault. Bump the fork version in `manifest.json` (e.g., `1.3.64-fork.2` → `1.3.64-fork.3`). The build auto-copies `main.js`, `manifest.json`, and `styles.css` to the vault plugin folder (configured via `OBSIDIAN_VAULT` in `.env.local`).
+- No `console.*` in production code
   - use Obsidian's notification system if user should be notified
   - use `console.log` for debugging, but remove it before committing
 - Generated docs/test scripts go in `dev/`.
