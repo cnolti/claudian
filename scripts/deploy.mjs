@@ -3,8 +3,9 @@
  * Deploy script: bumps fork version, builds, and copies plugin to Obsidian vault.
  *
  * Usage:
- *   node scripts/deploy.mjs          # bump patch (fork.2 → fork.3)
- *   node scripts/deploy.mjs --skip-bump  # build + copy without version bump
+ *   node scripts/deploy.mjs              # bump, build, copy, commit, push all remotes
+ *   node scripts/deploy.mjs --skip-bump  # build + copy + push without version bump
+ *   node scripts/deploy.mjs --skip-git   # bump + build + copy only (no commit/push)
  */
 
 import { execSync } from 'child_process';
@@ -93,3 +94,40 @@ for (const file of FILES_TO_COPY) {
 
 const manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf-8'));
 console.log(`Deployed v${manifest.version} to ${pluginDir}`);
+
+// ---------------------------------------------------------------------------
+// 5. Git commit + push to all remotes
+// ---------------------------------------------------------------------------
+
+const skipGit = process.argv.includes('--skip-git');
+
+if (!skipGit) {
+  // Stage version bump (manifest.json changed by step 2)
+  try {
+    const status = execSync('git status --porcelain manifest.json', { cwd: ROOT, encoding: 'utf-8' }).trim();
+    if (status) {
+      execSync('git add manifest.json', { cwd: ROOT, stdio: 'inherit' });
+      execSync(
+        `git commit -m "chore: bump version to ${manifest.version}"`,
+        { cwd: ROOT, stdio: 'inherit' },
+      );
+    }
+  } catch {
+    // Nothing to commit — fine
+  }
+
+  // Push to all remotes
+  const remotesRaw = execSync('git remote', { cwd: ROOT, encoding: 'utf-8' }).trim();
+  const remotes = remotesRaw.split('\n').filter(Boolean);
+
+  for (const remote of remotes) {
+    // Skip upstream (original repo, read-only)
+    if (remote === 'upstream') continue;
+    try {
+      console.log(`Pushing to ${remote}...`);
+      execSync(`git push ${remote} main`, { cwd: ROOT, stdio: 'inherit' });
+    } catch {
+      console.error(`Failed to push to ${remote} (continuing)`);
+    }
+  }
+}
