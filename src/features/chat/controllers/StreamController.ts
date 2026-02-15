@@ -13,10 +13,12 @@ import {
   appendThinkingContent,
   createThinkingBlock,
   createWriteEditBlock,
+  finalizeStreamingGroup,
   finalizeThinkingBlock,
   finalizeWriteEditBlock,
   getToolName,
   getToolSummary,
+  integrateIntoStreamingGroup,
   isBlockedToolResult,
   renderToolCall,
   updateToolCallResult,
@@ -306,6 +308,14 @@ export class StreamController {
       renderToolCall(parentEl, toolCall, state.toolCallElements);
     }
     state.pendingTools.delete(toolId);
+
+    // Integrate rendered element into streaming group
+    const renderedEl = state.toolCallElements.get(toolId);
+    if (renderedEl && state.currentContentEl) {
+      state.activeStreamGroup = integrateIntoStreamingGroup(
+        renderedEl, state.activeStreamGroup, state.currentContentEl
+      );
+    }
   }
 
   private async handleToolResult(
@@ -398,6 +408,10 @@ export class StreamController {
     if (!state.currentTextEl) {
       state.currentTextEl = state.currentContentEl.createDiv({ cls: 'claudian-text-block' });
       state.currentTextContent = '';
+      // Integrate text block into streaming group (transparent element)
+      state.activeStreamGroup = integrateIntoStreamingGroup(
+        state.currentTextEl, state.activeStreamGroup, state.currentContentEl
+      );
     }
 
     state.currentTextContent += text;
@@ -432,6 +446,12 @@ export class StreamController {
         state.currentContentEl,
         (el, md) => renderer.renderContent(el, md)
       );
+      // Integrate thinking block into streaming group
+      if (state.currentThinkingState.wrapperEl) {
+        state.activeStreamGroup = integrateIntoStreamingGroup(
+          state.currentThinkingState.wrapperEl, state.activeStreamGroup, state.currentContentEl
+        );
+      }
     }
 
     await appendThinkingContent(state.currentThinkingState, content, (el, md) => renderer.renderContent(el, md));
@@ -952,6 +972,11 @@ export class StreamController {
     const { state } = this.deps;
     if (!state.currentContentEl) return;
     this.hideThinkingIndicator();
+    // Finalize any active streaming group before rendering boundary
+    if (state.activeStreamGroup) {
+      finalizeStreamingGroup(state.activeStreamGroup, state.currentContentEl);
+      state.activeStreamGroup = null;
+    }
     const el = state.currentContentEl.createDiv({ cls: 'claudian-compact-boundary' });
     el.createSpan({ cls: 'claudian-compact-boundary-label', text: 'Conversation compacted' });
   }
@@ -973,6 +998,11 @@ export class StreamController {
   resetStreamingState(): void {
     const { state } = this.deps;
     this.hideThinkingIndicator();
+    // Finalize any active streaming group
+    if (state.activeStreamGroup && state.currentContentEl) {
+      finalizeStreamingGroup(state.activeStreamGroup, state.currentContentEl);
+    }
+    state.activeStreamGroup = null;
     state.currentContentEl = null;
     state.currentTextEl = null;
     state.currentTextContent = '';

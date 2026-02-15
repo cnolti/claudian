@@ -298,19 +298,19 @@
 }
 
 /* Make individual (non-grouped) tool calls visually compact.
-   Excludes interactive tools (AskUserQuestion, TodoWrite) via :has(). */
-.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)) {
+   Only AskUserQuestion is excluded from compact styling. */
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)) {
   margin: 2px 0;
   opacity: 0.55;
   transition: opacity 150ms ease;
 }
 
-.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)):hover,
-.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)).expanded {
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):hover,
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)).expanded {
   opacity: 1;
 }
 
-.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)):not(:has(.claudian-tool-content-todo)) .claudian-tool-header {
+.claudian-message-content > .claudian-tool-call:not(:has(.claudian-tool-content-ask)) .claudian-tool-header {
   padding: 1px 0;
 }
 
@@ -324,5 +324,34 @@
 .claudian-message-content > .claudian-thinking-block:hover,
 .claudian-message-content > .claudian-thinking-block.expanded {
   opacity: 1;
+}
+
+/* Make individual (non-grouped) write-edit blocks compact */
+.claudian-message-content > .claudian-write-edit-block {
+  margin: 2px 0;
+  opacity: 0.55;
+  transition: opacity 150ms ease;
+}
+
+.claudian-message-content > .claudian-write-edit-block:hover,
+.claudian-message-content > .claudian-write-edit-block.expanded {
+  opacity: 1;
+}
+
+/* Make individual (non-grouped) subagent blocks compact */
+.claudian-message-content > .claudian-subagent-list {
+  margin: 2px 0;
+  opacity: 0.55;
+  transition: opacity 150ms ease;
+}
+
+.claudian-message-content > .claudian-subagent-list:hover,
+.claudian-message-content > .claudian-subagent-list.expanded {
+  opacity: 1;
+}
+
+/* Streaming group: hide status icon while streaming */
+.claudian-tool-group--streaming .claudian-tool-group-status {
+  display: none;
 }
 

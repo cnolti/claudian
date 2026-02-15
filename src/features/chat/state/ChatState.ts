@@ -1,5 +1,6 @@
 import type { UsageInfo } from '../../../core/types';
 import type {
+  ActiveStreamGroup,
   ChatMessage,
   ChatStateCallbacks,
   ChatStateData,
@@ -41,6 +42,7 @@ function createInitialState(): ChatStateData {
     pendingNewSessionPlan: null,
     planFilePath: null,
     prePlanPermissionMode: null,
+    activeStreamGroup: null,
   };
 }
 
@@ -350,6 +352,18 @@ export class ChatState {
   }
 
   // ============================================
+  // Active Streaming Group
+  // ============================================
+
+  get activeStreamGroup(): ActiveStreamGroup | null {
+    return this.state.activeStreamGroup;
+  }
+
+  set activeStreamGroup(value: ActiveStreamGroup | null) {
+    this.state.activeStreamGroup = value;
+  }
+
+  // ============================================
   // Reset Methods
   // ============================================
 
@@ -365,6 +379,7 @@ export class ChatState {
     this.state.currentTextEl = null;
     this.state.currentTextContent = '';
     this.state.currentThinkingState = null;
+    this.state.activeStreamGroup = null;
     this.state.isStreaming = false;
     this.state.cancelRequested = false;
     // Clear thinking indicator timeout

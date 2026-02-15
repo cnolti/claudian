@@ -16,7 +16,7 @@ import { COMPLETION_FLAVOR_WORDS } from '../constants';
 import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../rendering/InlineAskUserQuestion';
 import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
-import { groupToolBlocks, setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
+import { finalizeStreamingGroup, setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
 import type { InstructionRefineService } from '../services/InstructionRefineService';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { TitleGenerationService } from '../services/TitleGenerationService';
@@ -408,7 +408,10 @@ export class InputController {
 
         streamController.finalizeCurrentThinkingBlock(assistantMsg);
         streamController.finalizeCurrentTextBlock(assistantMsg);
-        groupToolBlocks(contentEl);
+        if (state.activeStreamGroup && contentEl) {
+          finalizeStreamingGroup(state.activeStreamGroup, contentEl);
+          state.activeStreamGroup = null;
+        }
         this.deps.getSubagentManager().resetStreamingState();
 
         // Auto-hide completed status panels on response end

@@ -17,6 +17,7 @@ jest.mock('@/features/chat/rendering/ThinkingBlockRenderer', () => ({
 }));
 jest.mock('@/features/chat/rendering/ToolCallRenderer', () => ({
   renderStoredToolCall: jest.fn(),
+  groupToolBlocks: jest.fn(),
 }));
 jest.mock('@/features/chat/rendering/WriteEditRenderer', () => ({
   renderStoredWriteEdit: jest.fn(),

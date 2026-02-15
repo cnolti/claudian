@@ -12,6 +12,7 @@ import type {
 import type { CanvasSelectionContext } from '../../../utils/canvas';
 import type { EditorSelectionContext } from '../../../utils/editor';
 import type {
+  ActiveStreamGroup,
   ThinkingBlockState,
   WriteEditState,
 } from '../rendering';
@@ -103,6 +104,9 @@ export interface ChatStateData {
 
   // Saved permission mode before entering plan mode (for Shift+Tab toggle restore)
   prePlanPermissionMode: PermissionMode | null;
+
+  // Active streaming group for progressive tool call grouping
+  activeStreamGroup: ActiveStreamGroup | null;
 }
 
 /** Callbacks for ChatState changes. */
@@ -128,6 +132,7 @@ export interface QueryOptions {
 
 // Re-export types that are used across the chat feature
 export type {
+  ActiveStreamGroup,
   ChatMessage,
   EditorSelectionContext,
   ImageAttachment,

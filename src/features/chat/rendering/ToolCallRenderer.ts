@@ -613,22 +613,180 @@ export function renderStoredToolCall(
 
 const MIN_GROUP_SIZE = 2;
 
-/**
- * Returns true if the element is a groupable tool call or thinking block.
- * Interactive tools (AskUserQuestion, TodoWrite) are excluded from grouping.
- */
 function isGroupableElement(el: Element): boolean {
-  if (el.classList.contains('claudian-thinking-block')) return true;
-  if (!el.classList.contains('claudian-tool-call')) return false;
-  // Exclude interactive tool calls
   if (el.querySelector('.claudian-tool-content-ask')) return false;
-  if (el.querySelector('.claudian-tool-content-todo')) return false;
-  return true;
+  if (el.classList.contains('claudian-tool-call')) return true;
+  if (el.classList.contains('claudian-write-edit-block')) return true;
+  if (el.classList.contains('claudian-thinking-block')) return true;
+  if (el.classList.contains('claudian-subagent-list')) return true;
+  return false;
+}
+
+function isChainBreaker(el: Element): boolean {
+  if (el.querySelector('.claudian-tool-content-ask')) return true;
+  if (el.classList.contains('claudian-response-footer')) return true;
+  if (el.classList.contains('claudian-compact-boundary')) return true;
+  return false;
+}
+
+function isTransparentElement(el: Element): boolean {
+  return el.classList.contains('claudian-text-block');
+}
+
+function countGroupStats(elements: Element[]): {
+  toolCount: number;
+  thinkingCount: number;
+  thinkingDuration: number;
+  hasErrors: boolean;
+} {
+  let toolCount = 0;
+  let thinkingCount = 0;
+  let thinkingDuration = 0;
+  let hasErrors = false;
+
+  for (const el of elements) {
+    if (
+      el.classList.contains('claudian-tool-call') ||
+      el.classList.contains('claudian-write-edit-block') ||
+      el.classList.contains('claudian-subagent-list')
+    ) {
+      toolCount++;
+    } else if (el.classList.contains('claudian-thinking-block')) {
+      thinkingCount++;
+      const label = el.querySelector('.claudian-thinking-label');
+      if (label?.textContent) {
+        const match = label.textContent.match(/(\d+)s/);
+        if (match) thinkingDuration += parseInt(match[1], 10);
+      }
+    }
+    if (el.querySelector('.status-error') || el.classList.contains('error')) {
+      hasErrors = true;
+    }
+  }
+
+  return { toolCount, thinkingCount, thinkingDuration, hasErrors };
+}
+
+function buildGroupLabel(toolCount: number, thinkingCount: number, thinkingDuration: number): string {
+  const parts: string[] = [];
+  if (toolCount > 0) parts.push(`${toolCount} tool call${toolCount !== 1 ? 's' : ''}`);
+  if (thinkingCount > 0) {
+    parts.push(thinkingDuration > 0 ? `Thought for ${thinkingDuration}s` : `${thinkingCount} thinking`);
+  }
+  return parts.join(' \u00B7 ');
+}
+
+export interface GroupWrapper {
+  wrapperEl: HTMLElement;
+  summaryEl: HTMLElement;
+  labelEl: HTMLElement;
+  statusEl: HTMLElement;
+  contentEl: HTMLElement;
+}
+
+export function createGroupWrapper(
+  parentEl: HTMLElement,
+  elements: Element[],
+  insertBefore?: Element | null,
+  streaming = false,
+): GroupWrapper {
+  const { toolCount, thinkingCount, thinkingDuration, hasErrors } = countGroupStats(elements);
+  const labelText = buildGroupLabel(toolCount, thinkingCount, thinkingDuration);
+
+  const wrapperEl = document.createElement('div');
+  wrapperEl.className = streaming ? 'claudian-tool-group claudian-tool-group--streaming' : 'claudian-tool-group';
+
+  const summaryEl = document.createElement('div');
+  summaryEl.className = 'claudian-tool-group-summary';
+  summaryEl.setAttribute('tabindex', '0');
+  summaryEl.setAttribute('role', 'button');
+  summaryEl.setAttribute('aria-expanded', 'false');
+  summaryEl.setAttribute('aria-label', labelText);
+
+  const chevron = document.createElement('span');
+  chevron.className = 'claudian-tool-group-chevron';
+  chevron.textContent = '\u25B6';
+
+  const labelEl = document.createElement('span');
+  labelEl.className = 'claudian-tool-group-label';
+  labelEl.textContent = labelText;
+
+  const statusEl = document.createElement('span');
+  statusEl.className = 'claudian-tool-group-status';
+  if (!streaming) {
+    if (hasErrors) {
+      statusEl.classList.add('has-errors');
+      statusEl.innerHTML = ERROR_SVG;
+    } else {
+      statusEl.innerHTML = CHECKMARK_SVG;
+    }
+  }
+
+  summaryEl.appendChild(chevron);
+  summaryEl.appendChild(labelEl);
+  summaryEl.appendChild(statusEl);
+
+  const contentEl = document.createElement('div');
+  contentEl.className = 'claudian-tool-group-content';
+
+  wrapperEl.appendChild(summaryEl);
+  wrapperEl.appendChild(contentEl);
+
+  // Insert wrapper into DOM
+  if (insertBefore !== undefined) {
+    parentEl.insertBefore(wrapperEl, insertBefore);
+  } else if (elements.length > 0 && elements[0].parentNode === parentEl) {
+    parentEl.insertBefore(wrapperEl, elements[0]);
+  } else {
+    parentEl.appendChild(wrapperEl);
+  }
+
+  // Move elements into group content
+  for (const el of elements) {
+    contentEl.appendChild(el);
+  }
+
+  // Toggle handler
+  summaryEl.addEventListener('click', () => {
+    const isExpanded = wrapperEl.classList.toggle('expanded');
+    summaryEl.setAttribute('aria-expanded', String(isExpanded));
+  });
+
+  summaryEl.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      summaryEl.click();
+    }
+  });
+
+  return { wrapperEl, summaryEl, labelEl, statusEl, contentEl };
+}
+
+function updateGroupLabel(group: GroupWrapper): void {
+  const elements = Array.from(group.contentEl.children);
+  const { toolCount, thinkingCount, thinkingDuration, hasErrors } = countGroupStats(elements);
+  const labelText = buildGroupLabel(toolCount, thinkingCount, thinkingDuration);
+  group.labelEl.textContent = labelText;
+  group.summaryEl.setAttribute('aria-label', labelText);
+
+  // Update status icon
+  group.statusEl.className = 'claudian-tool-group-status';
+  if (hasErrors) {
+    group.statusEl.classList.add('has-errors');
+    group.statusEl.innerHTML = ERROR_SVG;
+  } else {
+    group.statusEl.innerHTML = CHECKMARK_SVG;
+  }
 }
 
 /**
  * Post-processes a message content element to group consecutive tool calls
  * and thinking blocks into collapsible summary groups.
+ *
+ * Uses chain-breaker approach: groupable elements are accumulated into runs,
+ * transparent elements (text-blocks) are absorbed into active runs without
+ * incrementing the count, and chain-breakers (AskUserQuestion, footer,
+ * compact boundary) close the current run.
  *
  * Call after all content blocks have been rendered (stored replay or stream end).
  */
@@ -638,112 +796,149 @@ export function groupToolBlocks(contentEl: HTMLElement | null): void {
   const children = Array.from(contentEl.children);
   if (children.length < MIN_GROUP_SIZE) return;
 
-  // Find consecutive runs of groupable elements
-  interface Run { start: number; end: number }
+  interface Run { elements: Element[]; groupableCount: number }
   const runs: Run[] = [];
-  let runStart = -1;
+  let currentRun: Run | null = null;
 
-  for (let i = 0; i <= children.length; i++) {
-    const child = children[i];
-    if (child && isGroupableElement(child)) {
-      if (runStart === -1) runStart = i;
-    } else {
-      if (runStart !== -1 && (i - runStart) >= MIN_GROUP_SIZE) {
-        runs.push({ start: runStart, end: i - 1 });
+  const closeRun = () => {
+    if (currentRun && currentRun.groupableCount >= MIN_GROUP_SIZE) {
+      runs.push(currentRun);
+    }
+    currentRun = null;
+  };
+
+  for (const child of children) {
+    if (isChainBreaker(child)) {
+      closeRun();
+    } else if (isGroupableElement(child)) {
+      if (!currentRun) {
+        currentRun = { elements: [], groupableCount: 0 };
       }
-      runStart = -1;
+      currentRun.elements.push(child);
+      currentRun.groupableCount++;
+    } else if (isTransparentElement(child) && currentRun) {
+      // Absorb text blocks into active run (don't increment groupable count)
+      currentRun.elements.push(child);
+    } else {
+      closeRun();
     }
   }
+  closeRun();
 
   if (runs.length === 0) return;
 
   // Process runs in reverse to preserve DOM indices
   for (let r = runs.length - 1; r >= 0; r--) {
-    const run = runs[r];
-    const elements = children.slice(run.start, run.end + 1);
-
-    const toolCount = elements.filter(e => e.classList.contains('claudian-tool-call')).length;
-    const thinkingEls = elements.filter(e => e.classList.contains('claudian-thinking-block'));
-    const thinkingCount = thinkingEls.length;
-
-    // Sum thinking durations from labels
-    let thinkingDuration = 0;
-    for (const el of thinkingEls) {
-      const label = el.querySelector('.claudian-thinking-label');
-      if (label?.textContent) {
-        const match = label.textContent.match(/(\d+)s/);
-        if (match) thinkingDuration += parseInt(match[1], 10);
-      }
-    }
-
-    // Detect errors
-    const hasErrors = elements.some(e => e.querySelector('.status-error'));
-
-    // Build label
-    const parts: string[] = [];
-    if (toolCount > 0) parts.push(`${toolCount} tool call${toolCount !== 1 ? 's' : ''}`);
-    if (thinkingCount > 0) {
-      parts.push(thinkingDuration > 0 ? `Thought for ${thinkingDuration}s` : `${thinkingCount} thinking`);
-    }
-    const labelText = parts.join(' \u00B7 ');
-
-    // Create wrapper
-    const wrapper = document.createElement('div');
-    wrapper.className = 'claudian-tool-group';
-
-    const summary = document.createElement('div');
-    summary.className = 'claudian-tool-group-summary';
-    summary.setAttribute('tabindex', '0');
-    summary.setAttribute('role', 'button');
-    summary.setAttribute('aria-expanded', 'false');
-    summary.setAttribute('aria-label', labelText);
-
-    const chevron = document.createElement('span');
-    chevron.className = 'claudian-tool-group-chevron';
-    chevron.textContent = '\u25B6';
-
-    const labelEl = document.createElement('span');
-    labelEl.className = 'claudian-tool-group-label';
-    labelEl.textContent = labelText;
-
-    const statusEl = document.createElement('span');
-    statusEl.className = 'claudian-tool-group-status';
-    if (hasErrors) {
-      statusEl.classList.add('has-errors');
-      statusEl.innerHTML = ERROR_SVG;
-    } else {
-      statusEl.innerHTML = CHECKMARK_SVG;
-    }
-
-    summary.appendChild(chevron);
-    summary.appendChild(labelEl);
-    summary.appendChild(statusEl);
-
-    const groupContent = document.createElement('div');
-    groupContent.className = 'claudian-tool-group-content';
-
-    wrapper.appendChild(summary);
-    wrapper.appendChild(groupContent);
-
-    // Insert wrapper before first element in the run
-    elements[0].parentNode!.insertBefore(wrapper, elements[0]);
-
-    // Move elements into group content
-    for (const el of elements) {
-      groupContent.appendChild(el);
-    }
-
-    // Toggle handler
-    summary.addEventListener('click', () => {
-      const isExpanded = wrapper.classList.toggle('expanded');
-      summary.setAttribute('aria-expanded', String(isExpanded));
-    });
-
-    summary.addEventListener('keydown', (e: KeyboardEvent) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        summary.click();
-      }
-    });
+    createGroupWrapper(contentEl, runs[r].elements);
   }
+}
+
+// ============================================
+// Progressive Streaming Group
+// ============================================
+
+export interface ActiveStreamGroup {
+  pendingElements: HTMLElement[];
+  pendingGroupableCount: number;
+  wrapper: GroupWrapper | null;
+  toolCount: number;
+  thinkingCount: number;
+  thinkingDuration: number;
+  hasErrors: boolean;
+}
+
+export function integrateIntoStreamingGroup(
+  el: HTMLElement,
+  group: ActiveStreamGroup | null,
+  parentEl: HTMLElement,
+): ActiveStreamGroup | null {
+  // Chain-breaker → finalize current group
+  if (isChainBreaker(el)) {
+    finalizeStreamingGroup(group, parentEl);
+    return null;
+  }
+
+  // Not groupable and not transparent → finalize
+  if (!isGroupableElement(el) && !isTransparentElement(el)) {
+    finalizeStreamingGroup(group, parentEl);
+    return null;
+  }
+
+  // Transparent element with no active group → ignore
+  if (isTransparentElement(el) && !group) {
+    return null;
+  }
+
+  // Transparent element with active group → absorb
+  if (isTransparentElement(el) && group) {
+    if (group.wrapper) {
+      group.wrapper.contentEl.appendChild(el);
+    } else {
+      group.pendingElements.push(el);
+    }
+    return group;
+  }
+
+  // Groupable element
+  if (!group) {
+    // First groupable → create pending group (Phase 1)
+    return {
+      pendingElements: [el],
+      pendingGroupableCount: 1,
+      wrapper: null,
+      toolCount: 0,
+      thinkingCount: 0,
+      thinkingDuration: 0,
+      hasErrors: false,
+    };
+  }
+
+  if (!group.wrapper) {
+    // Second groupable (no wrapper yet) → create wrapper (Phase 2)
+    group.pendingElements.push(el);
+    group.pendingGroupableCount++;
+    const wrapper = createGroupWrapper(
+      parentEl,
+      group.pendingElements,
+      undefined,
+      true,
+    );
+    group.wrapper = wrapper;
+    group.pendingElements = [];
+    updateGroupLabel(wrapper);
+    return group;
+  }
+
+  // Subsequent groupable → append to existing wrapper
+  group.wrapper.contentEl.appendChild(el);
+  group.pendingGroupableCount++;
+  updateGroupLabel(group.wrapper);
+  return group;
+}
+
+export function finalizeStreamingGroup(
+  group: ActiveStreamGroup | null,
+  parentEl: HTMLElement,
+): void {
+  if (!group) return;
+
+  if (!group.wrapper) {
+    // Phase 1: no wrapper created → elements stay as-is in DOM
+    return;
+  }
+
+  if (group.pendingGroupableCount < MIN_GROUP_SIZE) {
+    // Not enough groupable items → unwrap
+    const children = Array.from(group.wrapper.contentEl.children);
+    const wrapperEl = group.wrapper.wrapperEl;
+    for (const child of children) {
+      parentEl.insertBefore(child, wrapperEl);
+    }
+    wrapperEl.remove();
+    return;
+  }
+
+  // Finalize: remove streaming modifier, update label and status
+  group.wrapper.wrapperEl.classList.remove('claudian-tool-group--streaming');
+  updateGroupLabel(group.wrapper);
 }

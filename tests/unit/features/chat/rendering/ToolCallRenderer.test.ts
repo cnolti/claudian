@@ -3,9 +3,14 @@ import { setIcon } from 'obsidian';
 
 import type { ToolCallInfo } from '@/core/types';
 import {
+  type ActiveStreamGroup,
+  createGroupWrapper,
+  finalizeStreamingGroup,
   getToolLabel,
   getToolName,
   getToolSummary,
+  groupToolBlocks,
+  integrateIntoStreamingGroup,
   isBlockedToolResult,
   renderStoredToolCall,
   renderTodoWriteResult,
@@ -18,6 +23,20 @@ import {
 jest.mock('obsidian', () => ({
   setIcon: jest.fn(),
 }));
+
+// Mock document.createElement for grouping functions (node test environment)
+const originalCreateElement = globalThis.document?.createElement;
+beforeAll(() => {
+  (globalThis as any).document = {
+    ...(globalThis.document || {}),
+    createElement: (tag: string) => createMockEl(tag),
+  };
+});
+afterAll(() => {
+  if (originalCreateElement) {
+    (globalThis as any).document.createElement = originalCreateElement;
+  }
+});
 
 // Helper to create a basic tool call
 function createToolCall(overrides: Partial<ToolCallInfo> = {}): ToolCallInfo {
@@ -439,6 +458,352 @@ describe('ToolCallRenderer', () => {
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
       expect(toolEl).toBeDefined();
+    });
+  });
+
+  describe('groupToolBlocks', () => {
+    function makeGroupableEl(cls = 'claudian-tool-call'): any {
+      const el = createMockEl();
+      el.addClass(cls);
+      return el;
+    }
+
+    function makeAskEl(): any {
+      const el = createMockEl();
+      el.addClass('claudian-tool-call');
+      const content = createMockEl();
+      content.addClass('claudian-tool-content-ask');
+      el._children.push(content);
+      (el as any).children = el._children;
+      return el;
+    }
+
+    function makeTextEl(): any {
+      const el = createMockEl();
+      el.addClass('claudian-text-block');
+      return el;
+    }
+
+    function makeBoundaryEl(): any {
+      const el = createMockEl();
+      el.addClass('claudian-compact-boundary');
+      return el;
+    }
+
+    it('should not group fewer than 2 groupable elements', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl());
+      groupToolBlocks(parent as unknown as HTMLElement);
+      // No wrapper created
+      expect(parent._children.some((c: any) => c.hasClass?.('claudian-tool-group'))).toBe(false);
+    });
+
+    it('should group 2+ consecutive tool calls', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl());
+      parent.appendChild(makeGroupableEl());
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      // Wrapper should be created
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeDefined();
+    });
+
+    it('should group thinking blocks with tool calls', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl('claudian-thinking-block'));
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeDefined();
+    });
+
+    it('should group write-edit blocks', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl('claudian-write-edit-block'));
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeDefined();
+    });
+
+    it('should group subagent blocks', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl('claudian-subagent-list'));
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeDefined();
+    });
+
+    it('should group TodoWrite tool calls (no longer excluded)', () => {
+      const parent = createMockEl();
+      // TodoWrite creates claudian-tool-call with claudian-tool-content-todo
+      const todoEl = createMockEl();
+      todoEl.addClass('claudian-tool-call');
+      const todoContent = createMockEl();
+      todoContent.addClass('claudian-tool-content-todo');
+      todoEl._children.push(todoContent);
+      (todoEl as any).children = todoEl._children;
+
+      parent.appendChild(todoEl);
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeDefined();
+    });
+
+    it('should NOT group AskUserQuestion (chain-breaker)', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl());
+      parent.appendChild(makeAskEl());
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      // No group should be formed (each side has only 1 groupable)
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeUndefined();
+    });
+
+    it('should absorb text blocks into active run', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl());
+      parent.appendChild(makeTextEl());
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      // Text block absorbed, still forms a group
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeDefined();
+    });
+
+    it('should break on compact boundary', () => {
+      const parent = createMockEl();
+      parent.appendChild(makeGroupableEl());
+      parent.appendChild(makeBoundaryEl());
+      parent.appendChild(makeGroupableEl());
+
+      groupToolBlocks(parent as unknown as HTMLElement);
+
+      // No group (each side has only 1 groupable)
+      const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
+      expect(wrapper).toBeUndefined();
+    });
+
+    it('should handle null contentEl gracefully', () => {
+      expect(() => groupToolBlocks(null)).not.toThrow();
+    });
+  });
+
+  describe('createGroupWrapper', () => {
+    it('should create wrapper with correct classes', () => {
+      const parent = createMockEl();
+      const el1 = createMockEl();
+      el1.addClass('claudian-tool-call');
+      const el2 = createMockEl();
+      el2.addClass('claudian-tool-call');
+
+      const group = createGroupWrapper(parent as unknown as HTMLElement, [el1, el2]);
+
+      expect(group.wrapperEl.hasClass('claudian-tool-group')).toBe(true);
+      expect(group.wrapperEl.hasClass('claudian-tool-group--streaming')).toBe(false);
+    });
+
+    it('should add --streaming modifier when streaming flag is set', () => {
+      const parent = createMockEl();
+      const el = createMockEl();
+      el.addClass('claudian-tool-call');
+
+      const group = createGroupWrapper(parent as unknown as HTMLElement, [el], null, true);
+
+      expect(group.wrapperEl.hasClass('claudian-tool-group--streaming')).toBe(true);
+    });
+
+    it('should count write-edit and subagent as tool calls in label', () => {
+      const parent = createMockEl();
+      const el1 = createMockEl();
+      el1.addClass('claudian-write-edit-block');
+      const el2 = createMockEl();
+      el2.addClass('claudian-subagent-list');
+      const el3 = createMockEl();
+      el3.addClass('claudian-tool-call');
+
+      const group = createGroupWrapper(parent as unknown as HTMLElement, [el1, el2, el3]);
+
+      expect(group.labelEl.textContent).toBe('3 tool calls');
+    });
+  });
+
+  describe('integrateIntoStreamingGroup', () => {
+    function makeGroupableEl(cls = 'claudian-tool-call'): any {
+      const el = createMockEl();
+      el.addClass(cls);
+      return el;
+    }
+
+    it('should create pending group on first groupable element', () => {
+      const parent = createMockEl();
+      const el = makeGroupableEl();
+      parent.appendChild(el);
+
+      const result = integrateIntoStreamingGroup(
+        el as unknown as HTMLElement,
+        null,
+        parent as unknown as HTMLElement,
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.pendingElements).toHaveLength(1);
+      expect(result!.wrapper).toBeNull();
+    });
+
+    it('should create wrapper on second groupable element', () => {
+      const parent = createMockEl();
+      const el1 = makeGroupableEl();
+      const el2 = makeGroupableEl();
+      parent.appendChild(el1);
+      parent.appendChild(el2);
+
+      let group = integrateIntoStreamingGroup(
+        el1 as unknown as HTMLElement,
+        null,
+        parent as unknown as HTMLElement,
+      );
+      group = integrateIntoStreamingGroup(
+        el2 as unknown as HTMLElement,
+        group,
+        parent as unknown as HTMLElement,
+      );
+
+      expect(group).not.toBeNull();
+      expect(group!.wrapper).not.toBeNull();
+      expect(group!.wrapper!.wrapperEl.hasClass('claudian-tool-group--streaming')).toBe(true);
+    });
+
+    it('should return null for chain-breaker elements', () => {
+      const parent = createMockEl();
+      const askEl = createMockEl();
+      askEl.addClass('claudian-tool-call');
+      const askContent = createMockEl();
+      askContent.addClass('claudian-tool-content-ask');
+      askEl._children.push(askContent);
+      (askEl as any).children = askEl._children;
+      parent.appendChild(askEl);
+
+      const result = integrateIntoStreamingGroup(
+        askEl as unknown as HTMLElement,
+        null,
+        parent as unknown as HTMLElement,
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it('should return null for non-groupable non-transparent elements', () => {
+      const parent = createMockEl();
+      const el = createMockEl();
+      el.addClass('claudian-response-footer');
+      parent.appendChild(el);
+
+      const result = integrateIntoStreamingGroup(
+        el as unknown as HTMLElement,
+        null,
+        parent as unknown as HTMLElement,
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it('should absorb transparent element into active group wrapper', () => {
+      const parent = createMockEl();
+      const el1 = makeGroupableEl();
+      const el2 = makeGroupableEl();
+      const textEl = createMockEl();
+      textEl.addClass('claudian-text-block');
+      parent.appendChild(el1);
+      parent.appendChild(el2);
+      parent.appendChild(textEl);
+
+      let group = integrateIntoStreamingGroup(el1, null, parent);
+      group = integrateIntoStreamingGroup(el2, group, parent);
+      group = integrateIntoStreamingGroup(textEl, group, parent);
+
+      expect(group).not.toBeNull();
+      expect(group!.wrapper).not.toBeNull();
+    });
+
+    it('should ignore transparent element with no active group', () => {
+      const parent = createMockEl();
+      const textEl = createMockEl();
+      textEl.addClass('claudian-text-block');
+      parent.appendChild(textEl);
+
+      const result = integrateIntoStreamingGroup(textEl, null, parent);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('finalizeStreamingGroup', () => {
+    function makeGroupableEl(cls = 'claudian-tool-call'): any {
+      const el = createMockEl();
+      el.addClass(cls);
+      return el;
+    }
+
+    it('should no-op for null group', () => {
+      const parent = createMockEl();
+      expect(() => finalizeStreamingGroup(null, parent as unknown as HTMLElement)).not.toThrow();
+    });
+
+    it('should leave pending elements as-is (Phase 1, no wrapper)', () => {
+      const parent = createMockEl();
+      const el = makeGroupableEl();
+      parent.appendChild(el);
+
+      const group: ActiveStreamGroup = {
+        pendingElements: [el],
+        pendingGroupableCount: 1,
+        wrapper: null,
+        toolCount: 0,
+        thinkingCount: 0,
+        thinkingDuration: 0,
+        hasErrors: false,
+      };
+
+      finalizeStreamingGroup(group, parent as unknown as HTMLElement);
+
+      // Element remains directly in parent
+      expect(parent._children).toContain(el);
+    });
+
+    it('should remove streaming modifier on finalize (Phase 2, enough items)', () => {
+      const parent = createMockEl();
+      const el1 = makeGroupableEl();
+      const el2 = makeGroupableEl();
+      parent.appendChild(el1);
+      parent.appendChild(el2);
+
+      let group = integrateIntoStreamingGroup(el1, null, parent);
+      group = integrateIntoStreamingGroup(el2, group, parent);
+
+      expect(group!.wrapper!.wrapperEl.hasClass('claudian-tool-group--streaming')).toBe(true);
+
+      finalizeStreamingGroup(group, parent as unknown as HTMLElement);
+
+      expect(group!.wrapper!.wrapperEl.hasClass('claudian-tool-group--streaming')).toBe(false);
     });
   });
 });

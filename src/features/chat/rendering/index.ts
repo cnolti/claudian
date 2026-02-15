@@ -28,10 +28,15 @@ export {
   type TodoItem,
 } from './TodoListRenderer';
 export {
+  type ActiveStreamGroup,
+  createGroupWrapper,
+  finalizeStreamingGroup,
   getToolLabel,
   getToolName,
   getToolSummary,
   groupToolBlocks,
+  type GroupWrapper,
+  integrateIntoStreamingGroup,
   isBlockedToolResult,
   renderStoredToolCall,
   renderToolCall,
