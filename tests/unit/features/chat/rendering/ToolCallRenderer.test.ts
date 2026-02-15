@@ -576,7 +576,7 @@ describe('ToolCallRenderer', () => {
       expect(wrapper).toBeUndefined();
     });
 
-    it('should absorb text blocks into active run', () => {
+    it('should break on text blocks (text stays visible between groups)', () => {
       const parent = createMockEl();
       parent.appendChild(makeGroupableEl());
       parent.appendChild(makeTextEl());
@@ -584,9 +584,9 @@ describe('ToolCallRenderer', () => {
 
       groupToolBlocks(parent as unknown as HTMLElement);
 
-      // Text block absorbed, still forms a group
+      // No group (text block splits the run, each side has only 1 groupable)
       const wrapper = parent._children.find((c: any) => c.hasClass?.('claudian-tool-group'));
-      expect(wrapper).toBeDefined();
+      expect(wrapper).toBeUndefined();
     });
 
     it('should break on compact boundary', () => {
@@ -726,7 +726,7 @@ describe('ToolCallRenderer', () => {
       expect(result).toBeNull();
     });
 
-    it('should absorb transparent element into active group wrapper', () => {
+    it('should finalize group when text block arrives', () => {
       const parent = createMockEl();
       const el1 = makeGroupableEl();
       const el2 = makeGroupableEl();
@@ -738,13 +738,13 @@ describe('ToolCallRenderer', () => {
 
       let group = integrateIntoStreamingGroup(el1, null, parent);
       group = integrateIntoStreamingGroup(el2, group, parent);
+      // Text block finalizes the group
       group = integrateIntoStreamingGroup(textEl, group, parent);
 
-      expect(group).not.toBeNull();
-      expect(group!.wrapper).not.toBeNull();
+      expect(group).toBeNull();
     });
 
-    it('should ignore transparent element with no active group', () => {
+    it('should return null for text block with no active group', () => {
       const parent = createMockEl();
       const textEl = createMockEl();
       textEl.addClass('claudian-text-block');

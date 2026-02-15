@@ -408,10 +408,11 @@ export class StreamController {
     if (!state.currentTextEl) {
       state.currentTextEl = state.currentContentEl.createDiv({ cls: 'claudian-text-block' });
       state.currentTextContent = '';
-      // Integrate text block into streaming group (transparent element)
-      state.activeStreamGroup = integrateIntoStreamingGroup(
-        state.currentTextEl, state.activeStreamGroup, state.currentContentEl
-      );
+      // Text blocks break tool grouping — finalize any active streaming group
+      if (state.activeStreamGroup) {
+        finalizeStreamingGroup(state.activeStreamGroup, state.currentContentEl);
+        state.activeStreamGroup = null;
+      }
     }
 
     state.currentTextContent += text;

@@ -629,8 +629,8 @@ function isChainBreaker(el: Element): boolean {
   return false;
 }
 
-function isTransparentElement(el: Element): boolean {
-  return el.classList.contains('claudian-text-block');
+function isTransparentElement(_el: Element): boolean {
+  return false;
 }
 
 function countGroupStats(elements: Element[]): {
@@ -784,9 +784,8 @@ function updateGroupLabel(group: GroupWrapper): void {
  * and thinking blocks into collapsible summary groups.
  *
  * Uses chain-breaker approach: groupable elements are accumulated into runs,
- * transparent elements (text-blocks) are absorbed into active runs without
- * incrementing the count, and chain-breakers (AskUserQuestion, footer,
- * compact boundary) close the current run.
+ * text blocks and chain-breakers (AskUserQuestion, footer, compact boundary)
+ * close the current run. Text stays visible between groups.
  *
  * Call after all content blocks have been rendered (stored replay or stream end).
  */
