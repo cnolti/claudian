@@ -507,7 +507,13 @@ export class ClaudianService {
         // For cold-start queries, use the passed externalContextPaths.
         // For persistent queries, read this.currentExternalContextPaths at execution time
         // so dynamic updates are reflected.
-        const paths = externalContextPaths ?? this.currentExternalContextPaths;
+        const convPaths = externalContextPaths ?? this.currentExternalContextPaths;
+        // Always merge current persistentExternalContextPaths so paths added to settings
+        // after a conversation was created are still allowed.
+        const persistentPaths = this.plugin.settings.persistentExternalContextPaths ?? [];
+        const paths = persistentPaths.length > 0
+          ? [...new Set([...persistentPaths, ...convPaths])]
+          : convPaths;
         return getPathAccessType(
           p,
           paths,
