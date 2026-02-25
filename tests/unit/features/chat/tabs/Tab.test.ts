@@ -111,6 +111,7 @@ const createMockClaudianService = (overrides?: {
 }) => ({
   ensureReady: overrides?.ensureReady ?? jest.fn().mockResolvedValue(true),
   closePersistentQuery: jest.fn(),
+  cleanup: jest.fn(),
   isReady: jest.fn().mockReturnValue(false),
   applyForkState: jest.fn((conv: any) => conv.sessionId ?? conv.forkSource?.sessionId ?? null),
   onReadyStateChange: overrides?.onReadyStateChange ?? jest.fn((listener: (ready: boolean) => void) => {
@@ -655,18 +656,18 @@ describe('Tab - Destruction', () => {
       expect(unsubscribeFn).toHaveBeenCalled();
     });
 
-    it('should close service persistent query', async () => {
-      const mockClosePersistentQuery = jest.fn();
+    it('should cleanup service', async () => {
+      const mockCleanup = jest.fn();
       const options = createMockOptions();
       const tab = createTab(options);
 
       tab.service = {
-        closePersistentQuery: mockClosePersistentQuery,
+        cleanup: mockCleanup,
       } as any;
 
       await destroyTab(tab);
 
-      expect(mockClosePersistentQuery).toHaveBeenCalledWith('tab closed');
+      expect(mockCleanup).toHaveBeenCalled();
       expect(tab.service).toBeNull();
     });
 

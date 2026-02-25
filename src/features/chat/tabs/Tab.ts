@@ -1089,10 +1089,8 @@ export async function destroyTab(tab: TabData): Promise<void> {
   }
   tab.dom.eventCleanups.length = 0;
 
-  // Close the tab's service
-  // Note: closePersistentQuery is synchronous but we make destroyTab async
-  // for future-proofing and proper cleanup ordering
-  tab.service?.closePersistentQuery('tab closed');
+  // Close the tab's service (cleanup also aborts any in-flight cold-start queries)
+  tab.service?.cleanup();
   tab.service = null;
 
   // Remove DOM element

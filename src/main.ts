@@ -192,12 +192,18 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   async onunload() {
-    // Ensures state is saved even if Obsidian quits without calling onClose()
     for (const view of this.getAllViews()) {
       const tabManager = view.getTabManager();
       if (tabManager) {
+        // Save state before cleanup
         const state = tabManager.getPersistedState();
         await this.storage.setTabManagerState(state);
+
+        // Kill all Claude CLI processes (onClose() may not fire on plugin unload)
+        for (const tab of tabManager.getAllTabs()) {
+          tab.service?.cleanup();
+          tab.service = null;
+        }
       }
     }
   }
