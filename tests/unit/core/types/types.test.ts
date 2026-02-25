@@ -122,6 +122,13 @@ describe('types.ts', () => {
         enableAutoScroll: true,
         openInMainTab: false,
         hiddenSlashCommands: [],
+        heartbeatEnabled: false,
+        heartbeatIntervalMinutes: 30,
+        heartbeatMaxTurns: 25,
+        heartbeatModel: 'sonnet',
+        heartbeatQuietStart: '22:00',
+        heartbeatQuietEnd: '06:00',
+        heartbeatPauseOnStreaming: true,
       };
 
       expect(settings.enableBlocklist).toBe(false);
@@ -161,6 +168,13 @@ describe('types.ts', () => {
         enableAutoScroll: true,
         openInMainTab: false,
         hiddenSlashCommands: [],
+        heartbeatEnabled: false,
+        heartbeatIntervalMinutes: 30,
+        heartbeatMaxTurns: 25,
+        heartbeatModel: 'sonnet',
+        heartbeatQuietStart: '22:00',
+        heartbeatQuietEnd: '06:00',
+        heartbeatPauseOnStreaming: true,
       };
 
       expect(settings.model).toBe('anthropic/custom-model-v1');
@@ -200,6 +214,13 @@ describe('types.ts', () => {
         enableAutoScroll: false,
         openInMainTab: false,
         hiddenSlashCommands: [],
+        heartbeatEnabled: false,
+        heartbeatIntervalMinutes: 30,
+        heartbeatMaxTurns: 25,
+        heartbeatModel: 'sonnet',
+        heartbeatQuietStart: '22:00',
+        heartbeatQuietEnd: '06:00',
+        heartbeatPauseOnStreaming: true,
       };
 
       expect(settings.lastClaudeModel).toBe('opus');

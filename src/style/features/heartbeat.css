@@ -1,0 +1,133 @@
+/* Heartbeat toggle button */
+.claudian-heartbeat-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-faint);
+  transition: color 0.15s ease;
+}
+
+.claudian-heartbeat-toggle:hover {
+  color: var(--text-normal);
+}
+
+.claudian-heartbeat-toggle svg {
+  width: 16px;
+  height: 16px;
+}
+
+.claudian-heartbeat-toggle--active {
+  color: var(--claudian-brand, #da7756);
+}
+
+.claudian-heartbeat-toggle--active:hover {
+  color: var(--text-normal);
+}
+
+/* Heartbeat status button */
+.claudian-heartbeat-status-container {
+  position: relative;
+}
+
+.claudian-heartbeat-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-faint);
+  transition: color 0.15s ease;
+}
+
+.claudian-heartbeat-status:hover {
+  color: var(--text-normal);
+}
+
+.claudian-heartbeat-status svg {
+  width: 16px;
+  height: 16px;
+}
+
+.claudian-heartbeat-status--running {
+  color: var(--claudian-brand, #da7756);
+  animation: claudian-heartbeat-pulse 1.5s ease-in-out infinite;
+}
+
+.claudian-heartbeat-status--error {
+  color: var(--text-error);
+}
+
+.claudian-heartbeat-status--quiet {
+  color: var(--text-faint);
+  opacity: 0.5;
+}
+
+@keyframes claudian-heartbeat-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Heartbeat dropdown */
+.claudian-heartbeat-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 8px;
+  min-width: 240px;
+  max-width: 320px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.claudian-heartbeat-dropdown.visible {
+  display: block;
+}
+
+.claudian-heartbeat-dropdown-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0;
+  color: var(--text-muted);
+}
+
+.claudian-heartbeat-dropdown-row-label {
+  color: var(--text-faint);
+  flex-shrink: 0;
+  margin-right: 12px;
+}
+
+.claudian-heartbeat-dropdown-row-value {
+  color: var(--text-normal);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claudian-heartbeat-dropdown-separator {
+  border: none;
+  border-top: 1px solid var(--background-modifier-border);
+  margin: 8px 0;
+}
+
+.claudian-heartbeat-dropdown-journal-title {
+  color: var(--text-faint);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.claudian-heartbeat-dropdown-journal {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}

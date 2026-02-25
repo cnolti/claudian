@@ -512,6 +512,99 @@ export class ClaudianSettingTab extends PluginSettingTab {
       this.renderContextLimitsSection();
     });
 
+    // Heartbeat / Daemon section
+    new Setting(containerEl).setName('Heartbeat (Vault Daemon)').setHeading();
+
+    new Setting(containerEl)
+      .setName('Enable heartbeat')
+      .setDesc('Periodically wakes up the Vault Daemon to scan calendar, documents, voice notes, and goals.')
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.heartbeatEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatEnabled = value;
+            await this.plugin.saveSettings();
+            if (value) {
+              this.plugin.heartbeatManager?.start();
+            } else {
+              this.plugin.heartbeatManager?.stop();
+            }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Interval (minutes)')
+      .setDesc('How often the daemon wakes up. Lower = more responsive, higher = cheaper.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(5, 120, 5)
+          .setValue(this.plugin.settings.heartbeatIntervalMinutes)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatIntervalMinutes = value;
+            await this.plugin.saveSettings();
+            this.plugin.heartbeatManager?.restart();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Model')
+      .setDesc('Model for heartbeat queries. Sonnet is cheaper for routine work.')
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption('sonnet', 'Sonnet')
+          .addOption('opus', 'Opus')
+          .addOption('haiku', 'Haiku')
+          .setValue(this.plugin.settings.heartbeatModel)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatModel = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Max turns per heartbeat')
+      .setDesc('Safety limit. The daemon usually needs 10-20 turns.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(5, 80, 5)
+          .setValue(this.plugin.settings.heartbeatMaxTurns)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatMaxTurns = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Quiet hours')
+      .setDesc('No heartbeats during these hours (format: HH:MM-HH:MM).')
+      .addText((text) =>
+        text
+          .setPlaceholder('22:00-06:00')
+          .setValue(`${this.plugin.settings.heartbeatQuietStart}-${this.plugin.settings.heartbeatQuietEnd}`)
+          .onChange(async (value) => {
+            const parts = value.split('-').map(s => s.trim());
+            if (parts.length === 2) {
+              this.plugin.settings.heartbeatQuietStart = parts[0];
+              this.plugin.settings.heartbeatQuietEnd = parts[1];
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Pause during active chat')
+      .setDesc('Skip heartbeats while you are actively chatting with Claude.')
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.heartbeatPauseOnStreaming)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatPauseOnStreaming = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     new Setting(containerEl).setName(t('settings.advanced')).setHeading();
 
     new Setting(containerEl)

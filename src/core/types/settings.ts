@@ -296,6 +296,15 @@ export interface ClaudianSettings {
 
   // Slash commands
   hiddenSlashCommands: string[];  // Command names to hide from dropdown (user preference)
+
+  // Heartbeat (Vault Daemon)
+  heartbeatEnabled: boolean;
+  heartbeatIntervalMinutes: number;
+  heartbeatMaxTurns: number;
+  heartbeatModel: string;
+  heartbeatQuietStart: string;
+  heartbeatQuietEnd: string;
+  heartbeatPauseOnStreaming: boolean;
 }
 
 /** Default Claudian-specific settings. */
@@ -359,6 +368,15 @@ export const DEFAULT_SETTINGS: ClaudianSettings = {
 
   // Slash commands
   hiddenSlashCommands: [],  // No commands hidden by default
+
+  // Heartbeat (Vault Daemon)
+  heartbeatEnabled: false,
+  heartbeatIntervalMinutes: 30,
+  heartbeatMaxTurns: 25,
+  heartbeatModel: 'sonnet',
+  heartbeatQuietStart: '22:00',
+  heartbeatQuietEnd: '06:00',
+  heartbeatPauseOnStreaming: true,
 };
 
 /** Default CC-compatible settings. */

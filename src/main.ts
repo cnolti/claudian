@@ -29,6 +29,7 @@ import {
   VIEW_TYPE_CLAUDIAN,
 } from './core/types';
 import { ClaudianView } from './features/chat/ClaudianView';
+import { HeartbeatManager } from './features/heartbeat/HeartbeatManager';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n';
@@ -55,6 +56,7 @@ export default class ClaudianPlugin extends Plugin {
   agentManager: AgentManager;
   storage: StorageService;
   cliResolver: ClaudeCliResolver;
+  heartbeatManager: HeartbeatManager;
   private conversations: Conversation[] = [];
   private runtimeEnvironmentVariables = '';
 
@@ -189,9 +191,19 @@ export default class ClaudianPlugin extends Plugin {
     });
 
     this.addSettingTab(new ClaudianSettingTab(this.app, this));
+
+    // Initialize heartbeat manager (daemon background queries)
+    this.heartbeatManager = new HeartbeatManager(this);
+    if (this.settings.heartbeatEnabled) {
+      this.app.workspace.onLayoutReady(() => {
+        this.heartbeatManager.start();
+      });
+    }
   }
 
   async onunload() {
+    this.heartbeatManager?.destroy();
+
     for (const view of this.getAllViews()) {
       const tabManager = view.getTabManager();
       if (tabManager) {

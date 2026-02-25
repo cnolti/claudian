@@ -3,6 +3,7 @@ import { ItemView, Notice, setIcon } from 'obsidian';
 
 import { VIEW_TYPE_CLAUDIAN } from '../../core/types';
 import type ClaudianPlugin from '../../main';
+import type { HeartbeatSummary } from '../heartbeat/types';
 import { LOGO_SVG } from './constants';
 import { TabBar, TabManager, updatePlanModeUI } from './tabs';
 import type { TabData, TabId } from './tabs/types';
@@ -28,6 +29,10 @@ export class ClaudianView extends ItemView {
 
   // Header elements
   private historyDropdown: HTMLElement | null = null;
+  private heartbeatToggleBtn: HTMLElement | null = null;
+  private heartbeatStatusBtn: HTMLElement | null = null;
+  private heartbeatStatusContainer: HTMLElement | null = null;
+  private heartbeatDropdown: HTMLElement | null = null;
 
   // Event refs for cleanup
   private eventRefs: EventRef[] = [];
@@ -244,6 +249,28 @@ export class ClaudianView extends ItemView {
     // Header actions (right side)
     this.headerActionsContent = document.createElement('div');
     this.headerActionsContent.className = 'claudian-header-actions';
+
+    // Heartbeat toggle button
+    this.heartbeatToggleBtn = this.headerActionsContent.createDiv({ cls: 'claudian-heartbeat-toggle' });
+    setIcon(this.heartbeatToggleBtn, 'heart');
+    this.heartbeatToggleBtn.setAttribute('aria-label', 'Toggle heartbeat');
+    this.heartbeatToggleBtn.addEventListener('click', () => this.toggleHeartbeat());
+    this.updateHeartbeatToggleStyle();
+
+    // Heartbeat status button with dropdown
+    this.heartbeatStatusContainer = this.headerActionsContent.createDiv({ cls: 'claudian-heartbeat-status-container' });
+    this.heartbeatStatusBtn = this.heartbeatStatusContainer.createDiv({ cls: 'claudian-heartbeat-status' });
+    setIcon(this.heartbeatStatusBtn, 'activity');
+    this.heartbeatStatusBtn.setAttribute('aria-label', 'Heartbeat status');
+    this.heartbeatStatusBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.toggleHeartbeatDropdown();
+    });
+    this.heartbeatDropdown = this.heartbeatStatusContainer.createDiv({ cls: 'claudian-heartbeat-dropdown' });
+    this.updateHeartbeatStatusVisibility();
+
+    // Register for heartbeat status updates
+    this.plugin.heartbeatManager.onStatusChange = (summary) => this.onHeartbeatStatusChange(summary);
 
     // New tab button (plus icon)
     const newTabBtn = this.headerActionsContent.createDiv({ cls: 'claudian-header-btn claudian-new-tab-btn' });
@@ -469,6 +496,7 @@ export class ClaudianView extends ItemView {
     // Document-level click to close dropdowns
     this.registerDomEvent(document, 'click', () => {
       this.historyDropdown?.removeClass('visible');
+      this.heartbeatDropdown?.classList.remove('visible');
     });
 
     // View-level Shift+Tab to toggle plan mode (works from any focused element)
@@ -607,5 +635,146 @@ export class ClaudianView extends ItemView {
   /** Gets the tab manager. */
   getTabManager(): TabManager | null {
     return this.tabManager;
+  }
+
+  // ============================================
+  // Heartbeat UI
+  // ============================================
+
+  private toggleHeartbeat(): void {
+    const enabled = !this.plugin.settings.heartbeatEnabled;
+    this.plugin.settings.heartbeatEnabled = enabled;
+    this.plugin.saveSettings();
+
+    if (enabled) {
+      this.plugin.heartbeatManager.start();
+    } else {
+      this.plugin.heartbeatManager.stop();
+    }
+
+    this.updateHeartbeatToggleStyle();
+    this.updateHeartbeatStatusVisibility();
+  }
+
+  private updateHeartbeatToggleStyle(): void {
+    if (!this.heartbeatToggleBtn) return;
+    if (this.plugin.settings.heartbeatEnabled) {
+      this.heartbeatToggleBtn.classList.add('claudian-heartbeat-toggle--active');
+    } else {
+      this.heartbeatToggleBtn.classList.remove('claudian-heartbeat-toggle--active');
+    }
+  }
+
+  private updateHeartbeatStatusVisibility(): void {
+    if (!this.heartbeatStatusContainer) return;
+    this.heartbeatStatusContainer.style.display = this.plugin.settings.heartbeatEnabled ? '' : 'none';
+  }
+
+  private toggleHeartbeatDropdown(): void {
+    if (!this.heartbeatDropdown) return;
+    const isVisible = this.heartbeatDropdown.classList.contains('visible');
+    if (isVisible) {
+      this.heartbeatDropdown.classList.remove('visible');
+    } else {
+      this.updateHeartbeatDropdown();
+      this.heartbeatDropdown.classList.add('visible');
+    }
+  }
+
+  private updateHeartbeatDropdown(): void {
+    if (!this.heartbeatDropdown) return;
+
+    this.plugin.heartbeatManager.getSummary().then(summary => {
+      if (!this.heartbeatDropdown) return;
+      this.heartbeatDropdown.empty();
+
+      // Status row
+      const statusLabel = this.getStatusLabel(summary);
+      this.addDropdownRow('Status', statusLabel);
+
+      // Last run
+      if (summary.lastRun) {
+        const time = new Date(summary.lastRun);
+        const timeStr = `${time.getHours().toString().padStart(2, '0')}:${time.getMinutes().toString().padStart(2, '0')}`;
+        this.addDropdownRow('Last run', `${timeStr} (${summary.lastMode || 'unknown'})`);
+      } else {
+        this.addDropdownRow('Last run', 'Never');
+      }
+
+      // Run count
+      this.addDropdownRow('Run', `#${summary.runCount} / ${summary.totalRuns} total`);
+
+      // Compaction
+      this.addDropdownRow('Compaction', `in ${summary.runsToCompaction} runs`);
+
+      // Error
+      if (summary.error) {
+        this.addDropdownRow('Error', summary.error);
+      }
+
+      // Journal section
+      if (summary.lastJournalLines && summary.lastJournalLines.length > 0) {
+        const separator = this.heartbeatDropdown.createEl('hr', { cls: 'claudian-heartbeat-dropdown-separator' });
+        separator.empty(); // hr has no content
+
+        this.heartbeatDropdown.createDiv({
+          cls: 'claudian-heartbeat-dropdown-journal-title',
+          text: 'Last activity:',
+        });
+
+        const journalEl = this.heartbeatDropdown.createDiv({ cls: 'claudian-heartbeat-dropdown-journal' });
+        journalEl.textContent = summary.lastJournalLines.join('\n');
+      }
+    });
+  }
+
+  private addDropdownRow(label: string, value: string): void {
+    if (!this.heartbeatDropdown) return;
+    const row = this.heartbeatDropdown.createDiv({ cls: 'claudian-heartbeat-dropdown-row' });
+    row.createSpan({ cls: 'claudian-heartbeat-dropdown-row-label', text: label });
+    row.createSpan({ cls: 'claudian-heartbeat-dropdown-row-value', text: value });
+  }
+
+  private getStatusLabel(summary: HeartbeatSummary): string {
+    switch (summary.status) {
+      case 'running': return 'Running...';
+      case 'quiet': return 'Quiet hours';
+      case 'paused': return 'Paused (active chat)';
+      case 'error': return 'Error';
+      case 'disabled': return 'Disabled';
+      case 'idle':
+        if (summary.nextHeartbeatIn !== null) {
+          return `Idle (next in ${summary.nextHeartbeatIn}min)`;
+        }
+        return 'Idle';
+      default: return 'Unknown';
+    }
+  }
+
+  private onHeartbeatStatusChange(summary: HeartbeatSummary): void {
+    if (!this.heartbeatStatusBtn) return;
+
+    // Update status button style
+    const btn = this.heartbeatStatusBtn;
+    btn.classList.remove(
+      'claudian-heartbeat-status--running',
+      'claudian-heartbeat-status--error',
+      'claudian-heartbeat-status--quiet'
+    );
+
+    switch (summary.status) {
+      case 'running':
+        btn.classList.add('claudian-heartbeat-status--running');
+        break;
+      case 'error':
+        btn.classList.add('claudian-heartbeat-status--error');
+        break;
+      case 'quiet':
+        btn.classList.add('claudian-heartbeat-status--quiet');
+        break;
+    }
+
+    // Update tooltip
+    btn.setAttribute('aria-label', `Heartbeat: ${this.getStatusLabel(summary)}`);
   }
 }
