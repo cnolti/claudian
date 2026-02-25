@@ -1,5 +1,5 @@
-import type { App, Editor} from 'obsidian';
-import { MarkdownView, Notice } from 'obsidian';
+import type { App, Editor, MarkdownView } from 'obsidian';
+import { Notice } from 'obsidian';
 
 import type ClaudianPlugin from '../../../main';
 import { hideSelectionHighlight, showSelectionHighlight } from '../../../shared/components/SelectionHighlight';
@@ -8,6 +8,7 @@ import { MentionDropdownController } from '../../../shared/mention/MentionDropdo
 import { type CursorContext, getEditorView } from '../../../utils/editor';
 import { escapeHtml, normalizeInsertionText } from '../../../utils/inlineEdit';
 import { getVaultPath, normalizePathForVault as normalizePathForVaultUtil } from '../../../utils/path';
+import { VaultFolderCache } from '../../chat/ui/file-context/state/VaultFolderCache';
 import { type InlineEditMode, InlineEditService } from '../InlineEditService';
 
 export type InlineEditContext =
@@ -199,6 +200,8 @@ export class InlineEditModal {
   constructor(
     private app: App,
     private plugin: ClaudianPlugin,
+    private editor: Editor,
+    private view: MarkdownView,
     private editContext: InlineEditContext,
     private notePath: string
   ) {}
@@ -209,12 +212,21 @@ export class InlineEditModal {
       return { decision: 'reject' };
     }
 
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) return { decision: 'reject' };
+    // Use the editor/view provided by Obsidian's editorCallback.
+    // This avoids timing issues during leaf/view transitions (e.g., navigating via Search in the same tab).
+    let editor = this.editor;
+    let editorView = getEditorView(editor);
 
-    const editor = view.editor;
-    const editorView = getEditorView(editor);
-    if (!editorView) return { decision: 'reject' };
+    // Fallback: in rare cases Obsidian may re-initialize the editor between callback and modal open.
+    if (!editorView) {
+      editor = this.view.editor;
+      editorView = getEditorView(editor);
+    }
+
+    if (!editorView) {
+      new Notice('Inline edit unavailable: could not access the active editor. Try reopening the note.');
+      return { decision: 'reject' };
+    }
 
     return new Promise((resolve) => {
       this.controller = new InlineEditController(
@@ -252,6 +264,7 @@ class InlineEditController {
   private slashCommandDropdown: SlashCommandDropdown | null = null;
   private mentionDropdown: MentionDropdownController | null = null;
   private attachedFiles: Set<string> = new Set();
+  private folderCache: VaultFolderCache | null = null;
 
   constructor(
     private app: App,
@@ -403,7 +416,7 @@ class InlineEditController {
       }
     );
 
-    // No cache needed: short-lived modal
+    this.folderCache = new VaultFolderCache(this.app);
     this.mentionDropdown = new MentionDropdownController(
       document.body,
       this.inputEl,
@@ -414,6 +427,8 @@ class InlineEditController {
         setMentionedMcpServers: () => false,
         addMentionedMcpServer: () => {},
         getExternalContexts: () => [],
+        getCachedVaultFolders: () =>
+          this.folderCache?.getFolders().map(f => ({ name: f.name, path: f.path })) ?? [],
         getCachedMarkdownFiles: () => {
           try {
             return this.app.vault.getMarkdownFiles();
@@ -625,6 +640,7 @@ class InlineEditController {
     this.mentionDropdown?.destroy();
     this.mentionDropdown = null;
     this.attachedFiles.clear();
+    this.folderCache = null;
 
     if (activeController === this) {
       activeController = null;
