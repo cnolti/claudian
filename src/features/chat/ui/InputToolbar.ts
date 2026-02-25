@@ -295,10 +295,8 @@ export class ExternalContextSelector {
     this.updateDisplay();
     this.renderDropdown();
 
-    // If invalid paths were removed, notify user and save updated list
+    // If invalid paths were removed, silently save updated list
     if (invalidPaths.length > 0) {
-      const pathNames = invalidPaths.map(p => this.shortenPath(p)).join(', ');
-      new Notice(`Removed ${invalidPaths.length} invalid external context path(s): ${pathNames}`, 5000);
       this.onPersistenceChangeCallback?.([...this.persistentPaths]);
     }
   }

@@ -21,6 +21,10 @@
   color: var(--claudian-brand, #da7756);
 }
 
+.claudian-heartbeat-toggle--active svg {
+  fill: currentColor;
+}
+
 .claudian-heartbeat-toggle--active:hover {
   color: var(--text-normal);
 }
@@ -67,19 +71,19 @@
   50% { opacity: 0.4; }
 }
 
-/* Heartbeat dropdown */
+/* Heartbeat dropdown (opens upward) */
 .claudian-heartbeat-dropdown {
   display: none;
   position: absolute;
-  top: 100%;
+  bottom: 100%;
   right: 0;
-  margin-top: 8px;
+  margin-bottom: 8px;
   min-width: 240px;
   max-width: 320px;
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
   z-index: 100;
   padding: 12px;
   font-size: 12px;
