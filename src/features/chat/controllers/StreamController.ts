@@ -46,6 +46,7 @@ import {
   createThinkingBlock,
   finalizeThinkingBlock,
 } from '../rendering/ThinkingBlockRenderer';
+import { groupToolBlocks } from '../rendering/toolCallGrouping';
 import {
   getToolName,
   getToolSummary,
@@ -1517,6 +1518,9 @@ export class StreamController {
     this.cancelPendingToolOutputRenders();
     this.cancelPendingScroll();
     this.hideThinkingIndicator();
+    // Group consecutive tool calls / thinking blocks BEFORE clearing the
+    // content element, so the just-streamed message gets a collapsible summary.
+    groupToolBlocks(state.currentContentEl);
     state.currentContentEl = null;
     state.currentTextEl = null;
     state.currentTextContent = '';
