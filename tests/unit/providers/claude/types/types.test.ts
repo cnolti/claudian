@@ -108,6 +108,13 @@ describe('types.ts', () => {
         savedProviderServiceTier: {},
         savedProviderThinkingBudget: {},
         savedProviderPermissionMode: {},
+        heartbeatEnabled: false,
+        heartbeatIntervalMinutes: 15,
+        heartbeatMaxTurns: 8,
+        heartbeatModel: 'haiku',
+        heartbeatQuietStart: '22:00',
+        heartbeatQuietEnd: '06:00',
+        heartbeatPauseOnStreaming: true,
       };
 
       expect(settings.permissionMode).toBe('yolo');
@@ -160,6 +167,13 @@ describe('types.ts', () => {
         savedProviderServiceTier: {},
         savedProviderThinkingBudget: {},
         savedProviderPermissionMode: {},
+        heartbeatEnabled: false,
+        heartbeatIntervalMinutes: 15,
+        heartbeatMaxTurns: 8,
+        heartbeatModel: 'haiku',
+        heartbeatQuietStart: '22:00',
+        heartbeatQuietEnd: '06:00',
+        heartbeatPauseOnStreaming: true,
       };
 
       expect(settings.model).toBe('anthropic/custom-model-v1');
@@ -213,6 +227,13 @@ describe('types.ts', () => {
         savedProviderServiceTier: {},
         savedProviderThinkingBudget: {},
         savedProviderPermissionMode: {},
+        heartbeatEnabled: false,
+        heartbeatIntervalMinutes: 15,
+        heartbeatMaxTurns: 8,
+        heartbeatModel: 'haiku',
+        heartbeatQuietStart: '22:00',
+        heartbeatQuietEnd: '06:00',
+        heartbeatPauseOnStreaming: true,
       };
 
       expect(settings.lastClaudeModel).toBe('opus');

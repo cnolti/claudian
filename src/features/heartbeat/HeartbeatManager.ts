@@ -3,8 +3,10 @@ import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-import { createCustomSpawnFunction } from '../../core/agent/customSpawn';
+import { ProviderWorkspaceRegistry } from '../../core/providers/ProviderWorkspaceRegistry';
 import type ClaudianPlugin from '../../main';
+import { createCustomSpawnFunction } from '../../providers/claude/runtime/customSpawn';
+import { getClaudeProviderSettings } from '../../providers/claude/settings';
 import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../utils/env';
 import { getVaultPath } from '../../utils/path';
 import { loadConfig } from './HeartbeatConfig';
@@ -179,12 +181,12 @@ export class HeartbeatManager {
     prompt: string,
     sessionId: string | null
   ): Promise<{ sessionId: string | null; success: boolean }> {
-    const resolvedClaudePath = this.plugin.getResolvedClaudeCliPath();
+    const resolvedClaudePath = this.plugin.getResolvedProviderCliPath('claude');
     if (!resolvedClaudePath) {
       return { sessionId: null, success: false };
     }
 
-    const customEnv = parseEnvironmentVariables(this.plugin.getActiveEnvironmentVariables());
+    const customEnv = parseEnvironmentVariables(this.plugin.getActiveEnvironmentVariables('claude'));
     const enhancedPath = getEnhancedPath(customEnv.PATH, resolvedClaudePath);
     const missingNodeError = getMissingNodeError(resolvedClaudePath, enhancedPath);
     if (missingNodeError) {
@@ -205,14 +207,17 @@ export class HeartbeatManager {
       },
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
-      settingSources: this.plugin.settings.loadUserClaudeSettings
+      settingSources: getClaudeProviderSettings(
+        this.plugin.settings as unknown as Record<string, unknown>
+      ).loadUserSettings
         ? ['user', 'project']
         : ['project'],
       spawnClaudeCodeProcess: createCustomSpawnFunction(enhancedPath),
     };
 
-    // Add MCP servers (calendar, paperless, whatsapp, etc.)
-    const mcpServers = this.plugin.mcpManager.getActiveServers(new Set());
+    // Add Claude-provider MCP servers (calendar, paperless, whatsapp, etc.)
+    const mcpManager = ProviderWorkspaceRegistry.getMcpServerManager('claude');
+    const mcpServers = mcpManager?.getActiveServers(new Set()) ?? {};
     if (Object.keys(mcpServers).length > 0) {
       options.mcpServers = mcpServers;
     }

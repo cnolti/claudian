@@ -120,6 +120,15 @@ export interface ClaudianSettings {
   // UI settings
   keyboardNavigation: KeyboardNavigationSettings;
 
+  // Heartbeat (fork-only) — vault daemon background heartbeat
+  heartbeatEnabled: boolean;
+  heartbeatIntervalMinutes: number;
+  heartbeatMaxTurns: number;
+  heartbeatModel: string;
+  heartbeatQuietStart: string;
+  heartbeatQuietEnd: string;
+  heartbeatPauseOnStreaming: boolean;
+
   // Internationalization
   locale: string;
 

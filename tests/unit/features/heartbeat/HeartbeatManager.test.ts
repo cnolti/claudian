@@ -17,8 +17,16 @@ jest.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: jest.fn(),
 }));
 jest.mock('fs/promises');
-jest.mock('../../../../src/core/agent/customSpawn', () => ({
+jest.mock('../../../../src/providers/claude/runtime/customSpawn', () => ({
   createCustomSpawnFunction: jest.fn(() => jest.fn()),
+}));
+jest.mock('../../../../src/providers/claude/settings', () => ({
+  getClaudeProviderSettings: jest.fn(() => ({ loadUserSettings: false })),
+}));
+jest.mock('../../../../src/core/providers/ProviderWorkspaceRegistry', () => ({
+  ProviderWorkspaceRegistry: {
+    getMcpServerManager: jest.fn(() => ({ getActiveServers: jest.fn(() => ({})) })),
+  },
 }));
 jest.mock('../../../../src/utils/env', () => ({
   getEnhancedPath: jest.fn(() => '/usr/bin'),
@@ -39,13 +47,11 @@ function makePlugin(overrides: Record<string, unknown> = {}): any {
       heartbeatQuietStart: '22:00',
       heartbeatQuietEnd: '06:00',
       heartbeatPauseOnStreaming: true,
-      loadUserClaudeSettings: false,
       ...overrides,
     },
     app: { vault: { adapter: { basePath: '/vault' } } },
-    mcpManager: { getActiveServers: jest.fn(() => ({})) },
     getAllViews: jest.fn(() => []),
-    getResolvedClaudeCliPath: jest.fn(() => '/usr/local/bin/claude'),
+    getResolvedProviderCliPath: jest.fn(() => '/usr/local/bin/claude'),
     getActiveEnvironmentVariables: jest.fn(() => ''),
     saveSettings: jest.fn(),
   };
