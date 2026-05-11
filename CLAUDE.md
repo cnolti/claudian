@@ -78,3 +78,4 @@ Tests mirror the `src/` layout under `tests/unit/` and `tests/integration/`.
 - Run `npm run typecheck && npm run lint && npm run test && npm run build` after editing.
 - No `console.*` in production code.
 - Put non-committed notes, handoff files, and throwaway scripts in `.context/`.
+- **Deploy after every task**: `npm run deploy` bumps the fork version, builds, copies to the Obsidian vault, and pushes to all non-upstream remotes. Use `npm run deploy -- --skip-bump` to deploy without version bump, `--skip-git` to skip commit/push.
