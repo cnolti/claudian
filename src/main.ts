@@ -31,12 +31,14 @@ import {
 } from './core/types';
 import type { ChatViewPlacement, EnvironmentScope } from './core/types/settings';
 import { ClaudianView } from './features/chat/ClaudianView';
+import { HeartbeatManager } from './features/heartbeat/HeartbeatManager';
 import { type InlineEditContext, InlineEditModal } from './features/inline-edit/ui/InlineEditModal';
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
 import type { Locale } from './i18n/types';
 import { OPENCODE_PLAN_MODE_ID, OPENCODE_SAFE_MODE_ID } from './providers/opencode/modes';
 import { buildCursorContext } from './utils/editor';
+import { mergePersistentExternalContextPaths } from './utils/externalContext';
 import { getVaultPath } from './utils/path';
 
 function isClaudianView(value: unknown): value is ClaudianView {
@@ -48,12 +50,18 @@ function isClaudianView(value: unknown): value is ClaudianView {
 export default class ClaudianPlugin extends Plugin {
   settings!: ClaudianSettings;
   storage!: SharedAppStorage;
+  heartbeat!: HeartbeatManager;
   private conversations: Conversation[] = [];
   private lastKnownTabManagerState: AppTabManagerState | null = null;
 
   async onload() {
     await this.loadSettings();
     await ProviderWorkspaceRegistry.initializeAll(this);
+
+    this.heartbeat = new HeartbeatManager(this);
+    if (this.settings.heartbeatEnabled) {
+      this.heartbeat.start();
+    }
 
     this.registerView(
       VIEW_TYPE_CLAUDIAN,
@@ -177,12 +185,20 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   async onunload() {
-    // Ensures state is saved even if Obsidian quits without calling onClose()
+    this.heartbeat?.destroy();
+    // Ensures state is saved and provider runtime processes are terminated even
+    // if Obsidian quits without calling onClose() — otherwise zombie CLI
+    // processes (Claude/Codex) accumulate across plugin reload/disable.
     for (const view of this.getAllViews()) {
       const tabManager = view.getTabManager();
       if (tabManager) {
         const state = tabManager.getPersistedState();
         await this.persistTabManagerState(state);
+
+        for (const tab of tabManager.getAllTabs()) {
+          tab.service?.cleanup();
+          tab.service = null;
+        }
       }
     }
   }
@@ -448,7 +464,10 @@ export default class ClaudianPlugin extends Plugin {
         const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
         const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
           ?? (hasConversationContext
-            ? conversation?.externalContextPaths ?? []
+            ? mergePersistentExternalContextPaths(
+                this.settings.persistentExternalContextPaths,
+                conversation?.externalContextPaths
+              )
             : this.settings.persistentExternalContextPaths ?? []);
 
         tab.service.syncConversationState(conversation, externalContextPaths);

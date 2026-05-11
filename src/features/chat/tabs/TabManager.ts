@@ -13,6 +13,7 @@ import type { Conversation, SlashCommand } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { chooseForkTarget } from '../../../shared/modals/ForkTargetModal';
+import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
 import { getTabProviderId } from './providerResolution';
 import {
   activateTab,
@@ -277,7 +278,10 @@ export class TabManager implements TabManagerInterface {
         if (conversation) {
           const hasMessages = conversation.messages.length > 0;
           const externalContextPaths = hasMessages
-            ? conversation.externalContextPaths || []
+            ? mergePersistentExternalContextPaths(
+                this.plugin.settings.persistentExternalContextPaths,
+                conversation.externalContextPaths
+              )
             : (this.plugin.settings.persistentExternalContextPaths || []);
 
           tab.service.syncConversationState(conversation, externalContextPaths);
@@ -840,7 +844,10 @@ export class TabManager implements TabManagerInterface {
     const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
     const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
       ?? (hasConversationContext
-        ? conversation?.externalContextPaths ?? []
+        ? mergePersistentExternalContextPaths(
+            this.plugin.settings.persistentExternalContextPaths,
+            conversation?.externalContextPaths
+          )
         : this.plugin.settings.persistentExternalContextPaths ?? []);
     const runtime = tab.service?.providerId === providerId ? tab.service : null;
     const warmupMode = this.resolveProviderTabWarmupMode({

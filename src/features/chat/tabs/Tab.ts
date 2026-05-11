@@ -25,6 +25,7 @@ import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import { getEnhancedPath } from '../../../utils/env';
+import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
 import { getVaultPath } from '../../../utils/path';
 import { BrowserSelectionController } from '../controllers/BrowserSelectionController';
 import { CanvasSelectionController } from '../controllers/CanvasSelectionController';
@@ -575,7 +576,10 @@ export async function initializeTabService(
     if (conversation) {
       const hasMessages = conversation.messages.length > 0;
       const externalContextPaths = hasMessages
-        ? conversation.externalContextPaths || []
+        ? mergePersistentExternalContextPaths(
+            plugin.settings.persistentExternalContextPaths,
+            conversation.externalContextPaths
+          )
         : (plugin.settings.persistentExternalContextPaths || []);
 
       runtime.syncConversationState(conversation, externalContextPaths);
@@ -1291,7 +1295,10 @@ export function initializeTabControllers(
         if (tab.service && tab.service.providerId === nextProviderId && conversation) {
           const hasMessages = conversation.messages.length > 0;
           const externalContextPaths = hasMessages
-            ? conversation.externalContextPaths || []
+            ? mergePersistentExternalContextPaths(
+                plugin.settings.persistentExternalContextPaths,
+                conversation.externalContextPaths
+              )
             : (plugin.settings.persistentExternalContextPaths || []);
           tab.service.syncConversationState(conversation, externalContextPaths);
         }

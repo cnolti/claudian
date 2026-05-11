@@ -6,6 +6,7 @@ import type { Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
+import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
@@ -440,9 +441,13 @@ export class ConversationController {
     const hasMessages = state.messages.length > 0;
 
     // Determine external context paths for this session
-    // Empty session: use persistent paths; session with messages: use saved paths
+    // Empty session: use persistent paths; session with messages: union of saved + persistent
+    // so newly-added persistent paths are immediately effective in existing conversations.
     const externalContextPaths = hasMessages
-      ? conversation.externalContextPaths || []
+      ? mergePersistentExternalContextPaths(
+          plugin.settings.persistentExternalContextPaths,
+          conversation.externalContextPaths
+        )
       : plugin.settings.persistentExternalContextPaths || [];
 
     this.getAgentService()?.syncConversationState(conversation, externalContextPaths);
@@ -493,8 +498,14 @@ export class ConversationController {
         plugin.settings.persistentExternalContextPaths || []
       );
     } else {
-      // Session with messages: restore exactly what was saved
-      externalContextSelector.setExternalContexts(savedPaths || []);
+      // Session with messages: restore saved paths plus current persistent paths,
+      // so paths added to settings after the session was created are still available.
+      externalContextSelector.setExternalContexts(
+        mergePersistentExternalContextPaths(
+          plugin.settings.persistentExternalContextPaths,
+          savedPaths
+        )
+      );
     }
   }
 

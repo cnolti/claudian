@@ -141,3 +141,23 @@ export function isDuplicatePath(newPath: string, existingPaths: string[]): boole
   const normalizedNew = normalizePathForComparison(newPath);
   return existingPaths.some(existing => normalizePathForComparison(existing) === normalizedNew);
 }
+
+/**
+ * Returns the union of persistent external context paths and conversation-saved paths,
+ * deduplicated by reference equality. The persistent paths come first so they take
+ * priority in any ordered display.
+ *
+ * Why: when a path is added to settings AFTER a conversation was created, the
+ * conversation's saved paths alone would not include it — and the SDK would block
+ * access. Always merging persistent paths into the effective set ensures newly-
+ * configured paths are immediately effective across all conversations.
+ */
+export function mergePersistentExternalContextPaths(
+  persistent: string[] | undefined,
+  saved: string[] | undefined
+): string[] {
+  const persistentList = persistent ?? [];
+  const savedList = saved ?? [];
+  if (persistentList.length === 0) return savedList;
+  return Array.from(new Set([...persistentList, ...savedList]));
+}
