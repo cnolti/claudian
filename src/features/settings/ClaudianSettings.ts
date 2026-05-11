@@ -451,6 +451,108 @@ export class ClaudianSettingTab extends PluginSettingTab {
     addHotkeySettingRow(hotkeyGrid, this.app, 'claudian:new-tab', 'settings.newTabHotkey');
     addHotkeySettingRow(hotkeyGrid, this.app, 'claudian:close-current-tab', 'settings.closeTabHotkey');
 
+    // --- Heartbeat (fork-only) ---
+
+    new Setting(container).setName('Heartbeat').setHeading();
+
+    new Setting(container)
+      .setName('Enable heartbeat')
+      .setDesc('Periodically wake Claude in the background to update the vault daemon state.')
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.heartbeatEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatEnabled = value;
+            await this.plugin.saveSettings();
+            if (value) {
+              this.plugin.heartbeat.start();
+            } else {
+              this.plugin.heartbeat.stop();
+            }
+          }),
+      );
+
+    new Setting(container)
+      .setName('Interval (minutes)')
+      .setDesc('How often the heartbeat fires.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(5, 120, 5)
+          .setValue(this.plugin.settings.heartbeatIntervalMinutes)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatIntervalMinutes = value;
+            await this.plugin.saveSettings();
+            if (this.plugin.settings.heartbeatEnabled) {
+              this.plugin.heartbeat.restart();
+            }
+          }),
+      );
+
+    new Setting(container)
+      .setName('Max turns')
+      .setDesc('Maximum SDK turns the heartbeat can take per tick before terminating.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 40, 1)
+          .setValue(this.plugin.settings.heartbeatMaxTurns)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatMaxTurns = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(container)
+      .setName('Model')
+      .setDesc('Model used by the heartbeat (defaults to haiku for low cost).')
+      .addText((text) =>
+        text
+          .setPlaceholder('haiku')
+          .setValue(this.plugin.settings.heartbeatModel)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatModel = value.trim() || 'haiku';
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(container)
+      .setName('Quiet hours start (HH:MM)')
+      .setDesc('Heartbeat is suppressed between quiet-start and quiet-end (24h format).')
+      .addText((text) =>
+        text
+          .setPlaceholder('22:00')
+          .setValue(this.plugin.settings.heartbeatQuietStart)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatQuietStart = value.trim() || '22:00';
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(container)
+      .setName('Quiet hours end (HH:MM)')
+      .addText((text) =>
+        text
+          .setPlaceholder('06:00')
+          .setValue(this.plugin.settings.heartbeatQuietEnd)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatQuietEnd = value.trim() || '06:00';
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(container)
+      .setName('Pause while streaming')
+      .setDesc('Skip the heartbeat when any tab is actively streaming a response.')
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.heartbeatPauseOnStreaming)
+          .onChange(async (value) => {
+            this.plugin.settings.heartbeatPauseOnStreaming = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
     // --- Environment ---
 
     renderEnvironmentSettingsSection({
