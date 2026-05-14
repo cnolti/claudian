@@ -119,6 +119,7 @@ export interface ClaudianSettings {
 
   // UI settings
   keyboardNavigation: KeyboardNavigationSettings;
+  requireCommandOrControlEnterToSend: boolean;
 
   // Heartbeat (fork-only) — vault daemon background heartbeat
   heartbeatEnabled: boolean;
