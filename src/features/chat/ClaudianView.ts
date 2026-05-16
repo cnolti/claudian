@@ -541,6 +541,10 @@ export class ClaudianView extends ItemView {
     });
   }
 
+  refreshTabControls(): void {
+    this.updateTabBarVisibility();
+  }
+
   private updateTabBarVisibility(): void {
     if (!this.tabBarContainerEl || !this.tabManager) return;
 
