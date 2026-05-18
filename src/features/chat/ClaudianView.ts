@@ -233,6 +233,7 @@ export class ClaudianView extends ItemView {
 
     this.tabBar?.destroy();
     this.tabBar = null;
+    this.scope = null;
   }
 
   private attachHeartbeatStatusListener(): void {
@@ -696,14 +697,16 @@ export class ClaudianView extends ItemView {
       }
     });
 
-    // Register Escape on the view's Obsidian Scope to prevent Obsidian from
-    // navigating away when Claudian is open as a main-area tab.
-    // Returning false consumes the event (preventDefault + stops scope propagation).
+    // View scopes are the Obsidian-owned boundary for main-area tab hotkeys.
+    // Returning false consumes Escape before Obsidian uses it for pane navigation.
     this.scope = new Scope(this.app.scope);
-    this.scope.register([], 'Escape', () => {
-      const activeTab = this.tabManager?.getActiveTab();
-      if (activeTab?.state.isStreaming) {
-        activeTab.controllers.inputController?.cancelStreaming();
+    this.scope.register([], 'Escape', (e: KeyboardEvent) => {
+      if (e.isComposing) return;
+      if (!e.defaultPrevented) {
+        const activeTab = this.tabManager?.getActiveTab();
+        if (activeTab?.state.isStreaming) {
+          activeTab.controllers.inputController?.cancelStreaming();
+        }
       }
       return false;
     });
