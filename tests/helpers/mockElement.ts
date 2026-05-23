@@ -65,6 +65,12 @@ export function createMockEl(tag = 'div'): any {
     scrollHeight: 0,
     innerHTML: '',
 
+    ownerDocument: {
+      get activeElement() {
+        return (globalThis as { document?: { activeElement?: unknown } }).document?.activeElement ?? null;
+      },
+    },
+
     get textContent() {
       return textContent;
     },
@@ -149,8 +155,15 @@ export function createMockEl(tag = 'div'): any {
       return children.some(child => (child as any).contains?.(node));
     },
     scrollIntoView() {},
-    focus() {},
-    blur() {},
+    focus() {
+      const handlers = eventListeners.get('focus') || [];
+      handlers.forEach(h => h({ type: 'focus', target: element }));
+    },
+    blur() {
+      const handlers = eventListeners.get('blur') || [];
+      handlers.forEach(h => h({ type: 'blur', target: element }));
+    },
+    select() {},
 
     setAttribute(name: string, value: string) { attributes.set(name, value); },
     getAttribute(name: string) { return attributes.get(name) ?? null; },
