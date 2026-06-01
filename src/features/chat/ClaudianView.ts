@@ -10,7 +10,12 @@ import type ClaudianPlugin from '../../main';
 import { createProviderIconSvg } from '../../shared/icons';
 import type { HeartbeatSummary } from '../heartbeat/types';
 import type { HistoryConversationOpenState } from './controllers/ConversationController';
-import { getTabProviderId, onProviderAvailabilityChanged, updatePlanModeUI } from './tabs/Tab';
+import {
+  getTabProviderId,
+  onProviderAvailabilityChanged,
+  sendTabInputMessageFromExplicitEnterShortcut,
+  updatePlanModeUI,
+} from './tabs/Tab';
 import { TabBar } from './tabs/TabBar';
 import { TabManager } from './tabs/TabManager';
 import type { TabData, TabId } from './tabs/types';
@@ -709,6 +714,14 @@ export class ClaudianView extends ItemView {
         }
       }
       return false;
+    });
+    this.scope.register(['Mod'], 'Enter', (e: KeyboardEvent) => {
+      if (e.isComposing || e.defaultPrevented) return;
+      const activeTab = this.tabManager?.getActiveTab();
+      if (!activeTab) return;
+      if (sendTabInputMessageFromExplicitEnterShortcut(activeTab, e, { requireInputFocus: true })) {
+        return false;
+      }
     });
 
     // Vault events - forward to active tab's file context manager
