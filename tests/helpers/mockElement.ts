@@ -126,6 +126,11 @@ export function createMockEl(tag = 'div'): any {
       const child = createMockEl(tagName);
       if (opts?.cls) child.addClass(opts.cls);
       if (opts?.text) child.textContent = opts.text;
+      if (opts?.attr) {
+        for (const [name, value] of Object.entries(opts.attr)) {
+          child.setAttribute(name, String(value));
+        }
+      }
       children.push(child);
       return child;
     },

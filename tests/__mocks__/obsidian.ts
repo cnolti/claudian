@@ -63,6 +63,10 @@ export class ItemView {
 
 export class WorkspaceLeaf {}
 
+export const Platform = {
+  isMacOS: true,
+};
+
 export class App {
   vault: any = {
     adapter: {

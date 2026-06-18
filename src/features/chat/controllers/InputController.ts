@@ -682,7 +682,7 @@ export class InputController {
     state.queuedMessage = null;
     this.updateQueueIndicator();
 
-    window.setTimeout(
+    setTimeout(
       () => {
         void this.sendMessage({
           content: queuedMessage.content,
