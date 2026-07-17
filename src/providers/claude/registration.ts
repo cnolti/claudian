@@ -6,6 +6,7 @@ import {
 } from './app/ClaudeWorkspaceServices';
 import { InlineEditService as ClaudeInlineEditService } from './auxiliary/ClaudeInlineEditService';
 import { InstructionRefineService as ClaudeInstructionRefineService } from './auxiliary/ClaudeInstructionRefineService';
+import { ClaudeStatusNarrationService } from './auxiliary/ClaudeStatusNarrationService';
 import { TitleGenerationService as ClaudeTitleGenerationService } from './auxiliary/ClaudeTitleGenerationService';
 import { CLAUDE_PROVIDER_CAPABILITIES } from './capabilities';
 import { claudeSettingsReconciler } from './env/ClaudeSettingsReconciler';
@@ -61,6 +62,7 @@ export const claudeProviderRegistration: ProviderModule = {
     });
   },
   createTitleGenerationService: (plugin) => new ClaudeTitleGenerationService(plugin),
+  createStatusNarrationService: (plugin) => new ClaudeStatusNarrationService(plugin),
   createInstructionRefineService: (plugin) => new ClaudeInstructionRefineService(plugin),
   createInlineEditService: (plugin) => new ClaudeInlineEditService(plugin),
   historyService: new ClaudeConversationHistoryService(),

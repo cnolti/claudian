@@ -120,6 +120,10 @@ export interface ClaudianSettings {
   keyboardNavigation: KeyboardNavigationSettings;
   requireCommandOrControlEnterToSend: boolean;
 
+  // Status narrator (fork-only) — cheap-model live status line while a turn runs
+  statusNarratorEnabled: boolean;
+  statusNarratorModel: string;
+
   // Heartbeat (fork-only) — vault daemon background heartbeat
   heartbeatEnabled: boolean;
   heartbeatIntervalMinutes: number;

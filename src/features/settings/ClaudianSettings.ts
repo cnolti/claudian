@@ -501,6 +501,38 @@ export class ClaudianSettingTab extends PluginSettingTab {
     addHotkeySettingRow(hotkeyGrid, this.app, 'claudian:new-tab', 'settings.newTabHotkey');
     addHotkeySettingRow(hotkeyGrid, this.app, 'claudian:close-current-tab', 'settings.closeTabHotkey');
 
+    // --- Status narrator (fork-only) ---
+
+    new Setting(container).setName('Status narrator').setHeading();
+
+    new Setting(container)
+      .setName('Narrate tool activity')
+      .setDesc('While the main model works, a cheap model posts a short live status line based on the current tool activity.')
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.statusNarratorEnabled)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.statusNarratorEnabled = value;
+            });
+          }),
+      );
+
+    new Setting(container)
+      .setName('Narrator model')
+      .setDesc('Model used for status lines (defaults to haiku for low cost and latency).')
+      .addText((text) =>
+        text
+          // eslint-disable-next-line obsidianmd/ui/sentence-case -- literal model id
+          .setPlaceholder('haiku')
+          .setValue(this.plugin.settings.statusNarratorModel)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.statusNarratorModel = value.trim() || 'haiku';
+            });
+          }),
+      );
+
     // --- Heartbeat (fork-only) ---
 
     new Setting(container).setName('Heartbeat').setHeading();

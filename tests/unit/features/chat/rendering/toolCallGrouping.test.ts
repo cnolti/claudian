@@ -23,21 +23,20 @@ class FakeEl {
   }
 
   get classList() {
-    const self = this;
     return {
-      contains: (cls: string) => self.classes().includes(cls),
+      contains: (cls: string) => this.classes().includes(cls),
       add: (cls: string) => {
-        if (!self.classes().includes(cls)) self.className = `${self.className} ${cls}`.trim();
+        if (!this.classes().includes(cls)) this.className = `${this.className} ${cls}`.trim();
       },
       remove: (cls: string) => {
-        self.className = self.classes().filter(c => c !== cls).join(' ');
+        this.className = this.classes().filter(c => c !== cls).join(' ');
       },
       toggle: (cls: string) => {
-        if (self.classes().includes(cls)) {
-          self.className = self.classes().filter(c => c !== cls).join(' ');
+        if (this.classes().includes(cls)) {
+          this.className = this.classes().filter(c => c !== cls).join(' ');
           return false;
         }
-        self.className = `${self.className} ${cls}`.trim();
+        this.className = `${this.className} ${cls}`.trim();
         return true;
       },
     };

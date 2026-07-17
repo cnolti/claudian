@@ -32,6 +32,9 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   },
   requireCommandOrControlEnterToSend: false,
 
+  statusNarratorEnabled: true,
+  statusNarratorModel: 'haiku',
+
   heartbeatEnabled: false,
   heartbeatIntervalMinutes: 15,
   heartbeatMaxTurns: 8,

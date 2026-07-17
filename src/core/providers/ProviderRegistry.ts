@@ -16,6 +16,7 @@ import {
   type ProviderSubagentLifecycleAdapter,
   type ProviderTaskResultInterpreter,
   type ProviderUIOption,
+  type StatusNarrationService,
   type TitleGenerationCallback,
   type TitleGenerationService,
 } from './types';
@@ -55,6 +56,11 @@ export class ProviderRegistry {
       return new RoutedTitleGenerationService(plugin);
     }
     return this.getProviderRegistration(providerId).createTitleGenerationService(plugin);
+  }
+
+  /** Fork-only: returns null when the provider does not narrate tool activity. */
+  static createStatusNarrationService(plugin: ProviderHost, providerId: ProviderId): StatusNarrationService | null {
+    return this.getProviderRegistration(providerId).createStatusNarrationService?.(plugin) ?? null;
   }
 
   static resolveTitleGenerationProviderId(settings: Record<string, unknown>): ProviderId {

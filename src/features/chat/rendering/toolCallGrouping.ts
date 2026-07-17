@@ -194,6 +194,12 @@ export function groupToolBlocks(
   };
 
   for (const child of children) {
+    // The ephemeral narrator status line is transparent: it neither joins nor
+    // breaks a run (it is re-appended to the end during streaming and removed
+    // at end of turn).
+    if (child.classList.contains('claudian-narrator-line')) {
+      continue;
+    }
     if (isAlreadyGrouped(child)) {
       closeRun();
       continue;
