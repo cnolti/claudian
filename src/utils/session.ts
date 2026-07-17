@@ -14,10 +14,23 @@ import { extractUserQuery, formatCurrentNote } from './context';
 const SESSION_ERROR_PATTERNS = [
   'session expired',
   'session not found',
+  'no conversation found with session id',
   'invalid session',
   'session invalid',
   'process exited with code',
 ] as const;
+
+export function getMissingSessionId(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : '';
+  const match = message.match(/no conversation found with session id:\s*([a-z0-9_-]+)/i);
+  return match?.[1] ?? null;
+}
+
+export function isSessionMissingError(error: unknown, expectedSessionId?: string): boolean {
+  const missingSessionId = getMissingSessionId(error);
+  return !!missingSessionId
+    && (!expectedSessionId || missingSessionId.toLowerCase() === expectedSessionId.toLowerCase());
+}
 
 const SESSION_ERROR_COMPOUND_PATTERNS = [
   { includes: ['session', 'expired'] },
@@ -64,8 +77,14 @@ function formatToolInput(input: Record<string, unknown>, maxLength = 200): strin
         valueStr = value.length > 100 ? `${value.slice(0, 100)}...` : value;
       } else if (typeof value === 'object') {
         valueStr = '[object]';
+      } else if (typeof value === 'function') {
+        valueStr = '[function]';
+      } else if (typeof value === 'symbol') {
+        valueStr = value.description ? `[symbol:${value.description}]` : '[symbol]';
+      } else if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+        valueStr = `${value}`;
       } else {
-        valueStr = String(value);
+        valueStr = '[unknown]';
       }
       parts.push(`${key}=${valueStr}`);
     }
@@ -149,7 +168,7 @@ export function buildContextFromHistory(messages: ChatMessage[]): string {
       continue;
     }
 
-    if (message.isInterrupt) {
+    if (message.isInterrupt && message.role === 'user') {
       continue;
     }
 
@@ -185,7 +204,7 @@ export function buildContextFromHistory(messages: ChatMessage[]): string {
     if (message.role === 'assistant' && message.toolCalls?.length) {
       const toolLines = message.toolCalls
         .map(tc => formatToolCallForContext(tc))
-        .filter(Boolean) as string[];
+        .filter(Boolean);
       if (toolLines.length > 0) {
         lines.push(...toolLines);
       }

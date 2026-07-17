@@ -1,23 +1,23 @@
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
-import type ClaudianPlugin from '../../../main';
 import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import { extractAssistantText } from '../auxiliary/extractAssistantText';
+import { toClaudeRuntimeModelId } from '../modelSelection';
 import {
   getClaudeProviderSettings,
   resolveClaudeSettingSources,
 } from '../settings';
 import {
-  resolveAdaptiveEffortLevel,
-  resolveThinkingTokens,
+  resolveEffortLevel,
 } from '../types/models';
 import { createCustomSpawnFunction } from './customSpawn';
 
 export interface ColdStartQueryConfig {
-  plugin: ClaudianPlugin;
+  plugin: ProviderHost;
   systemPrompt: string;
   /** Tools available to the model. Omit for SDK default (all tools). */
   tools?: string[];
@@ -71,12 +71,12 @@ export async function runColdStartQuery(
 
   const settings = config.providerSettings
     ?? ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      config.plugin.settings as unknown as Record<string, unknown>,
+      config.plugin.settings,
       'claude',
     );
   const claudeSettings = getClaudeProviderSettings(settings);
 
-  const selectedModel = config.model ?? (settings.model as string);
+  const selectedModel = toClaudeRuntimeModelId(config.model ?? (settings.model as string));
 
   const options: Options = {
     cwd: vaultPath,
@@ -116,18 +116,11 @@ export async function runColdStartQuery(
   }
 
   if (!config.thinking?.disabled) {
-    const effortLevel = resolveAdaptiveEffortLevel(selectedModel, settings.effortLevel);
-    if (effortLevel !== null) {
-      options.thinking = { type: 'adaptive' };
-      // SDK runtime accepts `xhigh` on Opus 4.7+ and silently falls back to
-      // `high` elsewhere, but its type definition lags our local EffortLevel.
-      options.effort = effortLevel as Options['effort'];
-    } else {
-      const thinkingTokens = resolveThinkingTokens(selectedModel, settings.thinkingBudget);
-      if (thinkingTokens !== null) {
-        options.maxThinkingTokens = thinkingTokens;
-      }
-    }
+    const effortLevel = resolveEffortLevel(selectedModel, settings.effortLevel);
+    options.thinking = { type: 'adaptive' };
+    // SDK runtime accepts `xhigh` on Opus 4.7+, Sonnet 5+, and Fable, and silently
+    // falls back to `high` elsewhere, but its type definition lags our local EffortLevel.
+    options.effort = effortLevel;
   }
 
   const response = agentQuery({ prompt, options });

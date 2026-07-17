@@ -2,11 +2,13 @@ import { Menu, Notice, setIcon } from 'obsidian';
 
 import type { TitleGenerationService } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
+import type { ChatRewindMode } from '../../../core/runtime/types';
 import type { Conversation } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
-import type ClaudianPlugin from '../../../main';
 import { confirm } from '../../../shared/modals/ConfirmModal';
+import { extractUserDisplayContent } from '../../../utils/context';
 import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
+import type { FeatureHost } from '../../FeatureHost';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
 import { findRewindContext } from '../rewind';
@@ -17,6 +19,12 @@ import type { ImageContextManager } from '../ui/ImageContext';
 import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
 import type { StatusPanel } from '../ui/StatusPanel';
 
+function runConversationAction(action: () => Promise<void>, failureMessage: string): void {
+  void action().catch(() => {
+    new Notice(failureMessage);
+  });
+}
+
 export interface ConversationCallbacks {
   onNewConversation?: () => void;
   onConversationLoaded?: () => void;
@@ -24,7 +32,7 @@ export interface ConversationCallbacks {
 }
 
 export interface ConversationControllerDeps {
-  plugin: ClaudianPlugin;
+  plugin: FeatureHost;
   state: ChatState;
   renderer: MessageRenderer;
   subagentManager: SubagentManager;
@@ -41,20 +49,31 @@ export interface ConversationControllerDeps {
   getTitleGenerationService: () => TitleGenerationService | null;
   getStatusPanel: () => StatusPanel | null;
   getAgentService?: () => ChatRuntime | null;
+  getSelectedModel?: () => string | null;
   ensureServiceForConversation?: (conversation: Conversation | null) => Promise<void>;
   dismissPendingInlinePrompts?: () => void;
+  awaitBackgroundWork?: () => Promise<void>;
 }
 
 type SaveOptions = {
   resumeAtMessageId?: string;
+  resetProviderSession?: boolean;
 };
 
 export type HistoryConversationOpenState = 'closed' | 'open' | 'current';
+
+export type HistoryConversationStatus = {
+  openState: HistoryConversationOpenState;
+  isRunning: boolean;
+  location?: 'current-view' | 'other-view';
+  tabIndex?: number;
+};
 
 type HistoryRenderOptions = {
   onSelectConversation: (id: string) => Promise<void>;
   onOpenConversationInNewTab?: (id: string, activate?: boolean) => Promise<void>;
   getConversationOpenState?: (id: string) => HistoryConversationOpenState;
+  getConversationStatus?: (id: string) => HistoryConversationStatus;
   onRerender: () => void;
 };
 
@@ -100,12 +119,17 @@ export class ConversationController {
         this.getAgentService()?.cancel();
       }
 
-      // Save current conversation if it has messages
+      if (this.deps.awaitBackgroundWork) {
+        await this.deps.awaitBackgroundWork();
+      }
+
+      subagentManager.orphanAllActive();
+
+      // Persist terminalized background tasks before clearing their runtime state.
       if (state.currentConversationId && state.messages.length > 0) {
         await this.save();
       }
 
-      subagentManager.orphanAllActive();
       subagentManager.clear();
 
       // Clear streaming state and related DOM references
@@ -239,9 +263,12 @@ export class ConversationController {
 
     try {
       this.deps.dismissPendingInlinePrompts?.();
+      if (this.deps.awaitBackgroundWork) {
+        await this.deps.awaitBackgroundWork();
+      }
+      subagentManager.orphanAllActive();
       await this.save();
 
-      subagentManager.orphanAllActive();
       subagentManager.clear();
 
       const conversation = await plugin.switchConversation(id);
@@ -265,7 +292,10 @@ export class ConversationController {
     }
   }
 
-  async rewind(userMessageId: string): Promise<void> {
+  async rewind(
+    userMessageId: string,
+    mode: ChatRewindMode = 'code-and-conversation',
+  ): Promise<void> {
     const { plugin, state, renderer } = this.deps;
 
     const agentServiceForCheck = this.getAgentService();
@@ -292,7 +322,7 @@ export class ConversationController {
     }
 
     const rewindCtx = findRewindContext(msgs, userIdx);
-    if (!rewindCtx.hasResponse || !rewindCtx.prevAssistantUuid) {
+    if (!rewindCtx.hasResponse) {
       new Notice(t('chat.rewind.unavailableNoUuid'));
       return;
     }
@@ -300,7 +330,9 @@ export class ConversationController {
 
     const confirmed = await confirm(
       plugin.app,
-      t('chat.rewind.confirmMessage'),
+      mode === 'conversation'
+        ? t('chat.rewind.confirmMessageConversationOnly')
+        : t('chat.rewind.confirmMessage'),
       t('chat.rewind.confirmButton')
     );
     if (!confirmed) return;
@@ -318,7 +350,7 @@ export class ConversationController {
 
     let result;
     try {
-      result = await agentService.rewind(userMsg.userMessageId, prevAssistantUuid);
+      result = await agentService.rewind(userMsg.userMessageId, prevAssistantUuid, mode);
     } catch (e) {
       new Notice(t('chat.rewind.failed', { error: e instanceof Error ? e.message : 'Unknown error' }));
       return;
@@ -341,17 +373,28 @@ export class ConversationController {
     const filesChanged = result.filesChanged?.length ?? 0;
     let saveError: string | null = null;
     try {
-      await this.save(false, { resumeAtMessageId: prevAssistantUuid });
+      await this.save(false, {
+        resumeAtMessageId: prevAssistantUuid,
+        resetProviderSession: !prevAssistantUuid,
+      });
     } catch (e) {
       saveError = e instanceof Error ? e.message : 'Failed to save';
     }
 
     if (saveError) {
-      new Notice(t('chat.rewind.noticeSaveFailed', { count: String(filesChanged), error: saveError }));
+      new Notice(
+        mode === 'conversation'
+          ? t('chat.rewind.noticeConversationOnlySaveFailed', { error: saveError })
+          : t('chat.rewind.noticeSaveFailed', { count: String(filesChanged), error: saveError })
+      );
       return;
     }
 
-    new Notice(t('chat.rewind.notice', { count: String(filesChanged) }));
+    new Notice(
+      mode === 'conversation'
+        ? t('chat.rewind.noticeConversationOnly')
+        : t('chat.rewind.notice', { count: String(filesChanged) })
+    );
   }
 
   /**
@@ -378,9 +421,11 @@ export class ConversationController {
     // New conversations always use SDK-native storage.
     if (!state.currentConversationId && state.messages.length > 0) {
       const initialSessionId = agentService?.getSessionId() ?? undefined;
+      const selectedModel = this.deps.getSelectedModel?.() ?? undefined;
       const conversation = await plugin.createConversation({
         providerId: agentService?.providerId,
         sessionId: initialSessionId,
+        ...(selectedModel ? { selectedModel } : {}),
       });
       state.currentConversationId = conversation.id;
     }
@@ -394,7 +439,7 @@ export class ConversationController {
 
     const conversation = plugin.getConversationSync(state.currentConversationId!);
 
-    const { updates: sessionUpdates } = agentService
+    const { updates: sessionUpdates } = agentService && !options?.resetProviderSession
       ? agentService.buildSessionUpdates({ conversation, sessionInvalidated })
       : { updates: {} };
 
@@ -413,6 +458,10 @@ export class ConversationController {
 
     if (options) {
       updates.resumeAtMessageId = options.resumeAtMessageId;
+      if (options.resetProviderSession) {
+        updates.sessionId = null;
+        updates.providerState = undefined;
+      }
     }
 
     await plugin.updateConversation(state.currentConversationId!, updates);
@@ -565,47 +614,72 @@ export class ConversationController {
     });
 
     for (const conv of conversations) {
-      const isCurrent = conv.id === state.currentConversationId;
+      const fallbackOpenState: HistoryConversationOpenState =
+        conv.id === state.currentConversationId ? 'current' : 'closed';
+      const conversationStatus = this.getHistoryConversationStatus(conv.id, fallbackOpenState, options);
+      const { openState, isRunning } = conversationStatus;
+      const isCurrent = openState === 'current';
+      const isOpen = openState === 'open';
       const item = list.createDiv({
-        cls: `claudian-history-item${isCurrent ? ' active' : ''}`,
+        cls: [
+          'claudian-history-item',
+          isCurrent ? 'active' : '',
+          isOpen ? 'open' : '',
+          isRunning ? 'running' : '',
+        ].filter(Boolean).join(' '),
       });
+      item.setAttribute('data-open-state', openState);
+      item.setAttribute('data-running', isRunning ? 'true' : 'false');
+      item.setAttribute('data-tab-location', conversationStatus.location ?? 'current-view');
+      if (typeof conversationStatus.tabIndex === 'number') {
+        item.setAttribute('data-tab-index', String(conversationStatus.tabIndex));
+      }
 
       const iconEl = item.createDiv({ cls: 'claudian-history-item-icon' });
-      setIcon(iconEl, isCurrent ? 'message-square-dot' : 'message-square');
+      setIcon(iconEl, this.getHistoryItemIcon(openState, isRunning));
 
       const content = item.createDiv({ cls: 'claudian-history-item-content' });
       const titleEl = content.createDiv({ cls: 'claudian-history-item-title', text: conv.title });
       titleEl.setAttribute('title', conv.title);
       content.createDiv({
         cls: 'claudian-history-item-date',
-        text: isCurrent ? 'Current session' : this.formatDate(conv.lastResponseAt ?? conv.createdAt),
+        text: this.getHistoryItemStatusText(conversationStatus, conv.lastResponseAt ?? conv.createdAt),
       });
 
       if (!isCurrent) {
-        content.addEventListener('click', async (e) => {
+        content.addEventListener('click', (e) => {
           e.stopPropagation();
           if (this.isHistoryNewTabModifierClick(e) && options.onOpenConversationInNewTab) {
             e.preventDefault();
-            await this.runHistoryAction(
-              () => options.onOpenConversationInNewTab?.(conv.id, true),
+            runConversationAction(
+              () => this.runHistoryAction(
+                () => options.onOpenConversationInNewTab?.(conv.id, true),
+                'Failed to load conversation',
+              ),
               'Failed to load conversation',
             );
             return;
           }
 
-          await this.runHistoryAction(
-            () => options.onSelectConversation(conv.id),
+          runConversationAction(
+            () => this.runHistoryAction(
+              () => options.onSelectConversation(conv.id),
+              'Failed to load conversation',
+            ),
             'Failed to load conversation',
           );
         });
 
         if (options.onOpenConversationInNewTab) {
-          content.addEventListener('auxclick', async (e) => {
+          content.addEventListener('auxclick', (e) => {
             if (e.button !== 1) return;
             e.preventDefault();
             e.stopPropagation();
-            await this.runHistoryAction(
-              () => options.onOpenConversationInNewTab?.(conv.id, true),
+            runConversationAction(
+              () => this.runHistoryAction(
+                () => options.onOpenConversationInNewTab?.(conv.id, true),
+                'Failed to load conversation',
+              ),
               'Failed to load conversation',
             );
           });
@@ -629,13 +703,30 @@ export class ConversationController {
         const regenerateBtn = actions.createEl('button', { cls: 'claudian-action-btn' });
         setIcon(regenerateBtn, 'refresh-cw');
         regenerateBtn.setAttribute('aria-label', 'Regenerate title');
-        regenerateBtn.addEventListener('click', async (e) => {
+        regenerateBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          try {
-            await this.regenerateTitle(conv.id);
-          } catch {
-            new Notice('Failed to regenerate response');
-          }
+          runConversationAction(
+            () => this.regenerateTitle(conv.id),
+            'Failed to regenerate response',
+          );
+        });
+      }
+
+      if (openState === 'closed' && options.onOpenConversationInNewTab) {
+        const openInNewTabBtn = actions.createEl('button', {
+          cls: 'claudian-action-btn claudian-open-new-tab-btn',
+        });
+        setIcon(openInNewTabBtn, 'square-plus');
+        openInNewTabBtn.setAttribute('aria-label', 'Open in new tab');
+        openInNewTabBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          runConversationAction(
+            () => this.runHistoryAction(
+              () => options.onOpenConversationInNewTab?.(conv.id, true),
+              'Failed to load conversation',
+            ),
+            'Failed to load conversation',
+          );
         });
       }
 
@@ -650,14 +741,80 @@ export class ConversationController {
       const deleteBtn = actions.createEl('button', { cls: 'claudian-action-btn claudian-delete-btn' });
       setIcon(deleteBtn, 'trash-2');
       deleteBtn.setAttribute('aria-label', 'Delete');
-      deleteBtn.addEventListener('click', async (e) => {
+      deleteBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        await this.runHistoryAction(
-          () => this.deleteHistoryConversation(conv.id, options),
+        runConversationAction(
+          () => this.runHistoryAction(
+            () => this.deleteHistoryConversation(conv.id, options),
+            'Failed to delete conversation',
+          ),
           'Failed to delete conversation',
         );
       });
     }
+  }
+
+  private getHistoryConversationStatus(
+    conversationId: string,
+    fallbackOpenState: HistoryConversationOpenState,
+    options: HistoryRenderOptions,
+  ): HistoryConversationStatus {
+    const status = options.getConversationStatus?.(conversationId);
+    if (status) return status;
+
+    return {
+      openState: options.getConversationOpenState?.(conversationId) ?? fallbackOpenState,
+      isRunning: false,
+    };
+  }
+
+  private getHistoryItemStatusText(
+    status: HistoryConversationStatus,
+    timestamp: number,
+  ): string {
+    const { openState, isRunning } = status;
+    const location = status.location ?? 'current-view';
+
+    if (openState !== 'closed' && location === 'other-view') {
+      return isRunning ? 'Running in another pane' : 'Open in another pane';
+    }
+
+    if (isRunning) {
+      if (openState === 'closed') return 'Running';
+      return `Running in ${this.getHistoryTabLabel(status)}`;
+    }
+
+    switch (openState) {
+      case 'current':
+        return typeof status.tabIndex === 'number'
+          ? `Current tab ${status.tabIndex}`
+          : 'Current session';
+      case 'open':
+        return `Open in ${this.getHistoryTabLabel(status)}`;
+      case 'closed':
+        return this.formatDate(timestamp);
+    }
+  }
+
+  private getHistoryTabLabel(status: HistoryConversationStatus): string {
+    if (typeof status.tabIndex === 'number') {
+      return `tab ${status.tabIndex}`;
+    }
+
+    if (status.openState === 'current') {
+      return 'current tab';
+    }
+
+    return 'tab';
+  }
+
+  private getHistoryItemIcon(
+    openState: HistoryConversationOpenState,
+    isRunning: boolean,
+  ): string {
+    if (isRunning) return 'loader-2';
+    if (openState === 'current') return 'message-square-dot';
+    return 'message-square';
   }
 
   private isHistoryNewTabModifierClick(event: MouseEvent): boolean {
@@ -684,12 +841,13 @@ export class ConversationController {
     event: MouseEvent,
   ): void {
     const menu = new Menu();
-    const openState = options.getConversationOpenState?.(conversationId) ?? (isCurrent ? 'current' : 'closed');
+    const fallbackOpenState: HistoryConversationOpenState = isCurrent ? 'current' : 'closed';
+    const { openState } = this.getHistoryConversationStatus(conversationId, fallbackOpenState, options);
 
-    if (!isCurrent) {
+    if (openState !== 'current') {
       if (openState === 'closed' && options.onOpenConversationInNewTab) {
         menu.addItem((menuItem) => menuItem
-          .setTitle('Open in New Tab')
+          .setTitle('Open in new tab')
           .onClick(() => {
             void this.runHistoryAction(
               () => options.onOpenConversationInNewTab?.(conversationId, true),
@@ -697,7 +855,7 @@ export class ConversationController {
             );
           }));
         menu.addItem((menuItem) => menuItem
-          .setTitle('Open in Background Tab')
+          .setTitle('Open in background tab')
           .onClick(() => {
             void this.runHistoryAction(
               () => options.onOpenConversationInNewTab?.(conversationId, false),
@@ -706,7 +864,7 @@ export class ConversationController {
           }));
       } else if (openState === 'open') {
         menu.addItem((menuItem) => menuItem
-          .setTitle('Switch to Open Session')
+          .setTitle('Switch to open session')
           .onClick(() => {
             void this.runHistoryAction(
               () => options.onSelectConversation(conversationId),
@@ -753,7 +911,7 @@ export class ConversationController {
     const titleEl = item.querySelector('.claudian-history-item-title') as HTMLElement;
     if (!titleEl) return;
 
-    const input = document.createElement('input');
+    const input = (item.ownerDocument ?? window.document).createElement('input');
     input.type = 'text';
     input.className = 'claudian-rename-input';
     input.value = currentTitle;
@@ -772,8 +930,10 @@ export class ConversationController {
       }
     };
 
-    input.addEventListener('blur', finishRename);
-    input.addEventListener('keydown', async (e) => {
+    input.addEventListener('blur', () => {
+      runConversationAction(finishRename, 'Failed to rename conversation');
+    });
+    input.addEventListener('keydown', (e) => {
       // Check !e.isComposing for IME support (Chinese, Japanese, Korean, etc.)
       if (e.key === 'Enter' && !e.isComposing) {
         input.blur();
@@ -850,9 +1010,9 @@ export class ConversationController {
     if (!welcomeEl) return;
 
     if (this.deps.state.messages.length === 0) {
-      welcomeEl.style.display = '';
+      welcomeEl.removeClass('claudian-hidden');
     } else {
-      welcomeEl.style.display = 'none';
+      welcomeEl.addClass('claudian-hidden');
     }
   }
 
@@ -905,7 +1065,9 @@ export class ConversationController {
     const firstUserMsg = fullConv.messages.find(m => m.role === 'user');
     if (!firstUserMsg) return;
 
-    const userContent = firstUserMsg.displayContent || firstUserMsg.content;
+    const userContent = firstUserMsg.displayContent
+      ?? extractUserDisplayContent(firstUserMsg.content)
+      ?? firstUserMsg.content;
 
     // Store current title to check if user renames during generation
     const expectedTitle = fullConv.title;

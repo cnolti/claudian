@@ -1,21 +1,31 @@
 import type { App, Component } from 'obsidian';
-import { MarkdownRenderer, Notice } from 'obsidian';
+import { MarkdownRenderer, Menu, Notice, setIcon } from 'obsidian';
 
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderCapabilities } from '../../../core/providers/types';
+import type { ChatRewindMode } from '../../../core/runtime/types';
 import {
   isSubagentToolName,
   isWriteEditTool,
   TOOL_AGENT_OUTPUT,
+  TOOL_APPLY_PATCH,
+  TOOL_WRITE_STDIN,
 } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import type { ChatMessage, ImageAttachment, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
-import type ClaudianPlugin from '../../../main';
+import { extractUserDisplayContent } from '../../../utils/context';
 import { formatDurationMmSs } from '../../../utils/date';
 import { processFileLinks, registerFileLinkHandler } from '../../../utils/fileLink';
 import { replaceImageEmbedsWithHtml } from '../../../utils/imageEmbed';
-import { escapeMathDelimitersForStreaming } from '../../../utils/markdownMath';
+import { stripLegacyInterruptIndicator } from '../../../utils/interrupt';
+import { escapeRawHtmlTags } from '../../../utils/markdownHtml';
+import {
+  escapeMathDelimitersForStreaming,
+  normalizeLatexMathDelimiters,
+} from '../../../utils/markdownMath';
+import type { FeatureHost } from '../../FeatureHost';
 import { findRewindContext } from '../rewind';
+import { formatConversationDirectoryTitle } from '../utils/conversationDirectoryTitle';
 import { resolveSubagentLifecycleAdapter } from './subagentLifecycleResolution';
 import {
   renderStoredAsyncSubagent,
@@ -36,25 +46,27 @@ export type RenderContentFn = (
   options?: RenderContentOptions
 ) => Promise<void>;
 
+function runRendererAction(action: () => Promise<void>): void {
+  void action().catch(() => {
+    // UI actions already surface expected failures locally.
+  });
+}
+
 export class MessageRenderer {
   private app: App;
-  private plugin: ClaudianPlugin;
+  private plugin: FeatureHost;
   private component: Component;
   private messagesEl: HTMLElement;
-  private rewindCallback?: (messageId: string) => Promise<void>;
+  private rewindCallback?: (messageId: string, mode?: ChatRewindMode) => Promise<void>;
   private getCapabilities: () => ProviderCapabilities;
   private forkCallback?: (messageId: string) => Promise<void>;
   private liveMessageEls = new Map<string, HTMLElement>();
 
-  private static readonly REWIND_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>`;
-
-  private static readonly FORK_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>`;
-
   constructor(
-    plugin: ClaudianPlugin,
+    plugin: FeatureHost,
     component: Component,
     messagesEl: HTMLElement,
-    rewindCallback?: (messageId: string) => Promise<void>,
+    rewindCallback?: (messageId: string, mode?: ChatRewindMode) => Promise<void>,
     forkCallback?: (messageId: string) => Promise<void>,
     getCapabilities?: () => ProviderCapabilities,
   ) {
@@ -92,6 +104,23 @@ export class MessageRenderer {
     return resolveSubagentLifecycleAdapter(this.getCapabilities().providerId, toolName);
   }
 
+  private shouldExpandFileEditsByDefault(): boolean {
+    return this.plugin.settings?.expandFileEditsByDefault === true;
+  }
+
+  private getUserMessageTextToShow(msg: ChatMessage): string {
+    return msg.displayContent ?? extractUserDisplayContent(msg.content) ?? msg.content;
+  }
+
+  private applyTocTitle(msgEl: HTMLElement, text: string): void {
+    const tocTitle = formatConversationDirectoryTitle(text);
+    if (tocTitle) {
+      msgEl.setAttribute('data-toc-title', tocTitle);
+    } else {
+      msgEl.removeAttribute('data-toc-title');
+    }
+  }
+
   // ============================================
   // Streaming Message Rendering
   // ============================================
@@ -108,7 +137,7 @@ export class MessageRenderer {
 
     // Skip empty bubble for image-only messages
     if (msg.role === 'user') {
-      const textToShow = msg.displayContent ?? msg.content;
+      const textToShow = this.getUserMessageTextToShow(msg);
       if (!textToShow) {
         this.scrollToBottom();
         const lastChild = this.messagesEl.lastElementChild as HTMLElement;
@@ -127,11 +156,12 @@ export class MessageRenderer {
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 
     if (msg.role === 'user') {
-      const textToShow = msg.displayContent ?? msg.content;
+      const textToShow = this.getUserMessageTextToShow(msg);
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderContent(textEl, textToShow);
         this.addUserCopyButton(msgEl, textToShow);
+        this.applyTocTitle(msgEl, textToShow);
       }
       if (this.rewindCallback || this.forkCallback) {
         this.liveMessageEls.set(msg.id, msgEl);
@@ -148,25 +178,28 @@ export class MessageRenderer {
     }
 
     const msgEl = this.liveMessageEls.get(msg.id)
-      ?? this.messagesEl.querySelector(`[data-message-id="${msg.id}"]`) as HTMLElement | null;
+      ?? this.messagesEl.querySelector<HTMLElement>(`[data-message-id="${msg.id}"]`);
     if (!msgEl) {
       return;
     }
 
-    const contentEl = msgEl.querySelector('.claudian-message-content') as HTMLElement | null;
+    const contentEl = msgEl.querySelector<HTMLElement>('.claudian-message-content');
     if (!contentEl) {
       return;
     }
 
     contentEl.empty();
 
-    const textToShow = msg.displayContent ?? msg.content;
+    const textToShow = this.getUserMessageTextToShow(msg);
     if (textToShow) {
       const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
       void this.renderContent(textEl, textToShow);
+      this.applyTocTitle(msgEl, textToShow);
+    } else {
+      msgEl.removeAttribute('data-toc-title');
     }
 
-    const toolbar = msgEl.querySelector('.claudian-user-msg-actions') as HTMLElement | null;
+    const toolbar = msgEl.querySelector<HTMLElement>('.claudian-user-msg-actions');
     if (toolbar) {
       toolbar.querySelectorAll('.claudian-user-msg-copy-btn').forEach((el) => el.remove());
     }
@@ -178,7 +211,7 @@ export class MessageRenderer {
 
   removeMessage(messageId: string): void {
     const msgEl = this.liveMessageEls.get(messageId)
-      ?? this.messagesEl.querySelector(`[data-message-id="${messageId}"]`) as HTMLElement | null;
+      ?? this.messagesEl.querySelector<HTMLElement>(`[data-message-id="${messageId}"]`);
     if (!msgEl) {
       return;
     }
@@ -238,10 +271,13 @@ export class MessageRenderer {
 
     // Skip empty bubble for image-only messages
     if (msg.role === 'user') {
-      const textToShow = msg.displayContent ?? msg.content;
+      const textToShow = this.getUserMessageTextToShow(msg);
       if (!textToShow) {
         return;
       }
+    }
+    if (msg.role === 'assistant' && !this.hasVisibleContent(msg)) {
+      return;
     }
 
     const msgEl = this.messagesEl.createDiv({
@@ -255,23 +291,24 @@ export class MessageRenderer {
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 
     if (msg.role === 'user') {
-      const textToShow = msg.displayContent ?? msg.content;
+      const textToShow = this.getUserMessageTextToShow(msg);
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderContent(textEl, textToShow);
         this.addUserCopyButton(msgEl, textToShow);
+        this.applyTocTitle(msgEl, textToShow);
       }
-      if (msg.userMessageId && this.isRewindEligible(allMessages, index)) {
-        if (this.rewindCallback) {
+      if (msg.userMessageId) {
+        if (this.rewindCallback && this.isRewindEligible(allMessages, index)) {
           this.addRewindButton(msgEl, msg.id);
         }
-        if (this.forkCallback) {
+        if (this.forkCallback && this.isForkEligible(allMessages, index)) {
           this.addForkButton(msgEl, msg.id);
         }
       }
     } else if (msg.role === 'assistant') {
-      this.renderAssistantContent(msg, contentEl);
-      if (msg.isInterrupt) {
+      const hadLegacyInterruptIndicator = this.renderAssistantContent(msg, contentEl);
+      if (msg.isInterrupt || hadLegacyInterruptIndicator) {
         this.appendInterruptIndicator(contentEl);
       }
       // Post-process: collapse consecutive tool/thinking blocks into groups.
@@ -281,12 +318,29 @@ export class MessageRenderer {
 
   private hasVisibleContent(msg: ChatMessage): boolean {
     if (msg.content && msg.content.trim().length > 0) return true;
-    if (msg.toolCalls && msg.toolCalls.length > 0) return true;
-    if (msg.contentBlocks && msg.contentBlocks.length > 0) return true;
+    if (msg.contentBlocks && msg.contentBlocks.length > 0) {
+      for (const block of msg.contentBlocks) {
+        if (block.type === 'thinking' && block.content.trim().length > 0) return true;
+        if (block.type === 'text' && block.content.trim().length > 0) return true;
+        if (block.type === 'context_compacted') return true;
+        if (block.type === 'subagent') return true;
+        if (block.type === 'tool_use') {
+          const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
+          if (toolCall && this.shouldRenderToolCall(toolCall)) return true;
+        }
+      }
+    }
+    if (msg.toolCalls?.some(toolCall => this.shouldRenderToolCall(toolCall))) return true;
     return false;
   }
 
   private isRewindEligible(allMessages?: ChatMessage[], index?: number): boolean {
+    if (!allMessages || index === undefined) return false;
+    const ctx = findRewindContext(allMessages, index);
+    return ctx.hasResponse;
+  }
+
+  private isForkEligible(allMessages?: ChatMessage[], index?: number): boolean {
     if (!allMessages || index === undefined) return false;
     const ctx = findRewindContext(allMessages, index);
     return !!ctx.prevAssistantUuid && ctx.hasResponse;
@@ -298,15 +352,22 @@ export class MessageRenderer {
     this.appendInterruptIndicator(contentEl);
   }
 
-  private appendInterruptIndicator(contentEl: HTMLElement): void {
+  appendInterruptIndicator(contentEl: HTMLElement): void {
     const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-    textEl.innerHTML = '<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>';
+    textEl.createSpan({ cls: 'claudian-interrupted', text: 'Interrupted' });
+    textEl.appendText(' ');
+    textEl.createSpan({
+      cls: 'claudian-interrupted-hint',
+      text: '\u00B7 What should Claudian do instead?',
+    });
   }
 
   /**
    * Renders assistant message content (content blocks or fallback).
    */
-  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): void {
+  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): boolean {
+    let hadLegacyInterruptIndicator = false;
+
     if (msg.contentBlocks && msg.contentBlocks.length > 0) {
       const renderedToolIds = new Set<string>();
       for (const block of msg.contentBlocks) {
@@ -318,13 +379,15 @@ export class MessageRenderer {
             (el, md) => this.renderContent(el, md)
           );
         } else if (block.type === 'text') {
+          const normalized = stripLegacyInterruptIndicator(block.content);
+          hadLegacyInterruptIndicator ||= normalized.interrupted;
           // Skip empty or whitespace-only text blocks to avoid extra gaps
-          if (!block.content || !block.content.trim()) {
+          if (!normalized.content.trim()) {
             continue;
           }
           const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-          void this.renderContent(textEl, block.content);
-          this.addTextCopyButton(textEl, block.content);
+          void this.renderContent(textEl, normalized.content);
+          this.addTextCopyButton(textEl, normalized.content);
         } else if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
           if (toolCall) {
@@ -356,9 +419,13 @@ export class MessageRenderer {
     } else {
       // Fallback for old conversations without contentBlocks
       if (msg.content) {
-        const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-        void this.renderContent(textEl, msg.content);
-        this.addTextCopyButton(textEl, msg.content);
+        const normalized = stripLegacyInterruptIndicator(msg.content);
+        hadLegacyInterruptIndicator ||= normalized.interrupted;
+        if (normalized.content.trim()) {
+          const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
+          void this.renderContent(textEl, normalized.content);
+          this.addTextCopyButton(textEl, normalized.content);
+        }
       }
       if (msg.toolCalls) {
         for (const toolCall of msg.toolCalls) {
@@ -377,6 +444,8 @@ export class MessageRenderer {
         cls: 'claudian-baked-duration',
       });
     }
+
+    return hadLegacyInterruptIndicator;
   }
 
   /**
@@ -384,21 +453,37 @@ export class MessageRenderer {
    * and Codex collab agent lifecycle tools.
    */
   private renderToolCall(contentEl: HTMLElement, toolCall: ToolCallInfo, msg?: ChatMessage): void {
+    if (!this.shouldRenderToolCall(toolCall)) return;
     const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(toolCall.name);
 
-    // Skip invisible internal tools
-    if (toolCall.name === TOOL_AGENT_OUTPUT) return;
-    if (subagentLifecycleAdapter?.isHiddenTool(toolCall.name)) return;
-
     if (isWriteEditTool(toolCall.name)) {
-      renderStoredWriteEdit(contentEl, toolCall);
+      renderStoredWriteEdit(contentEl, toolCall, {
+        initiallyExpanded: this.shouldExpandFileEditsByDefault(),
+      });
     } else if (isSubagentToolName(toolCall.name)) {
       this.renderTaskSubagent(contentEl, toolCall);
     } else if (subagentLifecycleAdapter?.isSpawnTool(toolCall.name) && msg) {
       this.renderProviderLifecycleSubagent(contentEl, toolCall, msg);
     } else {
-      renderStoredToolCall(contentEl, toolCall);
+      renderStoredToolCall(contentEl, toolCall, {
+        initiallyExpanded: toolCall.name === TOOL_APPLY_PATCH && this.shouldExpandFileEditsByDefault(),
+      });
     }
+  }
+
+  private shouldRenderToolCall(toolCall: ToolCallInfo): boolean {
+    if (toolCall.name === TOOL_AGENT_OUTPUT) return false;
+    if (toolCall.name === TOOL_WRITE_STDIN && this.isSilentWriteStdinTool(toolCall)) return false;
+    if (toolCall.name === 'custom_tool_call_output') return false;
+
+    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(toolCall.name);
+    if (subagentLifecycleAdapter?.isHiddenTool(toolCall.name)) return false;
+
+    return true;
+  }
+
+  private isSilentWriteStdinTool(toolCall: ToolCallInfo): boolean {
+    return typeof toolCall.input.chars !== 'string' || toolCall.input.chars.length === 0;
   }
 
   private renderTaskSubagent(
@@ -543,7 +628,8 @@ export class MessageRenderer {
   showFullImage(image: ImageAttachment): void {
     const dataUri = `data:${image.mediaType};base64,${image.data}`;
 
-    const overlay = document.body.createDiv({ cls: 'claudian-image-modal-overlay' });
+    const ownerDocument = this.messagesEl.ownerDocument ?? window.document;
+    const overlay = ownerDocument.body.createDiv({ cls: 'claudian-image-modal-overlay' });
     const modal = overlay.createDiv({ cls: 'claudian-image-modal' });
 
     modal.createEl('img', {
@@ -563,7 +649,7 @@ export class MessageRenderer {
     };
 
     const close = () => {
-      document.removeEventListener('keydown', handleEsc);
+      ownerDocument.removeEventListener('keydown', handleEsc);
       overlay.remove();
     };
 
@@ -571,7 +657,7 @@ export class MessageRenderer {
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) close();
     });
-    document.addEventListener('keydown', handleEsc);
+    ownerDocument.addEventListener('keydown', handleEsc);
   }
 
   /**
@@ -597,16 +683,21 @@ export class MessageRenderer {
     el.empty();
 
     try {
+      const normalizedMarkdown = normalizeLatexMathDelimiters(markdown);
       const renderMarkdown = options?.deferMath
-        ? escapeMathDelimitersForStreaming(markdown)
-        : markdown;
-      // Normalize embeds before MarkdownRenderer consumes them.
+        ? escapeMathDelimitersForStreaming(normalizedMarkdown)
+        : normalizedMarkdown;
+      // Escape user-authored HTML first so placeholders like <meta-name> render
+      // as plain text. Trusted plugin markup (image embeds) is injected only
+      // after this step, otherwise it would be escaped too.
+      const safeMarkdown = escapeRawHtmlTags(renderMarkdown);
       const processedMarkdown = replaceImageEmbedsWithHtml(
-        renderMarkdown,
+        safeMarkdown,
         this.app,
-        this.plugin.settings.mediaFolder
+        { mediaFolder: this.plugin.settings.mediaFolder }
       );
-      await MarkdownRenderer.renderMarkdown(
+      await MarkdownRenderer.render(
+        this.app,
         processedMarkdown,
         el,
         '',
@@ -634,14 +725,19 @@ export class MessageRenderer {
               text: match[1],
             });
             wrapper.appendChild(label);
-            label.addEventListener('click', async () => {
-              try {
-                await navigator.clipboard.writeText(code.textContent || '');
-                label.setText('copied!');
-                setTimeout(() => label.setText(match[1]), 1500);
-              } catch {
-                // Clipboard API may fail in non-secure contexts
-              }
+            label.addEventListener('click', () => {
+              runRendererAction(async () => {
+                const originalLabel = match[1];
+                if (!originalLabel) return;
+
+                try {
+                  await navigator.clipboard.writeText(code.textContent || '');
+                  label.setText('Copied!');
+                  window.setTimeout(() => label.setText(originalLabel), 1500);
+                } catch {
+                  // Clipboard API may fail in non-secure contexts
+                }
+              });
             });
           }
         }
@@ -669,9 +765,6 @@ export class MessageRenderer {
   // Copy Button
   // ============================================
 
-  /** Clipboard icon SVG for copy button. */
-  private static readonly COPY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
-
   /**
    * Adds a copy button to a text block.
    * Button shows clipboard icon on hover, changes to "copied!" on click.
@@ -680,63 +773,76 @@ export class MessageRenderer {
    */
   addTextCopyButton(textEl: HTMLElement, markdown: string): void {
     const copyBtn = textEl.createSpan({ cls: 'claudian-text-copy-btn' });
-    copyBtn.innerHTML = MessageRenderer.COPY_ICON;
+    setIcon(copyBtn, 'copy');
 
-    let feedbackTimeout: ReturnType<typeof setTimeout> | null = null;
+    let feedbackTimeout: number | null = null;
 
-    copyBtn.addEventListener('click', async (e) => {
+    copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      runRendererAction(async () => {
 
-      try {
-        await navigator.clipboard.writeText(markdown);
-      } catch {
-        // Clipboard API may fail in non-secure contexts
-        return;
-      }
+        try {
+          await navigator.clipboard.writeText(markdown);
+        } catch {
+          // Clipboard API may fail in non-secure contexts
+          return;
+        }
 
-      // Clear any pending timeout from rapid clicks
-      if (feedbackTimeout) {
-        clearTimeout(feedbackTimeout);
-      }
+        // Clear any pending timeout from rapid clicks
+        if (feedbackTimeout) {
+          window.clearTimeout(feedbackTimeout);
+        }
 
-      // Show "copied!" feedback
-      copyBtn.innerHTML = '';
-      copyBtn.setText('copied!');
-      copyBtn.classList.add('copied');
+        // Show "copied!" feedback
+        copyBtn.empty();
+        copyBtn.setText('Copied!');
+        copyBtn.classList.add('copied');
 
-      feedbackTimeout = setTimeout(() => {
-        copyBtn.innerHTML = MessageRenderer.COPY_ICON;
-        copyBtn.classList.remove('copied');
-        feedbackTimeout = null;
-      }, 1500);
+        feedbackTimeout = window.setTimeout(() => {
+          copyBtn.empty();
+          setIcon(copyBtn, 'copy');
+          copyBtn.classList.remove('copied');
+          feedbackTimeout = null;
+        }, 1500);
+      });
     });
   }
 
   refreshActionButtons(msg: ChatMessage, allMessages?: ChatMessage[], index?: number): void {
     if (!msg.userMessageId) return;
-    if (!this.isRewindEligible(allMessages, index)) return;
+    const canRewind = this.isRewindEligible(allMessages, index);
+    const canFork = this.isForkEligible(allMessages, index);
+    if (!canRewind && !canFork) return;
     const msgEl = this.liveMessageEls.get(msg.id);
     if (!msgEl) return;
 
-    if (this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn')) {
+    if (canRewind && this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn')) {
       this.addRewindButton(msgEl, msg.id);
     }
-    if (this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn')) {
+    if (canFork && this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn')) {
       this.addForkButton(msgEl, msg.id);
     }
-    this.cleanupLiveMessageEl(msg.id, msgEl);
+    this.cleanupLiveMessageEl(msg.id, msgEl, { canRewind, canFork });
   }
 
-  private cleanupLiveMessageEl(msgId: string, msgEl: HTMLElement): void {
-    const needsRewind = this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn');
-    const needsFork = this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn');
+  private cleanupLiveMessageEl(
+    msgId: string,
+    msgEl: HTMLElement,
+    expectedActions: { canRewind: boolean; canFork: boolean },
+  ): void {
+    const needsRewind = expectedActions.canRewind
+      && this.rewindCallback
+      && !msgEl.querySelector('.claudian-message-rewind-btn');
+    const needsFork = expectedActions.canFork
+      && this.forkCallback
+      && !msgEl.querySelector('.claudian-message-fork-btn');
     if (!needsRewind && !needsFork) {
       this.liveMessageEls.delete(msgId);
     }
   }
 
   private getOrCreateActionsToolbar(msgEl: HTMLElement): HTMLElement {
-    const existing = msgEl.querySelector('.claudian-user-msg-actions') as HTMLElement | null;
+    const existing = msgEl.querySelector<HTMLElement>('.claudian-user-msg-actions');
     if (existing) return existing;
     return msgEl.createDiv({ cls: 'claudian-user-msg-actions' });
   }
@@ -744,27 +850,30 @@ export class MessageRenderer {
   private addUserCopyButton(msgEl: HTMLElement, content: string): void {
     const toolbar = this.getOrCreateActionsToolbar(msgEl);
     const copyBtn = toolbar.createSpan({ cls: 'claudian-user-msg-copy-btn' });
-    copyBtn.innerHTML = MessageRenderer.COPY_ICON;
+    setIcon(copyBtn, 'copy');
     copyBtn.setAttribute('aria-label', 'Copy message');
 
-    let feedbackTimeout: ReturnType<typeof setTimeout> | null = null;
+    let feedbackTimeout: number | null = null;
 
-    copyBtn.addEventListener('click', async (e) => {
+    copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      try {
-        await navigator.clipboard.writeText(content);
-      } catch {
-        return;
-      }
-      if (feedbackTimeout) clearTimeout(feedbackTimeout);
-      copyBtn.innerHTML = '';
-      copyBtn.setText('copied!');
-      copyBtn.classList.add('copied');
-      feedbackTimeout = setTimeout(() => {
-        copyBtn.innerHTML = MessageRenderer.COPY_ICON;
-        copyBtn.classList.remove('copied');
-        feedbackTimeout = null;
-      }, 1500);
+      runRendererAction(async () => {
+        try {
+          await navigator.clipboard.writeText(content);
+        } catch {
+          return;
+        }
+        if (feedbackTimeout) window.clearTimeout(feedbackTimeout);
+        copyBtn.empty();
+        copyBtn.setText('Copied!');
+        copyBtn.classList.add('copied');
+        feedbackTimeout = window.setTimeout(() => {
+          copyBtn.empty();
+          setIcon(copyBtn, 'copy');
+          copyBtn.classList.remove('copied');
+          feedbackTimeout = null;
+        }, 1500);
+      });
     });
   }
 
@@ -773,15 +882,39 @@ export class MessageRenderer {
     const toolbar = this.getOrCreateActionsToolbar(msgEl);
     const btn = toolbar.createSpan({ cls: 'claudian-message-rewind-btn' });
     if (toolbar.firstChild !== btn) toolbar.insertBefore(btn, toolbar.firstChild);
-    btn.innerHTML = MessageRenderer.REWIND_ICON;
+    setIcon(btn, 'rotate-ccw');
     btn.setAttribute('aria-label', t('chat.rewind.ariaLabel'));
-    btn.addEventListener('click', async (e) => {
+    btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      try {
-        await this.rewindCallback?.(messageId);
-      } catch (err) {
-        new Notice(t('chat.rewind.failed', { error: err instanceof Error ? err.message : 'Unknown error' }));
-      }
+      this.showRewindMenu(e, messageId);
+    });
+  }
+
+  private showRewindMenu(event: MouseEvent, messageId: string): void {
+    const menu = new Menu();
+    this.addRewindMenuItem(menu, messageId, 'conversation');
+    this.addRewindMenuItem(menu, messageId, 'code-and-conversation');
+    menu.showAtMouseEvent(event);
+  }
+
+  private addRewindMenuItem(menu: Menu, messageId: string, mode: ChatRewindMode): void {
+    menu.addItem((item) => {
+      item
+        .setTitle(
+          mode === 'conversation'
+            ? t('chat.rewind.menuConversationOnly')
+            : t('chat.rewind.menuCodeAndConversation')
+        )
+        .setIcon(mode === 'conversation' ? 'message-square' : 'rotate-ccw')
+        .onClick(() => {
+          runRendererAction(async () => {
+            try {
+              await this.rewindCallback?.(messageId, mode);
+            } catch (err) {
+              new Notice(t('chat.rewind.failed', { error: err instanceof Error ? err.message : 'Unknown error' }));
+            }
+          });
+        });
     });
   }
 
@@ -790,15 +923,17 @@ export class MessageRenderer {
     const toolbar = this.getOrCreateActionsToolbar(msgEl);
     const btn = toolbar.createSpan({ cls: 'claudian-message-fork-btn' });
     if (toolbar.firstChild !== btn) toolbar.insertBefore(btn, toolbar.firstChild);
-    btn.innerHTML = MessageRenderer.FORK_ICON;
+    setIcon(btn, 'git-fork');
     btn.setAttribute('aria-label', t('chat.fork.ariaLabel'));
-    btn.addEventListener('click', async (e) => {
+    btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      try {
-        await this.forkCallback?.(messageId);
-      } catch (err) {
-        new Notice(t('chat.fork.failed', { error: err instanceof Error ? err.message : 'Unknown error' }));
-      }
+      runRendererAction(async () => {
+        try {
+          await this.forkCallback?.(messageId);
+        } catch (err) {
+          new Notice(t('chat.fork.failed', { error: err instanceof Error ? err.message : 'Unknown error' }));
+        }
+      });
     });
   }
 
@@ -816,7 +951,7 @@ export class MessageRenderer {
     const { scrollTop, scrollHeight, clientHeight } = this.messagesEl;
     const isNearBottom = scrollHeight - scrollTop - clientHeight < threshold;
     if (isNearBottom) {
-      requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
         this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
       });
     }

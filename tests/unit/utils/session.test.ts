@@ -6,6 +6,7 @@ import {
   formatToolCallForContext,
   getLastUserMessage,
   isSessionExpiredError,
+  isSessionMissingError,
   truncateToolResult,
 } from '@/utils/session';
 
@@ -19,6 +20,19 @@ describe('session utilities', () => {
     it('returns true for "session not found" error', () => {
       const error = new Error('Session not found');
       expect(isSessionExpiredError(error)).toBe(true);
+    });
+
+    it('returns true for the Claude missing-conversation error', () => {
+      const error = new Error('No conversation found with session ID: session-123');
+      expect(isSessionExpiredError(error)).toBe(true);
+      expect(isSessionMissingError(error)).toBe(true);
+      expect(isSessionMissingError(error, 'session-123')).toBe(true);
+      expect(isSessionMissingError(error, 'different-session')).toBe(false);
+    });
+
+    it('does not classify generic not-found wording as confirmed provider deletion', () => {
+      expect(isSessionMissingError(new Error('Session not found'))).toBe(false);
+      expect(isSessionMissingError(new Error('No conversation found'))).toBe(false);
     });
 
     it('returns true for "invalid session" error', () => {
@@ -684,7 +698,7 @@ describe('session utilities', () => {
       expect(result).toBe(historyContext);
     });
 
-    it('avoids duplication when XML-wrapped content matches display content', () => {
+    it('avoids duplication when legacy XML-wrapped content matches display content', () => {
       const prompt = [
         '<current_note>',
         'notes/file.md',
@@ -728,8 +742,8 @@ describe('session utilities', () => {
 
     describe('new format (user content before XML context)', () => {
       it('avoids duplication when actualPrompt matches last user message', () => {
-        const prompt = 'Explain this\n\n<current_note>\ntest.md\n</current_note>';
-        const actualPrompt = 'Explain this\n\n<current_note>\ntest.md\n</current_note>';
+        const prompt = 'Explain this\n\n<linked_note>\ntest.md\n</linked_note>';
+        const actualPrompt = 'Explain this\n\n<linked_note>\ntest.md\n</linked_note>';
         const messages: ChatMessage[] = [
           {
             id: 'msg-1',
@@ -747,8 +761,8 @@ describe('session utilities', () => {
       });
 
       it('appends prompt when actualPrompt differs from last user message', () => {
-        const oldPrompt = 'First question\n\n<current_note>\nold.md\n</current_note>';
-        const newPrompt = 'Second question\n\n<current_note>\nnew.md\n</current_note>';
+        const oldPrompt = 'First question\n\n<linked_note>\nold.md\n</linked_note>';
+        const newPrompt = 'Second question\n\n<linked_note>\nnew.md\n</linked_note>';
         const messages: ChatMessage[] = [
           {
             id: 'msg-1',
@@ -785,7 +799,7 @@ describe('session utilities', () => {
       });
 
       it('extracts user query from content with multiple XML context tags', () => {
-        const prompt = 'Update code\n\n<current_note>\ntest.md\n</current_note>\n\n<editor_selection path="test.md">\nselected\n</editor_selection>';
+        const prompt = 'Update code\n\n<linked_note>\ntest.md\n</linked_note>\n\n<editor_selection path="test.md">\nselected\n</editor_selection>';
         const messages: ChatMessage[] = [
           {
             id: 'msg-1',
@@ -803,7 +817,7 @@ describe('session utilities', () => {
       });
 
       it('falls back to extractUserQuery when displayContent is not available', () => {
-        const prompt = 'Help me\n\n<current_note>\nfile.md\n</current_note>';
+        const prompt = 'Help me\n\n<linked_note>\nfile.md\n</linked_note>';
         const messages: ChatMessage[] = [
           {
             id: 'msg-1',
@@ -917,6 +931,42 @@ describe('session utilities', () => {
       expect(result).toContain('Assistant: Stopped.');
       // Interrupt message should not appear as a user message
       expect(result.match(/User:/g)?.length).toBe(1);
+    });
+
+    it('includes contentful interrupted assistant messages', () => {
+      const messages: ChatMessage[] = [
+        { id: 'msg-1', role: 'user', content: 'Compare options', timestamp: 1000 },
+        {
+          id: 'msg-2',
+          role: 'assistant',
+          content: 'Option A is safer, while option B is faster.',
+          timestamp: 2000,
+          isInterrupt: true,
+        },
+        { id: 'msg-3', role: 'user', content: 'Use option B instead', timestamp: 3000 },
+      ];
+
+      const result = buildContextFromHistory(messages);
+
+      expect(result).toContain('Assistant: Option A is safer, while option B is faster.');
+      expect(result).toContain('User: Use option B instead');
+    });
+
+    it('skips empty interrupted assistant signals', () => {
+      const messages: ChatMessage[] = [
+        { id: 'msg-1', role: 'user', content: 'Start task', timestamp: 1000 },
+        {
+          id: 'msg-2',
+          role: 'assistant',
+          content: '',
+          timestamp: 2000,
+          isInterrupt: true,
+        },
+      ];
+
+      const result = buildContextFromHistory(messages);
+
+      expect(result).toBe('User: Start task');
     });
 
     it('includes assistant message with only thinking blocks and no text', () => {

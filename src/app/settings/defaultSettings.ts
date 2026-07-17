@@ -1,4 +1,5 @@
 import { getDefaultHiddenProviderCommands } from '../../core/providers/commands/hiddenCommands';
+import { DEFAULT_REASONING_VALUE } from '../../core/providers/reasoning';
 import { type ClaudianSettings } from '../../core/types/settings';
 import { getBuiltInProviderDefaultConfigs } from '../../providers/defaultProviderConfigs';
 
@@ -9,7 +10,7 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
 
   model: 'haiku',
   thinkingBudget: 'off',
-  effortLevel: 'high',
+  effortLevel: DEFAULT_REASONING_VALUE,
   serviceTier: 'default',
   enableAutoTitleGeneration: true,
   titleGenerationModel: '',
@@ -22,6 +23,7 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   sharedEnvironmentVariables: '',
   envSnippets: [],
   customContextLimits: {},
+  customModelAliases: {},
 
   keyboardNavigation: {
     scrollUpKey: 'w',
@@ -52,9 +54,9 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   lastCustomModel: '',
 
   maxTabs: 3,
-  tabBarPosition: 'input',
   enableAutoScroll: true,
   deferMathRenderingDuringStreaming: true,
+  expandFileEditsByDefault: false,
   chatViewPlacement: 'right-sidebar',
 
   hiddenProviderCommands: getDefaultHiddenProviderCommands(),

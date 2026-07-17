@@ -21,6 +21,7 @@ export interface EnvSnippet {
   envVars: string;
   scope?: EnvironmentScope;
   contextLimits?: Record<string, number>;  // Optional: context limits for custom models
+  modelAliases?: Record<string, string>;   // Optional: display aliases for custom models
 }
 
 /** Source of a slash command. */
@@ -51,9 +52,6 @@ export interface KeyboardNavigationSettings {
   scrollDownKey: string;       // Key to scroll down when focused on messages (default: 's')
   focusInputKey: string;       // Key to focus input (default: 'i', like vim insert mode)
 }
-
-/** Tab bar position setting. */
-export type TabBarPosition = 'input' | 'header';
 
 export const CHAT_VIEW_PLACEMENTS = [
   'right-sidebar',
@@ -116,6 +114,7 @@ export interface ClaudianSettings {
   sharedEnvironmentVariables: string;
   envSnippets: EnvSnippet[];
   customContextLimits: Record<string, number>;
+  customModelAliases: Record<string, string>;
 
   // UI settings
   keyboardNavigation: KeyboardNavigationSettings;
@@ -149,9 +148,9 @@ export interface ClaudianSettings {
 
   // UI preferences
   maxTabs: number;
-  tabBarPosition: TabBarPosition;
   enableAutoScroll: boolean;
   deferMathRenderingDuringStreaming: boolean;
+  expandFileEditsByDefault: boolean;
   chatViewPlacement: ChatViewPlacement;
 
   // Provider command visibility

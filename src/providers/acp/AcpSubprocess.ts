@@ -1,7 +1,14 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 
+import {
+  resolveWindowsCmdShimSpawnSpec,
+  terminateSpawnedProcess,
+  type WindowsCmdShimSpawnSpec,
+} from '../../utils/windowsCmdShim';
+
 const SIGKILL_TIMEOUT_MS = 3_000;
+const FINAL_SHUTDOWN_TIMEOUT_MS = 3_000;
 const STDERR_BUFFER_LIMIT = 8_000;
 
 export interface AcpSubprocessLaunchSpec {
@@ -18,6 +25,7 @@ export class AcpSubprocess {
   private readonly closeListeners = new Set<CloseListener>();
   private notifiedClose = false;
   private proc: ChildProcessWithoutNullStreams | null = null;
+  private resolvedSpawnSpec: WindowsCmdShimSpawnSpec | null = null;
   private stderrBuffer = '';
 
   constructor(private readonly launchSpec: AcpSubprocessLaunchSpec) {}
@@ -46,11 +54,14 @@ export class AcpSubprocess {
       return;
     }
 
-    const proc = spawn(this.launchSpec.command, this.launchSpec.args, {
+    const resolvedSpawnSpec = resolveWindowsCmdShimSpawnSpec(this.launchSpec);
+    this.resolvedSpawnSpec = resolvedSpawnSpec;
+    const proc = spawn(resolvedSpawnSpec.command, resolvedSpawnSpec.args, {
       cwd: this.launchSpec.cwd,
       env: this.launchSpec.env,
       stdio: 'pipe',
       windowsHide: true,
+      ...(resolvedSpawnSpec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
 
     proc.stderr.on('data', (chunk: Buffer | string) => {
@@ -97,21 +108,29 @@ export class AcpSubprocess {
 
     await new Promise<void>((resolve) => {
       const proc = this.proc!;
+      let killTimer: number | null = null;
+      let finalTimer: number | null = null;
       const onClose = () => {
         cleanup();
         resolve();
       };
-      const killTimer = setTimeout(() => {
-        proc.kill('SIGKILL');
+      killTimer = window.setTimeout(() => {
+        this.killProc(proc, 'SIGKILL');
+        finalTimer = window.setTimeout(onClose, FINAL_SHUTDOWN_TIMEOUT_MS);
       }, SIGKILL_TIMEOUT_MS);
       const cleanup = () => {
-        clearTimeout(killTimer);
+        if (killTimer !== null) window.clearTimeout(killTimer);
+        if (finalTimer !== null) window.clearTimeout(finalTimer);
         proc.off('exit', onClose);
       };
 
       proc.once('exit', onClose);
-      proc.kill('SIGTERM');
+      this.killProc(proc, 'SIGTERM');
     });
+  }
+
+  private killProc(proc: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): boolean {
+    return terminateSpawnedProcess(proc, signal, spawn, this.resolvedSpawnSpec);
   }
 
   private notifyClose(error?: Error): void {

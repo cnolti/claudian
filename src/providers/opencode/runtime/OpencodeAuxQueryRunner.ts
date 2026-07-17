@@ -3,8 +3,8 @@ import * as path from 'node:path';
 
 import type { AuxQueryConfig, AuxQueryRunner } from '../../../core/auxiliary/AuxQueryRunner';
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
-import type ClaudianPlugin from '../../../main';
 import { getVaultPath } from '../../../utils/path';
 import {
   AcpClientConnection,
@@ -57,7 +57,7 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
   private transport: AcpJsonRpcTransport | null = null;
 
   constructor(
-    private readonly plugin: ClaudianPlugin,
+    private readonly plugin: ProviderHost,
     private readonly options: OpencodeAuxQueryRunnerOptions,
   ) {}
 
@@ -192,6 +192,7 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
       || !this.transport
       || !this.connection
       || !this.process.isAlive()
+      || this.transport.isClosed
       || this.currentLaunchKey !== nextLaunchKey;
 
     if (!shouldRestart) {
@@ -315,7 +316,7 @@ export class OpencodeAuxQueryRunner implements AuxQueryRunner {
 
   private resolveSelectedRawModel(explicitModel?: string): string | undefined {
     const projectedSettings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      this.plugin.settings as unknown as Record<string, unknown>,
+      this.plugin.settings,
       'opencode',
     );
     if (explicitModel) {

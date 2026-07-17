@@ -1,60 +1,16 @@
-import { type ChildProcess,spawn } from 'child_process';
+import { type ChildProcess, spawn } from 'child_process';
 import type { Readable, Writable } from 'stream';
 
+import {
+  resolveWindowsCmdShimSpawnSpec,
+  terminateSpawnedProcess,
+  type WindowsCmdShimSpawnSpec,
+} from '../../../utils/windowsCmdShim';
 import type { CodexLaunchSpec } from './codexLaunchTypes';
 
 const SIGKILL_TIMEOUT_MS = 3_000;
-const WINDOWS_CMD_ARGUMENT_CHARS = /[\s"&<>|{}^=;!'+,`~()%@]/u;
-
-function requiresWindowsShellQuoting(value: string): boolean {
-  return WINDOWS_CMD_ARGUMENT_CHARS.test(value)
-    || value.includes('[')
-    || value.includes(']');
-}
-
-function quoteWindowsShellArgument(value: string): string {
-  if (!value.length) {
-    return '""';
-  }
-
-  if (!requiresWindowsShellQuoting(value)) {
-    return value;
-  }
-
-  return `"${value.replace(/"/g, '""')}"`;
-}
-
-function resolveWindowsSpawnSpec(launchSpec: Pick<CodexLaunchSpec, 'command' | 'args' | 'spawnCwd' | 'env'>) {
-  const command = launchSpec.command.trim();
-  const lowerCommand = command.toLowerCase();
-
-  if (!command || process.platform !== 'win32') {
-    return {
-      command: launchSpec.command,
-      args: launchSpec.args,
-      env: launchSpec.env,
-    };
-  }
-
-  if (lowerCommand.endsWith('.cmd')) {
-    const shellCommand = [command, ...launchSpec.args]
-      .map(value => quoteWindowsShellArgument(value))
-      .join(' ');
-
-    return {
-      command: process.env.ComSpec || process.env.comspec || 'cmd.exe',
-      args: ['/d', '/s', '/c', `"${shellCommand}"`],
-      env: launchSpec.env,
-      windowsVerbatimArguments: true,
-    };
-  }
-
-  return {
-    command: launchSpec.command,
-    args: launchSpec.args,
-    env: launchSpec.env,
-  };
-}
+const FINAL_SHUTDOWN_TIMEOUT_MS = 3_000;
+const STDERR_BUFFER_LIMIT = 8_192;
 
 type ExitCallback = (code: number | null, signal: string | null) => void;
 
@@ -62,25 +18,32 @@ export class CodexAppServerProcess {
   private proc: ChildProcess | null = null;
   private alive = false;
   private exitCallbacks: ExitCallback[] = [];
+  private resolvedSpawnSpec: WindowsCmdShimSpawnSpec | null = null;
+  private stderrBuffer = '';
 
   constructor(
     private readonly launchSpec: Pick<CodexLaunchSpec, 'command' | 'args' | 'spawnCwd' | 'env'>,
   ) {}
 
   start(): void {
-    const resolvedSpawnSpec = resolveWindowsSpawnSpec(this.launchSpec);
+    const resolvedSpawnSpec = resolveWindowsCmdShimSpawnSpec(this.launchSpec);
+    this.resolvedSpawnSpec = resolvedSpawnSpec;
 
     this.proc = spawn(resolvedSpawnSpec.command, resolvedSpawnSpec.args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.launchSpec.spawnCwd,
-      env: resolvedSpawnSpec.env,
+      env: this.launchSpec.env,
       windowsHide: true,
       ...(resolvedSpawnSpec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
 
     this.alive = true;
 
-    this.proc.on('exit', (code, signal) => {
+    this.proc.on('exit', () => {
+      this.alive = false;
+    });
+
+    this.proc.on('close', (code, signal) => {
       this.alive = false;
       for (const cb of this.exitCallbacks) {
         cb(code, signal);
@@ -89,6 +52,11 @@ export class CodexAppServerProcess {
 
     this.proc.on('error', () => {
       this.alive = false;
+    });
+
+    this.proc.stderr?.on('data', (chunk: Buffer | string) => {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+      this.stderrBuffer = `${this.stderrBuffer}${text}`.slice(-STDERR_BUFFER_LIMIT);
     });
   }
 
@@ -111,6 +79,10 @@ export class CodexAppServerProcess {
     return this.alive;
   }
 
+  getStderrSnapshot(): string {
+    return this.stderrBuffer.trim();
+  }
+
   onExit(callback: ExitCallback): void {
     this.exitCallbacks.push(callback);
   }
@@ -124,19 +96,37 @@ export class CodexAppServerProcess {
     if (!this.proc || !this.alive) return;
 
     return new Promise<void>((resolve) => {
-      const onExit = () => {
-        clearTimeout(killTimer);
+      let killTimer: number | null = null;
+      let finalTimer: number | null = null;
+      const cleanup = () => {
+        if (killTimer !== null) window.clearTimeout(killTimer);
+        if (finalTimer !== null) window.clearTimeout(finalTimer);
+        this.proc?.off('exit', onExit);
+      };
+      const finish = () => {
+        cleanup();
         resolve();
+      };
+      const onExit = () => {
+        finish();
       };
 
       this.proc!.once('exit', onExit);
-      this.proc!.kill('SIGTERM');
+      this.killProc('SIGTERM');
 
-      const killTimer = setTimeout(() => {
+      killTimer = window.setTimeout(() => {
         if (this.alive) {
-          this.proc!.kill('SIGKILL');
+          this.killProc('SIGKILL');
         }
+        finalTimer = window.setTimeout(finish, FINAL_SHUTDOWN_TIMEOUT_MS);
       }, SIGKILL_TIMEOUT_MS);
     });
+  }
+
+  private killProc(signal: NodeJS.Signals): boolean {
+    if (!this.proc) {
+      return false;
+    }
+    return terminateSpawnedProcess(this.proc, signal, spawn, this.resolvedSpawnSpec);
   }
 }

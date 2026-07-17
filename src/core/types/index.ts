@@ -25,7 +25,6 @@ export {
   type KeyboardNavigationSettings,
   type PermissionMode,
   type SlashCommand,
-  type TabBarPosition,
 } from './settings';
 
 // Diff types
@@ -77,3 +76,10 @@ export {
   type McpStdioServerConfig,
   type ParsedMcpConfig,
 } from './mcp';
+
+// Heartbeat (fork-only)
+export {
+  type HeartbeatHost,
+  type HeartbeatStatus,
+  type HeartbeatSummary,
+} from './heartbeat';

@@ -1,6 +1,9 @@
 import * as fs from 'fs';
 
-import { OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES } from '@/providers/opencode/settings';
+import {
+  getOpencodeProviderSettings,
+  OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
+} from '@/providers/opencode/settings';
 import { opencodeSettingsTabRenderer } from '@/providers/opencode/ui/OpencodeSettingsTab';
 
 const mockGetHostnameKey = jest.fn(() => 'host-a');
@@ -11,6 +14,10 @@ const mockRefreshAgentMentions = jest.fn().mockResolvedValue(undefined);
 const mockInvalidateProviderCommandCaches = jest.fn();
 const mockRefreshModelSelector = jest.fn();
 const mockCliResolverReset = jest.fn();
+const mockRuntimeEnsureReady = jest.fn().mockResolvedValue(false);
+const mockRuntimeSyncConversationState = jest.fn();
+const mockRuntimeCleanup = jest.fn();
+const mockRuntimeWarmModelMetadata = jest.fn().mockResolvedValue(false);
 const mockAgentStorage = {};
 const mockCreatedAgentSettings: Array<{
   app: unknown;
@@ -20,6 +27,14 @@ const mockCreatedAgentSettings: Array<{
 }> = [];
 
 jest.mock('fs');
+jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
+  ProviderSettingsCoordinator: {
+    applyProviderEnablement: jest.fn((settings: Record<string, unknown>, providerId: string, enabled: boolean) => {
+      const providerConfigs = settings.providerConfigs as Record<string, { enabled: boolean }>;
+      providerConfigs[providerId].enabled = enabled;
+    }),
+  },
+}));
 jest.mock('obsidian', () => {
   class MockSetting {
     public name = '';
@@ -67,7 +82,7 @@ jest.mock('obsidian', () => {
   };
 });
 
-jest.mock('@/features/settings/ui/EnvironmentSettingsSection', () => ({
+jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
 
@@ -99,6 +114,28 @@ jest.mock('@/providers/opencode/app/OpencodeWorkspaceServices', () => ({
   })),
 }));
 
+jest.mock('@/providers/opencode/runtime/OpencodeChatRuntime', () => ({
+  OpencodeChatRuntime: class MockOpencodeChatRuntime {
+    constructor(readonly plugin: any) {}
+
+    syncConversationState(...args: unknown[]) {
+      return mockRuntimeSyncConversationState(...args);
+    }
+
+    ensureReady(...args: unknown[]) {
+      return mockRuntimeEnsureReady(this.plugin, ...args);
+    }
+
+    warmModelMetadata(...args: unknown[]) {
+      return mockRuntimeWarmModelMetadata(this.plugin, ...args);
+    }
+
+    cleanup() {
+      return mockRuntimeCleanup();
+    }
+  },
+}));
+
 jest.mock('@/utils/env', () => ({
   ...jest.requireActual('@/utils/env'),
   getHostnameKey: () => mockGetHostnameKey(),
@@ -115,6 +152,7 @@ interface MockTextComponent {
     value: string;
     style: Record<string, string>;
     addClass: jest.Mock;
+    toggleClass: jest.Mock;
   };
 }
 
@@ -141,6 +179,7 @@ type MockElementRecord = {
 
 const createdSettings: MockSettingRecord[] = [];
 const createdElements: MockElementRecord[] = [];
+const createdDomElements: any[] = [];
 
 function createTextComponent(): MockTextComponent {
   const component = {} as MockTextComponent;
@@ -151,6 +190,7 @@ function createTextComponent(): MockTextComponent {
     value: '',
     style: {},
     addClass: jest.fn(),
+    toggleClass: jest.fn(),
   };
   component.setPlaceholder = jest.fn((value: string) => {
     component.placeholder = value;
@@ -184,6 +224,8 @@ function createToggleComponent(): MockToggleComponent {
 }
 
 function createElement(): any {
+  const classes = new Set<string>();
+  const eventListeners = new Map<string, Array<(...args: unknown[]) => void>>();
   const element: any = {
     value: '',
     checked: false,
@@ -192,16 +234,56 @@ function createElement(): any {
     title: '',
     style: {},
     classList: {
-      add: jest.fn(),
-      toggle: jest.fn(),
+      add: jest.fn((cls: string) => classes.add(cls)),
+      remove: jest.fn((cls: string) => classes.delete(cls)),
+      toggle: jest.fn((cls: string, force?: boolean) => {
+        if (force === undefined) {
+          if (classes.has(cls)) {
+            classes.delete(cls);
+            return false;
+          }
+          classes.add(cls);
+          return true;
+        }
+        if (force) {
+          classes.add(cls);
+        } else {
+          classes.delete(cls);
+        }
+        return force;
+      }),
+      contains: jest.fn((cls: string) => classes.has(cls)),
     },
+    addClass: jest.fn((cls: string) => {
+      cls.split(/\s+/).filter(Boolean).forEach((item) => classes.add(item));
+    }),
+    removeClass: jest.fn((cls: string) => {
+      cls.split(/\s+/).filter(Boolean).forEach((item) => classes.delete(item));
+    }),
+    toggleClass: jest.fn((cls: string, force: boolean) => {
+      if (force) {
+        classes.add(cls);
+      } else {
+        classes.delete(cls);
+      }
+    }),
+    hasClass: jest.fn((cls: string) => classes.has(cls)),
     appendText: jest.fn(),
     setText: jest.fn((value: string) => {
       element.text = value;
     }),
     empty: jest.fn(),
     setAttribute: jest.fn(),
-    addEventListener: jest.fn(),
+    addEventListener: jest.fn((type: string, callback: (...args: unknown[]) => void) => {
+      const listeners = eventListeners.get(type) ?? [];
+      listeners.push(callback);
+      eventListeners.set(type, listeners);
+    }),
+    dispatchMockEvent: async (type: string, event?: unknown) => {
+      for (const listener of eventListeners.get(type) ?? []) {
+        await listener(event);
+      }
+    },
     blur: jest.fn(),
     createEl: jest.fn((_tag?: string, attrs?: Record<string, unknown>) => {
       const child = createElement();
@@ -223,6 +305,7 @@ function createElement(): any {
         tag: child.tag,
         text: child.text,
       });
+      createdDomElements.push(child);
       return child;
     }),
     createDiv: jest.fn((attrs?: Record<string, unknown>) => {
@@ -236,6 +319,7 @@ function createElement(): any {
         tag: child.tag,
         text: child.text,
       });
+      createdDomElements.push(child);
       return child;
     }),
     createSpan: jest.fn((_attrs?: Record<string, unknown>) => createElement()),
@@ -257,6 +341,7 @@ function createContainer(): any {
         tag: child.tag,
         text: child.text,
       });
+      createdDomElements.push(child);
       return child;
     }),
     createEl: jest.fn((tag?: string, attrs?: Record<string, unknown>) => {
@@ -273,6 +358,7 @@ function createContainer(): any {
         tag: child.tag,
         text: child.text,
       });
+      createdDomElements.push(child);
       return child;
     }),
   };
@@ -294,7 +380,7 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     refreshModelSelector: mockRefreshModelSelector,
   };
 
-  return {
+  const plugin: any = {
     settings: {
       providerConfigs: {
         opencode: {
@@ -316,6 +402,21 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     getView: jest.fn(() => viewA),
     getAllViews: jest.fn(() => [viewA, viewB]),
   };
+  plugin.recycleProviderRuntimes = jest.fn(async (providerId: string) => {
+    for (const view of plugin.getAllViews()) {
+      await view.getTabManager()?.broadcastToProviderTabs(
+        providerId,
+        (runtime: { cleanup(): void }) => Promise.resolve(runtime.cleanup()),
+      );
+      view.invalidateProviderCommandCaches([providerId]);
+      view.refreshModelSelector();
+    }
+  });
+  plugin.mutateSettings = jest.fn(async (mutation: (settings: any) => void | Promise<void>) => {
+    await mutation(plugin.settings);
+    await plugin.saveSettings();
+  });
+  return plugin;
 }
 
 function createContext(plugin: any) {
@@ -323,8 +424,13 @@ function createContext(plugin: any) {
     plugin,
     renderHiddenProviderCommandSetting: jest.fn(),
     refreshModelSelectors: jest.fn(),
+    refreshTitleGenerationModelOptions: jest.fn(),
     renderCustomContextLimits: jest.fn(),
   };
+}
+
+async function flushPromises(): Promise<void> {
+  await new Promise<void>(resolve => setImmediate(resolve));
 }
 
 function findSetting(name: string): MockSettingRecord {
@@ -335,6 +441,14 @@ function findSetting(name: string): MockSettingRecord {
   return setting;
 }
 
+function findElement(tag: string, cls: string): any {
+  const element = createdDomElements.find((candidate) => candidate.tag === tag && candidate.cls === cls);
+  if (!element) {
+    throw new Error(`Element not found: ${tag}.${cls}`);
+  }
+  return element;
+}
+
 describe('OpencodeSettingsTab', () => {
   const mockedExistsSync = fs.existsSync as jest.MockedFunction<typeof fs.existsSync>;
   const mockedStatSync = fs.statSync as jest.MockedFunction<typeof fs.statSync>;
@@ -342,10 +456,23 @@ describe('OpencodeSettingsTab', () => {
   beforeEach(() => {
     createdSettings.length = 0;
     createdElements.length = 0;
+    createdDomElements.length = 0;
     mockCreatedAgentSettings.length = 0;
     jest.clearAllMocks();
+    mockRuntimeEnsureReady.mockResolvedValue(false);
+    mockRuntimeWarmModelMetadata.mockResolvedValue(false);
     mockedExistsSync.mockReturnValue(false);
     mockedStatSync.mockReturnValue({ isFile: () => true } as fs.Stats);
+  });
+
+  it('refreshes title model options after OpenCode enablement changes', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    opencodeSettingsTabRenderer.render(createContainer(), context);
+    await findSetting('Enable OpenCode').toggleComponents[0].onChangeCallback?.(false);
+
+    expect(context.refreshTitleGenerationModelOptions).toHaveBeenCalledTimes(1);
   });
 
   it('stores the CLI path per host and resets active runtime state across all views', async () => {
@@ -377,7 +504,7 @@ describe('OpencodeSettingsTab', () => {
 
     opencodeSettingsTabRenderer.render(createContainer(), context);
 
-    expect(findSetting('Commands and Skills').heading).toBe(true);
+    expect(findSetting('Commands and skills').heading).toBe(true);
     expect(context.renderHiddenProviderCommandSetting).toHaveBeenCalledWith(
       expect.anything(),
       'opencode',
@@ -431,5 +558,196 @@ describe('OpencodeSettingsTab', () => {
       desc: expect.stringContaining(OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES),
       placeholder: `${OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES}\nOPENCODE_DB=/path/to/opencode.db`,
     }));
+  });
+
+  it('loads the OpenCode model catalog when the model browser is expanded', async () => {
+    mockRuntimeEnsureReady.mockImplementation(async (plugin: any) => {
+      plugin.settings.providerConfigs.opencode.discoveredModels = [
+        { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+      ];
+      return true;
+    });
+    const plugin = createPlugin({
+      providerConfigs: {
+        opencode: {
+          availableModes: [],
+          cliPath: '',
+          cliPathsByHost: {},
+          discoveredModels: [],
+          enabled: true,
+          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
+          modelAliases: {},
+          preferredThinkingByModel: {},
+          selectedMode: '',
+          visibleModels: ['deepseek/deepseek-v4-pro'],
+        },
+      },
+    });
+    const context = createContext(plugin);
+
+    opencodeSettingsTabRenderer.render(createContainer(), context);
+
+    const catalogEl = findElement('details', 'claudian-provider-model-picker-catalog');
+    catalogEl.open = true;
+    await catalogEl.dispatchMockEvent('toggle');
+    await flushPromises();
+
+    expect(mockRuntimeSyncConversationState).toHaveBeenCalledWith({
+      providerState: { databasePath: ':memory:' },
+      sessionId: null,
+    });
+    expect(mockRuntimeEnsureReady).toHaveBeenCalledWith(
+      plugin,
+      { allowSessionCreation: true },
+    );
+    expect(mockRuntimeCleanup).toHaveBeenCalledTimes(1);
+    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads the OpenCode model catalog immediately when a fresh picker starts expanded', async () => {
+    mockRuntimeEnsureReady.mockImplementation(async (plugin: any) => {
+      plugin.settings.providerConfigs.opencode.discoveredModels = [
+        { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+      ];
+      return true;
+    });
+    const plugin = createPlugin({
+      providerConfigs: {
+        opencode: {
+          availableModes: [],
+          cliPath: '',
+          cliPathsByHost: {},
+          discoveredModels: [],
+          enabled: true,
+          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
+          modelAliases: {},
+          preferredThinkingByModel: {},
+          selectedMode: '',
+          visibleModels: [],
+        },
+      },
+    });
+    const context = createContext(plugin);
+
+    opencodeSettingsTabRenderer.render(createContainer(), context);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockRuntimeSyncConversationState).toHaveBeenCalledWith({
+      providerState: { databasePath: ':memory:' },
+      sessionId: null,
+    });
+    expect(mockRuntimeEnsureReady).toHaveBeenCalledWith(
+      plugin,
+      { allowSessionCreation: true },
+    );
+    expect(mockRuntimeCleanup).toHaveBeenCalledTimes(1);
+    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads the OpenCode catalog when saved models start with the browser collapsed', async () => {
+    mockRuntimeEnsureReady.mockImplementation(async (plugin: any) => {
+      plugin.settings.providerConfigs.opencode.discoveredModels = [
+        { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+      ];
+      return true;
+    });
+    const plugin = createPlugin({
+      providerConfigs: {
+        opencode: {
+          availableModes: [],
+          cliPath: '',
+          cliPathsByHost: {},
+          discoveredModels: [],
+          enabled: true,
+          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
+          modelAliases: {},
+          preferredThinkingByModel: {},
+          selectedMode: '',
+          visibleModels: ['deepseek/deepseek-v4-pro'],
+        },
+      },
+    });
+    const context = createContext(plugin);
+
+    opencodeSettingsTabRenderer.render(createContainer(), context);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockRuntimeEnsureReady).toHaveBeenCalledWith(
+      plugin,
+      { allowSessionCreation: true },
+    );
+    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
+  });
+
+  it('warms and persists thinking metadata when a model is added to the visible list', async () => {
+    mockRuntimeWarmModelMetadata.mockResolvedValue(true);
+    const plugin = createPlugin({
+      providerConfigs: {
+        opencode: {
+          availableModes: [],
+          cliPath: '',
+          cliPathsByHost: {},
+          discoveredModels: [
+            { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+          ],
+          enabled: true,
+          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
+          modelAliases: {},
+          preferredThinkingByModel: {},
+          selectedMode: '',
+          visibleModels: [],
+        },
+      },
+    });
+    const context = createContext(plugin);
+
+    opencodeSettingsTabRenderer.render(createContainer(), context);
+
+    const checkboxEl = createdDomElements.find((element) => element.type === 'checkbox');
+    if (!checkboxEl) {
+      throw new Error('Expected model checkbox');
+    }
+
+    checkboxEl.checked = true;
+    await checkboxEl.dispatchMockEvent('change');
+    await flushPromises();
+
+    expect(plugin.settings.providerConfigs.opencode.visibleModels).toEqual([
+      'deepseek/deepseek-v4-pro',
+    ]);
+    expect(mockRuntimeWarmModelMetadata).toHaveBeenCalledWith(
+      plugin,
+      'opencode:deepseek/deepseek-v4-pro',
+    );
+    expect(context.refreshModelSelectors).toHaveBeenCalled();
+  });
+
+  it('persists aliases through the shared model picker', async () => {
+    const plugin = createPlugin({
+      providerConfigs: {
+        opencode: {
+          discoveredModels: [
+            { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+          ],
+          modelAliases: {},
+          visibleModels: ['deepseek/deepseek-v4-pro'],
+        },
+      },
+    });
+    const context = createContext(plugin);
+
+    opencodeSettingsTabRenderer.render(createContainer(), context);
+
+    const aliasInput = findElement('input', 'claudian-provider-model-picker-selected-alias');
+    aliasInput.value = 'V4 Pro';
+    await aliasInput.dispatchMockEvent('blur');
+    await flushPromises();
+
+    expect(getOpencodeProviderSettings(plugin.settings).modelAliases).toEqual({
+      'deepseek/deepseek-v4-pro': 'V4 Pro',
+    });
+    expect(context.refreshModelSelectors).toHaveBeenCalled();
   });
 });

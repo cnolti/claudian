@@ -1,12 +1,13 @@
 import '@/providers';
 
+import { CODEX_SPARK_MODEL, TEST_CODEX_MODEL } from '@test/helpers/codexModels';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
 import type { PreparedChatTurn } from '@/core/runtime/types';
 import type { StreamChunk } from '@/core/types/chat';
-import { CODEX_SPARK_MODEL, DEFAULT_CODEX_PRIMARY_MODEL } from '@/providers/codex/types/models';
+import { encodeCodexModelSelectionId } from '@/providers/codex/modelSelection';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -119,8 +120,39 @@ async function emitServerRequest(
 function createMockPlugin(overrides: Record<string, unknown> = {}): any {
   return {
     settings: {
-      model: DEFAULT_CODEX_PRIMARY_MODEL,
+      model: TEST_CODEX_MODEL,
       effortLevel: 'medium',
+      providerConfigs: {
+        codex: {
+          discoveredModels: [{
+            model: TEST_CODEX_MODEL,
+            displayName: 'Test Codex Model',
+            description: 'Test model',
+            supportedReasoningEfforts: [
+              { value: 'low', description: 'Fast' },
+              { value: 'medium', description: 'Balanced' },
+              { value: 'max', description: 'Maximum reasoning' },
+            ],
+            defaultReasoningEffort: 'medium',
+            serviceTiers: [{ id: 'priority', name: 'Fast', description: '1.5x speed' }],
+            defaultServiceTier: null,
+            inputModalities: ['text', 'image'],
+            isDefault: true,
+          }, {
+            model: 'gpt-5.4-mini',
+            displayName: 'Test Mini Model',
+            description: 'Test mini model',
+            supportedReasoningEfforts: [
+              { value: 'medium', description: 'Balanced' },
+            ],
+            defaultReasoningEffort: 'medium',
+            serviceTiers: [],
+            defaultServiceTier: null,
+            inputModalities: ['text', 'image'],
+            isDefault: false,
+          }],
+        },
+      },
       systemPrompt: '',
       mediaFolder: '',
       userName: '',
@@ -217,6 +249,81 @@ function createWslLaunchSpec(overrides: Record<string, unknown> = {}) {
   };
 }
 
+interface TestWorkspaceRuntime {
+  home: string;
+  runtimeRoot: string;
+  dependenciesRoot: string;
+}
+
+function createTestWorkspaceRuntime(): TestWorkspaceRuntime {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claudian-chat-runtime-'));
+  const runtimeRoot = path.join(
+    home,
+    '.cache',
+    'codex-runtimes',
+    'codex-primary-runtime',
+  );
+  const dependenciesRoot = path.join(runtimeRoot, 'dependencies');
+  fs.mkdirSync(path.join(dependenciesRoot, 'node', 'bin'), { recursive: true });
+  fs.mkdirSync(
+    path.join(dependenciesRoot, 'node', 'node_modules', '@oai', 'artifact-tool'),
+    { recursive: true },
+  );
+  fs.mkdirSync(path.join(dependenciesRoot, 'python', 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(dependenciesRoot, 'bin', 'override'), { recursive: true });
+  fs.mkdirSync(path.join(dependenciesRoot, 'bin', 'fallback'), { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, 'runtime.json'), JSON.stringify({
+    bundleFormatVersion: 2,
+    bundleVersion: 'test-bundle',
+    targetPlatform: 'darwin',
+  }));
+  fs.writeFileSync(path.join(dependenciesRoot, 'node', 'bin', 'node'), '');
+  fs.writeFileSync(path.join(dependenciesRoot, 'python', 'bin', 'python3'), '');
+  fs.writeFileSync(path.join(dependenciesRoot, 'bin', 'fallback', 'git'), '');
+  fs.writeFileSync(path.join(dependenciesRoot, 'bin', 'fallback', 'pnpm'), '');
+  fs.writeFileSync(
+    path.join(dependenciesRoot, 'node', 'node_modules', '@oai', 'artifact-tool', 'package.json'),
+    JSON.stringify({ version: 'test-artifact' }),
+  );
+
+  return { home, runtimeRoot, dependenciesRoot };
+}
+
+function useTestWorkspaceRuntime(workspaceRuntime: TestWorkspaceRuntime): void {
+  mockResolveLaunchSpec.mockImplementation((plugin: any) => ({
+    target: {
+      method: 'host-native',
+      platformFamily: 'unix',
+      platformOs: 'macos',
+    },
+    command: plugin.getResolvedProviderCliPath('codex') ?? 'codex',
+    args: ['app-server', '--listen', 'stdio://'],
+    spawnCwd: '/test/vault',
+    targetCwd: '/test/vault',
+    env: { HOME: workspaceRuntime.home },
+    pathMapper: {
+      target: {
+        method: 'host-native',
+        platformFamily: 'unix',
+        platformOs: 'macos',
+      },
+      toTargetPath: (value: string) => value,
+      toHostPath: (value: string) => value,
+      mapTargetPathList: (values: string[]) => values,
+      canRepresentHostPath: () => true,
+    },
+  }));
+}
+
+function workspaceRuntimeInitializeResponse(workspaceRuntime: TestWorkspaceRuntime) {
+  return {
+    userAgent: 'test/0.1',
+    codexHome: path.join(workspaceRuntime.home, '.codex'),
+    platformFamily: 'unix',
+    platformOs: 'macos',
+  };
+}
+
 async function collectChunks(gen: AsyncGenerator<StreamChunk>): Promise<StreamChunk[]> {
   const chunks: StreamChunk[] = [];
   for await (const chunk of gen) {
@@ -246,7 +353,7 @@ function threadStartResponse(threadId = 'thread-001') {
       gitInfo: null,
       name: null,
     },
-    model: DEFAULT_CODEX_PRIMARY_MODEL,
+    model: TEST_CODEX_MODEL,
     modelProvider: 'openai_http',
     serviceTier: null,
     cwd: '/test/vault',
@@ -458,6 +565,32 @@ describe('CodexChatRuntime', () => {
       expect(mockTransportDispose).toHaveBeenCalled();
       expect(mockProcessShutdown).toHaveBeenCalled();
     });
+
+    it('does not become ready after cleanup interrupts startup', async () => {
+      let resolveInitialize!: (value: unknown) => void;
+      const initialize = new Promise(resolve => {
+        resolveInitialize = resolve;
+      });
+      mockTransportRequest.mockImplementation((method: string) => {
+        if (method === 'initialize') {
+          return initialize;
+        }
+        return Promise.resolve({});
+      });
+
+      const readiness = runtime.ensureReady();
+      await new Promise(resolve => setImmediate(resolve));
+      runtime.cleanup();
+      resolveInitialize({
+        userAgent: 'test/0.1',
+        codexHome: '/tmp',
+        platformFamily: 'unix',
+        platformOs: 'macos',
+      });
+
+      await expect(readiness).rejects.toThrow('disposed');
+      expect(runtime.isReady()).toBe(false);
+    });
   });
 
   describe('query - new thread', () => {
@@ -468,10 +601,10 @@ describe('CodexChatRuntime', () => {
       expect(mockTransportRequest).toHaveBeenCalledWith(
         'thread/start',
         expect.objectContaining({
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           cwd: '/test/vault',
           persistExtendedHistory: true,
-          experimentalRawEvents: false,
+          experimentalRawEvents: true,
           baseInstructions: expect.any(String),
         }),
       );
@@ -479,6 +612,144 @@ describe('CodexChatRuntime', () => {
       // Verify text chunk
       expect(chunks).toContainEqual({ type: 'text', content: 'Hello!' });
       expect(chunks).toContainEqual({ type: 'done' });
+    });
+
+    it('registers the workspace dependency tool when the bundled runtime is available', async () => {
+      const workspaceRuntime = createTestWorkspaceRuntime();
+      useTestWorkspaceRuntime(workspaceRuntime);
+      mockTransportRequest.mockImplementation(async (method: string) => {
+        if (method === 'initialize') {
+          return workspaceRuntimeInitializeResponse(workspaceRuntime);
+        }
+        if (method === 'thread/start') return threadStartResponse('thread-dynamic-tool');
+        if (method === 'turn/start') {
+          setTimeout(() => {
+            emitNotification('turn/completed', {
+              threadId: 'thread-dynamic-tool',
+              turn: { id: 'turn-dynamic-tool', items: [], status: 'completed', error: null },
+            });
+          }, 0);
+          return turnStartResponse('turn-dynamic-tool');
+        }
+        return {};
+      });
+
+      try {
+        await collectChunks(runtime.query(createTurn('create a workbook')));
+
+        expect(findCall('thread/start')[1].dynamicTools).toEqual([{
+          namespace: 'codex_app',
+          name: 'load_workspace_dependencies',
+          description: expect.any(String),
+          inputSchema: expect.any(Object),
+        }]);
+
+        const response = await emitServerRequest('item/tool/call', 'request-1', {
+          threadId: 'thread-dynamic-tool',
+          turnId: 'turn-dynamic-tool',
+          callId: 'call-1',
+          namespace: 'codex_app',
+          tool: 'load_workspace_dependencies',
+          arguments: {},
+        });
+        expect(response).toEqual(expect.objectContaining({
+          success: true,
+          contentItems: [expect.objectContaining({
+            type: 'inputText',
+            text: expect.stringContaining(path.join(workspaceRuntime.dependenciesRoot, 'node', 'node_modules')),
+          })],
+        }));
+
+        const updates = runtime.buildSessionUpdates({ conversation: null, sessionInvalidated: false });
+        expect(updates.updates.providerState).toEqual(expect.objectContaining({
+          workspaceDependencyToolVersion: 1,
+        }));
+      } finally {
+        fs.rmSync(workspaceRuntime.home, { recursive: true, force: true });
+      }
+    });
+
+    it('advertises the workspace dependency tool and returns a blocker for an incomplete runtime', async () => {
+      await collectChunks(runtime.query(createTurn('hi')));
+
+      expect(findCall('thread/start')[1].dynamicTools).toEqual([
+        expect.objectContaining({
+          namespace: 'codex_app',
+          name: 'load_workspace_dependencies',
+        }),
+      ]);
+      expect(serverRequestHandlers.has('item/tool/call')).toBe(true);
+
+      const response = await emitServerRequest('item/tool/call', 'request-missing-runtime', {
+        threadId: 'thread-001',
+        turnId: 'turn-001',
+        callId: 'call-missing-runtime',
+        namespace: 'codex_app',
+        tool: 'load_workspace_dependencies',
+        arguments: {},
+      });
+      expect(response).toEqual(expect.objectContaining({
+        success: false,
+        contentItems: [expect.objectContaining({
+          text: expect.stringContaining('is unavailable'),
+        })],
+      }));
+    });
+
+    it('refreshes workspace dependency availability without restarting the app server', async () => {
+      const workspaceRuntime = createTestWorkspaceRuntime();
+      useTestWorkspaceRuntime(workspaceRuntime);
+      const artifactManifest = path.join(
+        workspaceRuntime.dependenciesRoot,
+        'node',
+        'node_modules',
+        '@oai',
+        'artifact-tool',
+        'package.json',
+      );
+      fs.rmSync(artifactManifest);
+      mockTransportRequest.mockImplementation(async (method: string) => {
+        if (method === 'initialize') return workspaceRuntimeInitializeResponse(workspaceRuntime);
+        if (method === 'thread/start') return threadStartResponse('thread-runtime-refresh');
+        if (method === 'turn/start') {
+          setTimeout(() => {
+            emitNotification('turn/completed', {
+              threadId: 'thread-runtime-refresh',
+              turn: { id: 'turn-runtime-refresh', items: [], status: 'completed', error: null },
+            });
+          }, 0);
+          return turnStartResponse('turn-runtime-refresh');
+        }
+        return {};
+      });
+
+      try {
+        await collectChunks(runtime.query(createTurn('create a workbook')));
+
+        const unavailableResponse = await emitServerRequest('item/tool/call', 'request-before-install', {
+          threadId: 'thread-runtime-refresh',
+          turnId: 'turn-runtime-refresh',
+          callId: 'call-before-install',
+          namespace: 'codex_app',
+          tool: 'load_workspace_dependencies',
+          arguments: {},
+        });
+        expect(unavailableResponse).toEqual(expect.objectContaining({ success: false }));
+
+        fs.writeFileSync(artifactManifest, JSON.stringify({ version: 'test-artifact' }));
+
+        const availableResponse = await emitServerRequest('item/tool/call', 'request-after-install', {
+          threadId: 'thread-runtime-refresh',
+          turnId: 'turn-runtime-refresh',
+          callId: 'call-after-install',
+          namespace: 'codex_app',
+          tool: 'load_workspace_dependencies',
+          arguments: {},
+        });
+        expect(availableResponse).toEqual(expect.objectContaining({ success: true }));
+      } finally {
+        fs.rmSync(workspaceRuntime.home, { recursive: true, force: true });
+      }
     });
 
     it('handles host-native initialize responses that omit codexHome', async () => {
@@ -519,7 +790,7 @@ describe('CodexChatRuntime', () => {
     it('sends reasoning summary off for GPT-5.3 Codex Spark turns', async () => {
       runtime.cleanup();
       runtime = new CodexChatRuntime(createMockPlugin({
-        model: CODEX_SPARK_MODEL,
+        model: encodeCodexModelSelectionId(CODEX_SPARK_MODEL),
         providerConfigs: {
           codex: {
             customModels: CODEX_SPARK_MODEL,
@@ -551,7 +822,7 @@ describe('CodexChatRuntime', () => {
 
       const turnStartCall = findCall('turn/start');
       expect(turnStartCall[1]).toMatchObject({
-        model: DEFAULT_CODEX_PRIMARY_MODEL,
+        model: TEST_CODEX_MODEL,
         summary: 'concise',
       });
     });
@@ -738,6 +1009,7 @@ describe('CodexChatRuntime', () => {
       expect(resumeCall).toBeDefined();
       expect(resumeCall[1].threadId).toBe('thread-existing');
       expect(resumeCall[1].baseInstructions).toBeDefined();
+      expect(resumeCall[1].experimentalRawEvents).toBe(true);
 
       const startCall = findCall('thread/start');
       expect(startCall).toBeUndefined();
@@ -760,6 +1032,150 @@ describe('CodexChatRuntime', () => {
       const resumeCall = findCall('thread/resume');
       expect(startCall).toBeUndefined();
       expect(resumeCall).toBeUndefined();
+    });
+
+    it('preserves a legacy thread and surfaces its dynamic-tool limitation', async () => {
+      const workspaceRuntime = createTestWorkspaceRuntime();
+      useTestWorkspaceRuntime(workspaceRuntime);
+      runtime.syncConversationState({
+        sessionId: 'thread-legacy',
+        providerState: { threadId: 'thread-legacy', sessionFilePath: '/tmp/legacy.jsonl' },
+      });
+      mockTransportRequest.mockImplementation(async (method: string) => {
+        if (method === 'initialize') return workspaceRuntimeInitializeResponse(workspaceRuntime);
+        if (method === 'thread/resume') return threadStartResponse('thread-legacy');
+        if (method === 'turn/start') {
+          setTimeout(() => {
+            emitNotification('turn/completed', {
+              threadId: 'thread-legacy',
+              turn: { id: 'turn-legacy-next', items: [], status: 'completed', error: null },
+            });
+          }, 0);
+          return turnStartResponse('turn-legacy-next');
+        }
+        return {};
+      });
+      const history = [
+        {
+          id: 'u1',
+          role: 'user' as const,
+          content: 'Earlier question with an image',
+          timestamp: 1,
+          images: [{
+            id: 'image-1',
+            name: 'chart.png',
+            mediaType: 'image/png' as const,
+            data: 'aW1hZ2U=',
+            size: 5,
+            source: 'paste' as const,
+          }],
+        },
+        { id: 'a1', role: 'assistant' as const, content: 'Earlier answer', timestamp: 2 },
+      ];
+
+      try {
+        const chunks = await collectChunks(runtime.query(createTurn('create a workbook'), history));
+
+        expect(findCall('thread/start')).toBeUndefined();
+        expect(findCall('thread/resume')[1]).toEqual(expect.objectContaining({
+          threadId: 'thread-legacy',
+          baseInstructions: expect.stringMatching(/load_workspace_dependencies[\s\S]*new conversation/i),
+        }));
+        expect(JSON.stringify(findCall('turn/start')[1].input)).not.toContain('Earlier question');
+        expect(runtime.getSessionId()).toBe('thread-legacy');
+        expect(chunks).toContainEqual({
+          type: 'notice',
+          level: 'warning',
+          content: expect.stringMatching(/new conversation/i),
+        });
+        expect(runtime.buildSessionUpdates({ conversation: null, sessionInvalidated: false }).updates.providerState)
+          .not.toEqual(expect.objectContaining({ workspaceDependencyToolVersion: 1 }));
+      } finally {
+        fs.rmSync(workspaceRuntime.home, { recursive: true, force: true });
+      }
+    });
+
+    it('retains a legacy session when turn/start fails', async () => {
+      const workspaceRuntime = createTestWorkspaceRuntime();
+      useTestWorkspaceRuntime(workspaceRuntime);
+      runtime.syncConversationState({
+        sessionId: 'thread-legacy-failure',
+        providerState: {
+          threadId: 'thread-legacy-failure',
+          sessionFilePath: '/tmp/legacy-failure.jsonl',
+        },
+      });
+      mockTransportRequest.mockImplementation(async (method: string) => {
+        if (method === 'initialize') return workspaceRuntimeInitializeResponse(workspaceRuntime);
+        if (method === 'thread/resume') return threadStartResponse('thread-legacy-failure');
+        if (method === 'turn/start') throw new Error('turn rejected');
+        return {};
+      });
+
+      try {
+        const chunks = await collectChunks(runtime.query(createTurn('retry-safe request')));
+
+        expect(chunks).toContainEqual({ type: 'error', content: 'turn rejected' });
+        expect(findCall('thread/start')).toBeUndefined();
+        expect(runtime.getSessionId()).toBe('thread-legacy-failure');
+        expect(runtime.buildSessionUpdates({ conversation: null, sessionInvalidated: false }).updates)
+          .toEqual(expect.objectContaining({
+            sessionId: 'thread-legacy-failure',
+            providerState: expect.not.objectContaining({ workspaceDependencyToolVersion: 1 }),
+          }));
+      } finally {
+        fs.rmSync(workspaceRuntime.home, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps a persisted dynamic-tool handler on resume when the runtime is missing', async () => {
+      runtime.syncConversationState({
+        sessionId: 'thread-tool-capable',
+        providerState: {
+          threadId: 'thread-tool-capable',
+          workspaceDependencyToolVersion: 1,
+        },
+      });
+      let toolResponse: unknown;
+      let toolError: unknown;
+      mockTransportRequest.mockImplementation(async (method: string) => {
+        if (method === 'initialize') {
+          return { userAgent: 'test/0.1', codexHome: '/tmp', platformFamily: 'unix', platformOs: 'macos' };
+        }
+        if (method === 'thread/resume') return threadStartResponse('thread-tool-capable');
+        if (method === 'turn/start') {
+          setTimeout(() => {
+            void emitServerRequest('item/tool/call', 'request-resumed-tool', {
+              threadId: 'thread-tool-capable',
+              turnId: 'turn-resumed-tool',
+              callId: 'call-resumed-tool',
+              namespace: 'codex_app',
+              tool: 'load_workspace_dependencies',
+              arguments: {},
+            }).then(
+              response => { toolResponse = response; },
+              error => { toolError = error; },
+            ).finally(() => {
+              emitNotification('turn/completed', {
+                threadId: 'thread-tool-capable',
+                turn: { id: 'turn-resumed-tool', items: [], status: 'completed', error: null },
+              });
+            });
+          }, 0);
+          return turnStartResponse('turn-resumed-tool');
+        }
+        return {};
+      });
+
+      await collectChunks(runtime.query(createTurn('create a workbook')));
+
+      expect(toolError).toBeUndefined();
+      expect(toolResponse).toEqual(expect.objectContaining({
+        success: false,
+        contentItems: [expect.objectContaining({
+          text: expect.stringContaining('is unavailable'),
+        })],
+      }));
     });
   });
 
@@ -843,8 +1259,8 @@ describe('CodexChatRuntime', () => {
       }));
     });
 
-    it('prefers session-tail tool chunks when a Codex session file is available', async () => {
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-tail-runtime-'));
+    it('streams raw response items instead of tailing the Codex session file', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-raw-runtime-'));
       const sessionFilePath = path.join(tmpDir, 'thread-tail.jsonl');
       fs.writeFileSync(sessionFilePath, '');
 
@@ -881,39 +1297,24 @@ describe('CodexChatRuntime', () => {
               ].join('\n') + '\n',
             );
 
-            emitNotification('item/started', {
-              item: {
-                type: 'commandExecution',
-                id: 'call_wrong_1',
-                command: 'echo wrong',
-                cwd: '/test/vault',
-                processId: '1',
-                source: 'unifiedExecStartup',
-                status: 'inProgress',
-                commandActions: [{ type: 'unknown', command: 'echo wrong' }],
-                aggregatedOutput: null,
-                exitCode: null,
-                durationMs: null,
-              },
+            emitNotification('rawResponseItem/completed', {
               threadId: 'thread-tail',
               turnId: 'turn-tail',
+              item: {
+                type: 'function_call',
+                name: 'exec_command',
+                call_id: 'call_raw_1',
+                arguments: '{"command":"cat package.json"}',
+              },
             });
-            emitNotification('item/completed', {
-              item: {
-                type: 'commandExecution',
-                id: 'call_wrong_1',
-                command: 'echo wrong',
-                cwd: '/test/vault',
-                processId: '1',
-                source: 'unifiedExecStartup',
-                status: 'completed',
-                commandActions: [],
-                aggregatedOutput: 'wrong\n',
-                exitCode: 0,
-                durationMs: 10,
-              },
+            emitNotification('rawResponseItem/completed', {
               threadId: 'thread-tail',
               turnId: 'turn-tail',
+              item: {
+                type: 'function_call_output',
+                call_id: 'call_raw_1',
+                output: 'Exit code: 0\nOutput:\nraw package output',
+              },
             });
             emitNotification('turn/completed', {
               threadId: 'thread-tail',
@@ -929,17 +1330,17 @@ describe('CodexChatRuntime', () => {
 
         expect(chunks).toContainEqual(expect.objectContaining({
           type: 'tool_use',
-          id: 'call_tail_1',
+          id: 'call_raw_1',
           name: 'Bash',
-          input: { command: 'cat src/main.ts' },
+          input: { command: 'cat package.json' },
         }));
         expect(chunks).toContainEqual(expect.objectContaining({
           type: 'tool_result',
-          id: 'call_tail_1',
-          content: 'import x from "./main";',
+          id: 'call_raw_1',
+          content: 'raw package output',
           isError: false,
         }));
-        expect(chunks).not.toContainEqual(expect.objectContaining({ id: 'call_wrong_1' }));
+        expect(chunks).not.toContainEqual(expect.objectContaining({ id: 'call_tail_1' }));
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -1372,7 +1773,7 @@ describe('CodexChatRuntime', () => {
     });
 
     it('sends serviceTier on thread/resume when fast mode is enabled', async () => {
-      const plugin = createMockPlugin({ model: DEFAULT_CODEX_PRIMARY_MODEL, serviceTier: 'fast' });
+      const plugin = createMockPlugin({ model: TEST_CODEX_MODEL, serviceTier: 'fast' });
       const rt = new CodexChatRuntime(plugin);
 
       rt.syncConversationState({
@@ -1387,7 +1788,7 @@ describe('CodexChatRuntime', () => {
 
       const resumeCall = findCall('thread/resume');
       expect(resumeCall).toBeDefined();
-      expect(resumeCall[1].serviceTier).toBe('fast');
+      expect(resumeCall[1].serviceTier).toBe('priority');
 
       rt.cleanup();
     });
@@ -1428,7 +1829,7 @@ describe('CodexChatRuntime', () => {
       yoloRuntime.cleanup();
     });
 
-    it('sends serviceTier fast on thread/start and turn/start when fast mode is enabled', async () => {
+    it('maps the legacy fast selection to the discovered fast service tier', async () => {
       const plugin = createMockPlugin({ serviceTier: 'fast' });
       const rt = new CodexChatRuntime(plugin);
 
@@ -1436,8 +1837,8 @@ describe('CodexChatRuntime', () => {
 
       const threadStartCall = findCall('thread/start');
       const turnStartCall = findCall('turn/start');
-      expect(threadStartCall[1].serviceTier).toBe('fast');
-      expect(turnStartCall[1].serviceTier).toBe('fast');
+      expect(threadStartCall[1].serviceTier).toBe('priority');
+      expect(turnStartCall[1].serviceTier).toBe('priority');
 
       rt.cleanup();
     });
@@ -1773,6 +2174,21 @@ describe('CodexChatRuntime', () => {
   });
 
   describe('query - plan mode (collaborationMode)', () => {
+    it('passes newly advertised effort values through without a hardcoded map', async () => {
+      const plugin = createMockPlugin({ effortLevel: 'max' });
+      const rt = new CodexChatRuntime(plugin);
+      captureHandlers();
+      setupDefaultRequestMock();
+
+      await collectChunks(rt.query(createTurn('delegate this')));
+
+      const turnStartCall = findCall('turn/start');
+      expect(turnStartCall[1].effort).toBe('max');
+      expect(turnStartCall[1].collaborationMode.settings.reasoning_effort).toBe('max');
+
+      rt.cleanup();
+    });
+
     it('includes collaborationMode in turn/start when permissionMode is plan', async () => {
       const plugin = createMockPlugin({ permissionMode: 'plan' });
       const rt = new CodexChatRuntime(plugin);
@@ -1786,7 +2202,7 @@ describe('CodexChatRuntime', () => {
       expect(turnStartCall[1].collaborationMode).toEqual({
         mode: 'plan',
         settings: {
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           reasoning_effort: 'medium',
           developer_instructions: null,
         },
@@ -1808,7 +2224,7 @@ describe('CodexChatRuntime', () => {
       expect(turnStartCall[1].collaborationMode).toEqual({
         mode: 'default',
         settings: {
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           reasoning_effort: 'medium',
           developer_instructions: null,
         },
@@ -1830,7 +2246,7 @@ describe('CodexChatRuntime', () => {
       expect(turnStartCall[1].collaborationMode).toEqual({
         mode: 'default',
         settings: {
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           reasoning_effort: 'medium',
           developer_instructions: null,
         },
@@ -1857,7 +2273,7 @@ describe('CodexChatRuntime', () => {
       expect(turnStartCalls[0][1].collaborationMode).toEqual({
         mode: 'plan',
         settings: {
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           reasoning_effort: 'medium',
           developer_instructions: null,
         },
@@ -1865,7 +2281,7 @@ describe('CodexChatRuntime', () => {
       expect(turnStartCalls[1][1].collaborationMode).toEqual({
         mode: 'default',
         settings: {
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           reasoning_effort: 'medium',
           developer_instructions: null,
         },
@@ -1986,6 +2402,55 @@ describe('CodexChatRuntime', () => {
 
       // After fork, session should be the fork thread
       expect(runtime.getSessionId()).toBe('fork-thread-1');
+    });
+
+    it('preserves a fork from a legacy source and surfaces its dynamic-tool limitation', async () => {
+      const workspaceRuntime = createTestWorkspaceRuntime();
+      useTestWorkspaceRuntime(workspaceRuntime);
+      runtime.syncConversationState({
+        sessionId: null,
+        providerState: { forkSource: { sessionId: 'legacy-source', resumeAt: 'turn-legacy' } },
+      });
+      mockTransportRequest.mockImplementation(async (method: string) => {
+        if (method === 'initialize') return workspaceRuntimeInitializeResponse(workspaceRuntime);
+        if (method === 'thread/fork') {
+          const response = threadStartResponse('fork-legacy');
+          response.thread.turns = [
+            { id: 'turn-legacy', items: [], status: 'completed', error: null },
+          ];
+          return response;
+        }
+        if (method === 'thread/resume') return threadStartResponse('fork-legacy');
+        if (method === 'turn/start') {
+          setTimeout(() => {
+            emitNotification('turn/completed', {
+              threadId: 'fork-legacy',
+              turn: { id: 'turn-fork-legacy', items: [], status: 'completed', error: null },
+            });
+          }, 0);
+          return turnStartResponse('turn-fork-legacy');
+        }
+        return {};
+      });
+
+      try {
+        const chunks = await collectChunks(runtime.query(createTurn('forked workbook request')));
+
+        expect(findCall('thread/start')).toBeUndefined();
+        expect(findCall('thread/fork')[1].threadId).toBe('legacy-source');
+        expect(findCall('thread/resume')[1]).toEqual(expect.objectContaining({
+          threadId: 'fork-legacy',
+          baseInstructions: expect.stringMatching(/load_workspace_dependencies[\s\S]*new conversation/i),
+        }));
+        expect(runtime.getSessionId()).toBe('fork-legacy');
+        expect(chunks).toContainEqual({
+          type: 'notice',
+          level: 'warning',
+          content: expect.stringMatching(/new conversation/i),
+        });
+      } finally {
+        fs.rmSync(workspaceRuntime.home, { recursive: true, force: true });
+      }
     });
 
     it('skips rollback when resumeAt is the last turn', async () => {
@@ -2315,7 +2780,7 @@ describe('CodexChatRuntime', () => {
       expect(runtime.getSessionId()).toBeNull();
     });
 
-    it('does not call buildInput or start transcript tailing for compact', async () => {
+    it('does not call buildInput for compact', async () => {
       mockTransportRequest.mockImplementation(buildRequestHandler({
         'thread/start': () => threadStartResponse('thread-no-input'),
         'thread/compact/start': () => {

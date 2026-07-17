@@ -11,10 +11,10 @@ import type {
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
 import type { Conversation, SlashCommand } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
-import type ClaudianPlugin from '../../../main';
 import { chooseForkTarget } from '../../../shared/modals/ForkTargetModal';
 import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
 import { revealWorkspaceLeaf } from '../../../utils/obsidianCompat';
+import type { FeatureHost } from '../../FeatureHost';
 import { getTabProviderId } from './providerResolution';
 import {
   activateTab,
@@ -26,6 +26,7 @@ import {
   initializeTabControllers,
   initializeTabService,
   initializeTabUI,
+  recycleTabRuntime,
   setupServiceCallbacks,
   wireTabInputEvents,
 } from './Tab';
@@ -85,7 +86,7 @@ type ProviderCommandWarmupEntry = {
  * TabManager coordinates multiple chat tabs.
  */
 export class TabManager implements TabManagerInterface {
-  private plugin: ClaudianPlugin;
+  private plugin: FeatureHost;
   private containerEl: HTMLElement;
   private view: TabManagerViewHost;
 
@@ -98,6 +99,8 @@ export class TabManager implements TabManagerInterface {
 
   /** Guard to prevent concurrent tab switches. */
   private isSwitchingTab = false;
+  private pendingSwitchTabId: TabId | null = null;
+  private pendingTabCreations = 0;
 
   /**
    * Gets the current max tabs limit from settings.
@@ -109,21 +112,21 @@ export class TabManager implements TabManagerInterface {
   }
 
   constructor(
-    plugin: ClaudianPlugin,
+    plugin: FeatureHost,
     containerEl: HTMLElement,
     view: TabManagerViewHost,
     callbacks?: TabManagerCallbacks,
   );
   constructor(
-    plugin: ClaudianPlugin,
+    plugin: FeatureHost,
     legacyArg: unknown,
     containerEl: HTMLElement,
     view: TabManagerViewHost,
     callbacks?: TabManagerCallbacks,
   );
   constructor(
-    plugin: ClaudianPlugin,
-    arg2: HTMLElement | unknown,
+    plugin: FeatureHost,
+    arg2: unknown,
     arg3: HTMLElement | TabManagerViewHost,
     arg4?: TabManagerViewHost | TabManagerCallbacks,
     arg5: TabManagerCallbacks = {},
@@ -137,7 +140,7 @@ export class TabManager implements TabManagerInterface {
       return;
     }
 
-    this.containerEl = arg3 as HTMLElement;
+    this.containerEl = arg3;
     this.view = arg4 as TabManagerViewHost;
     this.callbacks = arg5;
   }
@@ -159,11 +162,14 @@ export class TabManager implements TabManagerInterface {
     options: CreateTabOptions = {},
   ): Promise<TabData | null> {
     const maxTabs = this.getMaxTabs();
-    if (this.tabs.size >= maxTabs) {
+    if (this.tabs.size + this.pendingTabCreations >= maxTabs) {
       return null;
     }
+    this.pendingTabCreations += 1;
+    let reservationHeld = true;
 
-    const { activate = true, draftModel } = options;
+    try {
+      const { activate = true, draftModel } = options;
 
     const conversation = conversationId
       ? await this.plugin.getConversationById(conversationId)
@@ -222,6 +228,8 @@ export class TabManager implements TabManagerInterface {
     wireTabInputEvents(tab, this.plugin);
 
     this.tabs.set(tab.id, tab);
+    this.pendingTabCreations -= 1;
+    reservationHeld = false;
     this.callbacks.onTabCreated?.(tab);
 
     if (!this.isRestoringState && (activate || !this.activeTabId)) {
@@ -230,7 +238,12 @@ export class TabManager implements TabManagerInterface {
       this.maybePrimeProviderRuntime(tab);
     }
 
-    return tab;
+      return tab;
+    } finally {
+      if (reservationHeld) {
+        this.pendingTabCreations -= 1;
+      }
+    }
   }
 
   /**
@@ -245,6 +258,7 @@ export class TabManager implements TabManagerInterface {
 
     // Guard against concurrent tab switches
     if (this.isSwitchingTab) {
+      this.pendingSwitchTabId = tabId;
       return;
     }
 
@@ -263,6 +277,7 @@ export class TabManager implements TabManagerInterface {
       // Activate new tab
       this.activeTabId = tabId;
       activateTab(tab);
+      this.callbacks.onActiveTabChanged?.(previousTabId, tabId);
 
       // Load conversation if not already loaded
       if (tab.conversationId && tab.state.messages.length === 0) {
@@ -272,6 +287,7 @@ export class TabManager implements TabManagerInterface {
         && tab.state.messages.length > 0
         && tab.service
         && !tab.state.isStreaming
+        && !tab.state.isSwitchingConversation
         && !tab.state.hasPendingConversationSave
       ) {
         // Passive sync is only safe once local tab state has been persisted.
@@ -296,6 +312,11 @@ export class TabManager implements TabManagerInterface {
       this.maybePrimeProviderRuntime(tab);
     } finally {
       this.isSwitchingTab = false;
+      const pendingTabId = this.pendingSwitchTabId;
+      this.pendingSwitchTabId = null;
+      if (pendingTabId && pendingTabId !== this.activeTabId) {
+        await this.switchToTab(pendingTabId);
+      }
     }
   }
 
@@ -322,8 +343,15 @@ export class TabManager implements TabManagerInterface {
       return false;
     }
 
-    // Save conversation before closing
-    await tab.controllers.conversationController?.save();
+    // Save conversation before closing. Cleanup remains mandatory if save fails.
+    let saveError: unknown;
+    let didSaveFail = false;
+    try {
+      await tab.controllers.conversationController?.save();
+    } catch (error) {
+      didSaveFail = true;
+      saveError = error;
+    }
 
     // Capture tab order BEFORE deletion for fallback calculation
     const tabIdsBefore = Array.from(this.tabs.keys());
@@ -355,6 +383,9 @@ export class TabManager implements TabManagerInterface {
       }
     }
 
+    if (didSaveFail) {
+      throw saveError;
+    }
     return true;
   }
 
@@ -572,6 +603,7 @@ export class TabManager implements TabManagerInterface {
   private async createForkConversation(context: ForkContext): Promise<string> {
     const conversation = await this.plugin.createConversation({
       providerId: context.providerId,
+      ...(context.sourceSelectedModel ? { selectedModel: context.sourceSelectedModel } : {}),
     });
 
     const title = context.sourceTitle
@@ -751,10 +783,12 @@ export class TabManager implements TabManagerInterface {
       return [];
     }
 
-    const context = await this.buildProviderCommandContext(
+    const resolvedWarmupContext = warmupContext
+      ?? await this.buildProviderWarmupContext(tab, providerId);
+    const context = this.buildProviderCommandContext(
       tab,
       providerId,
-      warmupContext ?? await this.buildProviderWarmupContext(tab, providerId),
+      resolvedWarmupContext,
     );
     const cached = this.providerCommandCache.get(tab.id);
     if (
@@ -784,13 +818,14 @@ export class TabManager implements TabManagerInterface {
   }
 
   private maybePrimeProviderRuntime(tab: TabData): void {
+    if (tab.state.isSwitchingConversation) return;
     void this.prewarmProviderTab(tab).catch(() => {});
   }
 
   private isProviderCommandLoaderAvailable(providerId: ProviderId): boolean {
     const loader = ProviderWorkspaceRegistry.getRuntimeCommandLoader(providerId);
     if (!loader) return false;
-    return loader.isAvailable(this.plugin.settings as unknown as Record<string, unknown>);
+    return loader.isAvailable(this.plugin.settings);
   }
 
   private async prewarmProviderTab(tab: TabData): Promise<void> {
@@ -854,7 +889,7 @@ export class TabManager implements TabManagerInterface {
     const warmupMode = this.resolveProviderTabWarmupMode({
       conversation,
       externalContextPaths,
-      plugin: this.plugin,
+      plugin: this.plugin.providerHost,
       runtime,
       tab: {
         conversationId: tab.conversationId,
@@ -888,7 +923,7 @@ export class TabManager implements TabManagerInterface {
     warmupContext: ProviderWarmupContext,
   ): ProviderCommandContext {
     const providerSettings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      this.plugin.settings as unknown as Record<string, unknown>,
+      this.plugin.settings,
       providerId,
     );
 
@@ -927,7 +962,7 @@ export class TabManager implements TabManagerInterface {
         && tab.id === this.activeTabId,
       conversation: context.conversation,
       externalContextPaths: context.externalContextPaths,
-      plugin: this.plugin,
+      plugin: this.plugin.providerHost,
       runtime: context.runtime,
     });
 
@@ -984,6 +1019,16 @@ export class TabManager implements TabManagerInterface {
     );
   }
 
+  async recycleProviderRuntimes(providerIds: ProviderId | ProviderId[]): Promise<void> {
+    const tabs = this.filterTabsByProvider(
+      providerIds,
+      (tab) => tab.service?.providerId ?? tab.providerId,
+    );
+    for (const tab of tabs) {
+      await recycleTabRuntime(tab);
+    }
+  }
+
   private async broadcastToTabs(
     tabs: Iterable<TabData>,
     fn: (service: ChatRuntime) => Promise<void>,
@@ -1009,14 +1054,7 @@ export class TabManager implements TabManagerInterface {
 
   /** Destroys all tabs and cleans up resources. */
   async destroy(): Promise<void> {
-    // Save all conversations in parallel (independent per-tab)
-    await Promise.all(
-      Array.from(this.tabs.values()).map(
-        tab => tab.controllers.conversationController?.save() ?? Promise.resolve()
-      )
-    );
-
-    // Destroy all tabs in parallel (independent per-tab, must run after saves complete)
+    // Each tab drains background work and persists its final state during teardown.
     await Promise.all(Array.from(this.tabs.values()).map(tab => destroyTab(tab)));
 
     this.tabs.clear();

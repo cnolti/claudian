@@ -1,5 +1,6 @@
 import { TFile } from 'obsidian';
 
+import { resolveConversationModel } from '../../../core/providers/conversationModel';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import {
   DEFAULT_CHAT_PROVIDER_ID,
@@ -7,6 +8,7 @@ import {
   type ProviderSubagentLifecycleAdapter,
 } from '../../../core/providers/types';
 import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
+import type { AsyncSubagentCompletion } from '../../../core/runtime/types';
 import { parseTodoInput } from '../../../core/tools/todo';
 import { extractResolvedAnswers, extractResolvedAnswersFromResultText } from '../../../core/tools/toolInput';
 import {
@@ -24,7 +26,6 @@ import {
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import type { ChatMessage, StreamChunk, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import type { SDKToolUseResult } from '../../../core/types/diff';
-import type ClaudianPlugin from '../../../main';
 import {
   cancelScheduledAnimationFrame,
   scheduleAnimationFrame,
@@ -34,6 +35,7 @@ import { formatDurationMmSs } from '../../../utils/date';
 import { extractDiffData } from '../../../utils/diff';
 import { hasStreamingMathDelimiters } from '../../../utils/markdownMath';
 import { getVaultPath, normalizePathForVault } from '../../../utils/path';
+import type { FeatureHost } from '../../FeatureHost';
 import { FLAVOR_TEXTS } from '../constants';
 import type { MessageRenderer, RenderContentOptions } from '../rendering/MessageRenderer';
 import { resolveSubagentLifecycleAdapter } from '../rendering/subagentLifecycleResolution';
@@ -64,7 +66,7 @@ import type { ChatState } from '../state/ChatState';
 import type { FileContextManager } from '../ui/FileContext';
 
 export interface StreamControllerDeps {
-  plugin: ClaudianPlugin;
+  plugin: FeatureHost;
   state: ChatState;
   renderer: MessageRenderer;
   subagentManager: SubagentManager;
@@ -73,6 +75,8 @@ export interface StreamControllerDeps {
   updateQueueIndicator: () => void;
   /** Get the agent service from the tab. */
   getAgentService?: () => ChatRuntime | null;
+  enqueueBackgroundWork?: (work: () => Promise<void>) => Promise<void> | null;
+  persistConversation?: () => Promise<void>;
 }
 
 export class StreamController {
@@ -179,10 +183,6 @@ export class StreamController {
         await this.handleSubagentChunk(chunk, msg);
         break;
 
-      case 'async_subagent_result':
-        await this.handleAsyncSubagentResult(chunk);
-        break;
-
       case 'tool_output':
         this.handleToolOutput(chunk, msg);
         break;
@@ -282,13 +282,13 @@ export class StreamController {
         // If already rendered, update the header name + summary
         const toolEl = state.toolCallElements.get(chunk.id);
         if (toolEl) {
-          const nameEl = toolEl.querySelector('.claudian-tool-name') as HTMLElement | null
-            ?? toolEl.querySelector('.claudian-write-edit-name') as HTMLElement | null;
+          const nameEl = toolEl.querySelector('.claudian-tool-name')
+            ?? toolEl.querySelector('.claudian-write-edit-name');
           if (nameEl) {
             nameEl.setText(getToolName(existingToolCall.name, existingToolCall.input));
           }
-          const summaryEl = toolEl.querySelector('.claudian-tool-summary') as HTMLElement | null
-            ?? toolEl.querySelector('.claudian-write-edit-summary') as HTMLElement | null;
+          const summaryEl = toolEl.querySelector('.claudian-tool-summary')
+            ?? toolEl.querySelector('.claudian-write-edit-summary');
           if (summaryEl) {
             summaryEl.setText(getToolSummary(existingToolCall.name, existingToolCall.input));
           }
@@ -337,13 +337,30 @@ export class StreamController {
   }
 
   private getActiveProviderModel(): string | undefined {
-    const providerId = this.deps.getAgentService?.()?.providerId;
+    const conversation = this.deps.state.currentConversationId
+      ? this.deps.plugin.getConversationSync(this.deps.state.currentConversationId)
+      : null;
+    if (conversation) {
+      return resolveConversationModel(
+        this.deps.plugin.settings,
+        conversation.providerId,
+        conversation,
+      ).model;
+    }
+
+    const service = this.deps.getAgentService?.();
+    const serviceModel = service?.getAuxiliaryModel?.();
+    if (serviceModel) {
+      return serviceModel;
+    }
+
+    const providerId = service?.providerId;
     if (!providerId) {
       return undefined;
     }
 
     const settings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      this.deps.plugin.settings as unknown as Record<string, unknown>,
+      this.deps.plugin.settings,
       providerId,
     );
     return typeof settings.model === 'string' ? settings.model : undefined;
@@ -351,6 +368,10 @@ export class StreamController {
 
   private shouldDeferMathRendering(): boolean {
     return this.deps.plugin.settings.deferMathRenderingDuringStreaming !== false;
+  }
+
+  private shouldExpandFileEditsByDefault(): boolean {
+    return this.deps.plugin.settings.expandFileEditsByDefault === true;
   }
 
   private getStreamingRenderOptions(content: string): RenderContentOptions | undefined {
@@ -399,11 +420,15 @@ export class StreamController {
     const { toolCall, parentEl } = pending;
     if (!parentEl) return;
     if (isWriteEditTool(toolCall.name)) {
-      const writeEditState = createWriteEditBlock(parentEl, toolCall);
+      const writeEditState = createWriteEditBlock(parentEl, toolCall, {
+        initiallyExpanded: this.shouldExpandFileEditsByDefault(),
+      });
       state.writeEditStates.set(toolId, writeEditState);
       state.toolCallElements.set(toolId, writeEditState.wrapperEl);
     } else {
-      renderToolCall(parentEl, toolCall, state.toolCallElements);
+      renderToolCall(parentEl, toolCall, state.toolCallElements, {
+        initiallyExpanded: toolCall.name === TOOL_APPLY_PATCH && this.shouldExpandFileEditsByDefault(),
+      });
     }
     state.pendingTools.delete(toolId);
   }
@@ -580,7 +605,7 @@ export class StreamController {
     }
 
     // Check if it's an async task result
-    if (this.handleAsyncTaskToolResult(chunk)) {
+    if (await this.handleAsyncTaskToolResult(chunk)) {
       this.showThinkingIndicator();
       return;
     }
@@ -707,7 +732,7 @@ export class StreamController {
       this.pendingTextRenderFrame = scheduleAnimationFrame(() => {
         this.pendingTextRenderFrame = null;
         void this.renderPendingText();
-      });
+      }, this.getStreamingRenderWindow());
     }
 
     return this.pendingTextRenderPromise;
@@ -754,7 +779,7 @@ export class StreamController {
       this.pendingTextRenderFrame = scheduleAnimationFrame(() => {
         this.pendingTextRenderFrame = null;
         void this.renderPendingText();
-      });
+      }, this.getStreamingRenderWindow());
       return;
     }
 
@@ -783,7 +808,7 @@ export class StreamController {
       this.pendingToolOutputFrames.delete(toolId);
       updateToolCallResult(toolId, toolCall, this.deps.state.toolCallElements);
       this.scrollToBottom();
-    });
+    }, this.getMessagesWindow());
     this.pendingToolOutputFrames.set(toolId, frame);
   }
 
@@ -857,7 +882,7 @@ export class StreamController {
       this.pendingThinkingRenderFrame = scheduleAnimationFrame(() => {
         this.pendingThinkingRenderFrame = null;
         void this.renderPendingThinking();
-      });
+      }, this.getThinkingRenderWindow());
     }
 
     return this.pendingThinkingRenderPromise;
@@ -904,7 +929,7 @@ export class StreamController {
       this.pendingThinkingRenderFrame = scheduleAnimationFrame(() => {
         this.pendingThinkingRenderFrame = null;
         void this.renderPendingThinking();
-      });
+      }, this.getThinkingRenderWindow());
       return;
     }
 
@@ -1113,15 +1138,19 @@ export class StreamController {
     this.showThinkingIndicator();
   }
 
-  private handleAsyncTaskToolResult(
+  private async handleAsyncTaskToolResult(
     chunk: { type: 'tool_result'; id: string; content: string; isError?: boolean; toolUseResult?: unknown }
-  ): boolean {
+  ): Promise<boolean> {
     const { subagentManager } = this.deps;
-    if (!subagentManager.isPendingAsyncTask(chunk.id)) {
+    if (
+      !subagentManager.isPendingAsyncTask(chunk.id)
+      && !subagentManager.getByTaskId(chunk.id)
+    ) {
       return false;
     }
 
     subagentManager.handleTaskToolResult(chunk.id, chunk.content, chunk.isError, chunk.toolUseResult);
+    await this.hydrateAsyncSubagentToolCalls(subagentManager.getByTaskId(chunk.id));
     return true;
   }
 
@@ -1144,22 +1173,22 @@ export class StreamController {
     return isLinked || handled !== undefined;
   }
 
-  private async handleAsyncSubagentResult(
-    chunk: Extract<StreamChunk, { type: 'async_subagent_result' }>
-  ): Promise<void> {
-    const handled = this.deps.subagentManager.handleAsyncSubagentResult(
-      chunk.agentId,
-      chunk.status,
-      chunk.result
-    );
+  public async handleAsyncSubagentCompletion(
+    completion: AsyncSubagentCompletion,
+  ): Promise<boolean> {
+    const handled = this.deps.subagentManager.handleAsyncSubagentCompletion(completion);
 
-    await this.hydrateAsyncSubagentToolCalls(handled);
+    await this.hydrateAsyncSubagentToolCalls(handled, completion.providerSessionId);
     if (handled) {
       this.showThinkingIndicator();
     }
+    return handled !== undefined;
   }
 
-  private async hydrateAsyncSubagentToolCalls(subagent: SubagentInfo | undefined): Promise<void> {
+  private async hydrateAsyncSubagentToolCalls(
+    subagent: SubagentInfo | undefined,
+    providerSessionId?: string,
+  ): Promise<void> {
     if (!subagent) return;
     if (subagent.mode !== 'async') return;
     if (!subagent.agentId) return;
@@ -1169,27 +1198,32 @@ export class StreamController {
 
     const runtime = this.deps.getAgentService?.();
     if (!runtime) return;
+    const ownerSessionId = providerSessionId ?? runtime.getSessionId();
+    if (!ownerSessionId || !this.ownsAsyncSubagent(subagent, runtime, ownerSessionId)) return;
 
-    const { hasHydrated, finalResultHydrated } = await this.tryHydrateAsyncSubagent(
+    const { hasHydrated, finalResultHydrated, isCurrent } = await this.tryHydrateAsyncSubagent(
       subagent,
       runtime,
+      ownerSessionId,
       true
     );
+    if (!isCurrent) return;
 
     if (hasHydrated) {
       this.deps.subagentManager.refreshAsyncSubagent(subagent);
     }
 
     if (!finalResultHydrated) {
-      this.scheduleAsyncSubagentResultRetry(subagent, runtime, 0);
+      this.scheduleAsyncSubagentResultRetry(subagent, runtime, ownerSessionId, 0);
     }
   }
 
   private async tryHydrateAsyncSubagent(
     subagent: SubagentInfo,
     runtime: ChatRuntime,
+    providerSessionId: string,
     hydrateToolCalls: boolean
-  ): Promise<{ hasHydrated: boolean; finalResultHydrated: boolean }> {
+  ): Promise<{ hasHydrated: boolean; finalResultHydrated: boolean; isCurrent: boolean }> {
     let hasHydrated = false;
     let finalResultHydrated = false;
 
@@ -1197,6 +1231,9 @@ export class StreamController {
       const recoveredToolCalls = await runtime.loadSubagentToolCalls?.(
         subagent.agentId || ''
       ) ?? [];
+      if (!this.ownsAsyncSubagent(subagent, runtime, providerSessionId)) {
+        return { hasHydrated: false, finalResultHydrated: false, isCurrent: false };
+      }
       if (recoveredToolCalls.length > 0) {
         subagent.toolCalls = recoveredToolCalls.map((toolCall) => ({
           ...toolCall,
@@ -1209,6 +1246,9 @@ export class StreamController {
     const recoveredFinalResult = await runtime.loadSubagentFinalResult?.(
       subagent.agentId || ''
     ) ?? null;
+    if (!this.ownsAsyncSubagent(subagent, runtime, providerSessionId)) {
+      return { hasHydrated: false, finalResultHydrated: false, isCurrent: false };
+    }
     if (recoveredFinalResult && recoveredFinalResult.trim().length > 0) {
       finalResultHydrated = true;
       if (recoveredFinalResult !== subagent.result) {
@@ -1217,43 +1257,73 @@ export class StreamController {
       }
     }
 
-    return { hasHydrated, finalResultHydrated };
+    return { hasHydrated, finalResultHydrated, isCurrent: true };
+  }
+
+  private ownsAsyncSubagent(
+    subagent: SubagentInfo,
+    runtime: ChatRuntime,
+    providerSessionId: string,
+  ): boolean {
+    return this.deps.getAgentService?.() === runtime
+      && runtime.getSessionId() === providerSessionId
+      && this.deps.subagentManager.getByTaskId(subagent.id) === subagent;
   }
 
   private scheduleAsyncSubagentResultRetry(
     subagent: SubagentInfo,
     runtime: ChatRuntime,
+    providerSessionId: string,
     attempt: number
   ): void {
     if (!subagent.agentId) return;
     if (attempt >= StreamController.ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS.length) return;
 
     const delay = StreamController.ASYNC_SUBAGENT_RESULT_RETRY_DELAYS_MS[attempt];
-    setTimeout(() => {
-      void this.retryAsyncSubagentResult(subagent, runtime, attempt);
+    window.setTimeout(() => {
+      const work = () => this.retryAsyncSubagentResult(
+        subagent,
+        runtime,
+        providerSessionId,
+        attempt,
+      );
+      const pending = this.deps.enqueueBackgroundWork
+        ? this.deps.enqueueBackgroundWork(work)
+        : work();
+      void pending?.catch(() => undefined);
     }, delay);
   }
 
   private async retryAsyncSubagentResult(
     subagent: SubagentInfo,
     runtime: ChatRuntime,
+    providerSessionId: string,
     attempt: number
   ): Promise<void> {
     if (!subagent.agentId) return;
+    if (!this.ownsAsyncSubagent(subagent, runtime, providerSessionId)) return;
     const asyncStatus = subagent.asyncStatus ?? subagent.status;
     if (asyncStatus !== 'completed' && asyncStatus !== 'error') return;
 
-    const { hasHydrated, finalResultHydrated } = await this.tryHydrateAsyncSubagent(
+    const { hasHydrated, finalResultHydrated, isCurrent } = await this.tryHydrateAsyncSubagent(
       subagent,
       runtime,
+      providerSessionId,
       false
     );
+    if (!isCurrent) return;
     if (hasHydrated) {
       this.deps.subagentManager.refreshAsyncSubagent(subagent);
+      await this.deps.persistConversation?.();
     }
 
     if (!finalResultHydrated) {
-      this.scheduleAsyncSubagentResultRetry(subagent, runtime, attempt + 1);
+      this.scheduleAsyncSubagentResultRetry(
+        subagent,
+        runtime,
+        providerSessionId,
+        attempt + 1,
+      );
     }
   }
 
@@ -1341,8 +1411,8 @@ export class StreamController {
 
     // Clear any existing timeout
     if (state.thinkingIndicatorTimeout) {
-      clearTimeout(state.thinkingIndicatorTimeout);
-      state.thinkingIndicatorTimeout = null;
+      const timerWindow = state.currentContentEl.ownerDocument.defaultView ?? window;
+      state.clearThinkingIndicatorTimeout(timerWindow);
     }
 
     // Don't show flavor text while model thinking block is active
@@ -1358,8 +1428,9 @@ export class StreamController {
     }
 
     // Schedule showing the indicator after a delay
-    state.thinkingIndicatorTimeout = setTimeout(() => {
-      state.thinkingIndicatorTimeout = null;
+    const timerWindow = state.currentContentEl.ownerDocument.defaultView ?? window;
+    state.setThinkingIndicatorTimeout(timerWindow.setTimeout(() => {
+      state.setThinkingIndicatorTimeout(null, null);
       // Double-check we still have a content element, no indicator exists, and no thinking block
       if (!state.currentContentEl || state.thinkingEl || state.currentThinkingState) return;
 
@@ -1377,8 +1448,7 @@ export class StreamController {
         // Check if element is still connected to DOM (prevents orphaned interval updates)
         if (!timerSpan.isConnected) {
           if (state.flavorTimerInterval) {
-            clearInterval(state.flavorTimerInterval);
-            state.flavorTimerInterval = null;
+            state.clearFlavorTimerInterval();
           }
           return;
         }
@@ -1389,11 +1459,12 @@ export class StreamController {
 
       // Start interval to update timer every second
       if (state.flavorTimerInterval) {
-        clearInterval(state.flavorTimerInterval);
+        state.clearFlavorTimerInterval();
       }
-      state.flavorTimerInterval = setInterval(updateTimer, 1000);
+      const thinkingWindow = state.currentContentEl.ownerDocument.defaultView ?? timerWindow;
+      state.setFlavorTimerInterval(thinkingWindow.setInterval(updateTimer, 1000), thinkingWindow);
 
-    }, StreamController.THINKING_INDICATOR_DELAY);
+    }, StreamController.THINKING_INDICATOR_DELAY), timerWindow);
   }
 
   /** Hides the thinking indicator and cancels any pending show timeout. */
@@ -1402,8 +1473,8 @@ export class StreamController {
 
     // Cancel any pending show timeout
     if (state.thinkingIndicatorTimeout) {
-      clearTimeout(state.thinkingIndicatorTimeout);
-      state.thinkingIndicatorTimeout = null;
+      const activeWindow = this.deps.getMessagesEl().ownerDocument.defaultView ?? window;
+      state.clearThinkingIndicatorTimeout(activeWindow);
     }
 
     // Clear timer interval (but preserve responseStartTime for duration capture)
@@ -1437,12 +1508,13 @@ export class StreamController {
    * FSWatcher often misses the event.
    */
   private notifyVaultFileChange(input: Record<string, unknown>): void {
-    const rawPath = (input.file_path ?? input.notebook_path) as string | undefined;
+    const rawPathValue = input.file_path ?? input.notebook_path;
+    const rawPath = typeof rawPathValue === 'string' ? rawPathValue : undefined;
     const vaultPath = getVaultPath(this.deps.plugin.app);
     const relativePath = normalizePathForVault(rawPath, vaultPath);
     if (!relativePath || relativePath.startsWith('/')) return;
 
-    setTimeout(() => {
+    window.setTimeout(() => {
       const { vault } = this.deps.plugin.app;
       const file = vault.getAbstractFileByPath(relativePath);
       if (file instanceof TFile) {
@@ -1466,9 +1538,12 @@ export class StreamController {
     const changes = input.changes;
     if (Array.isArray(changes)) {
       for (const change of changes) {
-        if (change && typeof change === 'object' && typeof change.path === 'string') {
-          notified.add(change.path);
-          this.notifyVaultFileChange({ file_path: change.path });
+        if (change && typeof change === 'object' && !Array.isArray(change)) {
+          const changeRecord = change as Record<string, unknown>;
+          if (typeof changeRecord.path === 'string') {
+            notified.add(changeRecord.path);
+            this.notifyVaultFileChange({ file_path: changeRecord.path });
+          }
         }
       }
     }
@@ -1492,7 +1567,7 @@ export class StreamController {
     this.pendingScrollFrame = scheduleAnimationFrame(() => {
       this.pendingScrollFrame = null;
       this.applyScrollToBottom();
-    });
+    }, this.getMessagesWindow());
   }
 
   private applyScrollToBottom(): void {
@@ -1509,6 +1584,24 @@ export class StreamController {
 
     cancelScheduledAnimationFrame(this.pendingScrollFrame);
     this.pendingScrollFrame = null;
+  }
+
+  private getMessagesWindow(): Window | null {
+    return this.deps.getMessagesEl().ownerDocument.defaultView ?? null;
+  }
+
+  private getStreamingRenderWindow(): Window | null {
+    const { state } = this.deps;
+    return state.currentTextEl?.ownerDocument?.defaultView
+      ?? state.currentContentEl?.ownerDocument?.defaultView
+      ?? this.getMessagesWindow();
+  }
+
+  private getThinkingRenderWindow(): Window | null {
+    const { state } = this.deps;
+    return state.currentThinkingState?.contentEl.ownerDocument?.defaultView
+      ?? state.currentContentEl?.ownerDocument?.defaultView
+      ?? this.getMessagesWindow();
   }
 
   resetStreamingState(): void {

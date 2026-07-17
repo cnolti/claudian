@@ -14,6 +14,7 @@ import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { BangBashModeManager } from '../ui/BangBashModeManager';
+import type { ComposerContextTray } from '../ui/ComposerContextTray';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type {
@@ -29,6 +30,8 @@ import type {
 import type { InstructionModeManager } from '../ui/InstructionModeManager';
 import type { NavigationSidebar } from '../ui/NavigationSidebar';
 import type { StatusPanel } from '../ui/StatusPanel';
+import type { RuntimeSupervisor } from './RuntimeSupervisor';
+import type { TabSession } from './TabSession';
 
 /**
  * Default number of tabs allowed.
@@ -52,18 +55,6 @@ export const MIN_TABS = 3;
 export const MAX_TABS = 10;
 
 /**
- * Minimum max-height for textarea in pixels.
- * Used by autoResizeTextarea to ensure minimum usable space.
- */
-export const TEXTAREA_MIN_MAX_HEIGHT = 150;
-
-/**
- * Percentage of view height for max textarea height.
- * Textarea can grow up to this portion of the view.
- */
-export const TEXTAREA_MAX_HEIGHT_PERCENT = 0.55;
-
-/**
  * Minimal interface for the ClaudianView methods used by TabManager and Tab.
  * Extends Component for Obsidian integration (event handling, cleanup).
  * Avoids circular dependency by not importing ClaudianView directly.
@@ -74,6 +65,9 @@ export interface TabManagerViewHost extends Component {
 
   /** Gets the tab manager instance (used for cross-view coordination). */
   getTabManager(): TabManagerInterface | null;
+
+  /** Gets view-owned elements that should preserve active tab selection context. */
+  getSharedSelectionFocusScopeEls?(): HTMLElement[];
 }
 
 /**
@@ -123,6 +117,7 @@ export interface TabServices {
  * UI components managed per-tab.
  */
 export interface TabUIComponents {
+  contextTray: ComposerContextTray | null;
   fileContextManager: FileContextManager | null;
   imageContextManager: ImageContextManager | null;
   modelSelector: ModelSelector | null;
@@ -151,6 +146,8 @@ export interface TabDOMElements {
   /** Container for status panel (fixed between messages and input). */
   statusPanelContainerEl: HTMLElement;
 
+  /** Per-tab composer root. Inline prompts render here as siblings of the input container. */
+  inputComposerEl: HTMLElement;
   inputContainerEl: HTMLElement;
   queueIndicatorEl: HTMLElement;
   inputWrapper: HTMLElement;
@@ -159,12 +156,8 @@ export interface TabDOMElements {
   /** Nav row for tab badges and header icons (above input wrapper). */
   navRowEl: HTMLElement;
 
-  /** Context row for file chips and selection indicator (inside input wrapper). */
+  /** Composer-owned context tray container inside the input wrapper. */
   contextRowEl: HTMLElement;
-
-  selectionIndicatorEl: HTMLElement | null;
-  browserIndicatorEl: HTMLElement | null;
-  canvasIndicatorEl: HTMLElement | null;
 
   /** Cleanup functions for event listeners (prevents memory leaks). */
   eventCleanups: Array<() => void>;
@@ -184,6 +177,8 @@ export type TabLifecycleState = 'blank' | 'bound_cold' | 'bound_active' | 'closi
  * Each tab is an independent chat session with its own runtime instance.
  */
 export interface TabData {
+  /** Authoritative identity and runtime owner for the tab. */
+  session: TabSession;
   /** Unique tab identifier. */
   id: TabId;
 
@@ -204,6 +199,9 @@ export interface TabData {
 
   /** Per-tab chat runtime instance for independent streaming. */
   service: ChatRuntime | null;
+
+  /** Named owner of the per-tab runtime reference. */
+  runtimeSupervisor: RuntimeSupervisor;
 
   /** Whether the service has been initialized (lazy start). */
   serviceInitialized: boolean;
@@ -244,6 +242,7 @@ export interface PersistedTabState {
 export interface PersistedTabManagerState {
   openTabs: PersistedTabState[];
   activeTabId: TabId | null;
+  expandedTitleTabIds?: TabId[];
 }
 
 /**
@@ -252,6 +251,9 @@ export interface PersistedTabManagerState {
 export interface TabManagerCallbacks {
   /** Called when a tab is created. */
   onTabCreated?: (tab: TabData) => void;
+
+  /** Called immediately after the active tab changes, before async tab loading completes. */
+  onActiveTabChanged?: (fromTabId: TabId | null, toTabId: TabId) => void;
 
   /** Called when switching to a different tab. */
   onTabSwitched?: (fromTabId: TabId | null, toTabId: TabId) => void;

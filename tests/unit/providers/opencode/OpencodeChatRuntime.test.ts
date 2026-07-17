@@ -10,7 +10,7 @@ import * as launchArtifacts from '@/providers/opencode/runtime/OpencodeLaunchArt
 import { getOpencodeProviderSettings } from '@/providers/opencode/settings';
 
 function createMockPlugin(overrides: Record<string, unknown> = {}): any {
-  return {
+  const plugin: any = {
     settings: {},
     manifest: { version: '0.0.0-test' },
     getAllViews: jest.fn().mockReturnValue([]),
@@ -25,6 +25,16 @@ function createMockPlugin(overrides: Record<string, unknown> = {}): any {
     },
     ...overrides,
   };
+  plugin.refreshModelSelectors ??= jest.fn(() => {
+    for (const view of plugin.getAllViews()) {
+      view.refreshModelSelector();
+    }
+  });
+  plugin.mutateSettings ??= jest.fn(async (mutation: (settings: any) => void | Promise<void>) => {
+    await mutation(plugin.settings);
+    await plugin.saveSettings();
+  });
+  return plugin;
 }
 
 describe('OpencodeChatRuntime', () => {
@@ -188,6 +198,255 @@ describe('OpencodeChatRuntime', () => {
     });
 
     await expect(runtime.ensureReady({ allowSessionCreation: false })).resolves.toBe(true);
+  });
+
+  it('restarts when the ACP transport closed even if the subprocess still looks alive', async () => {
+    const plugin = createMockPlugin({
+      settings: {
+        providerConfigs: {
+          opencode: {
+            enabled: true,
+          },
+        },
+      },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    const mockTransport = { dispose: jest.fn(), isClosed: false };
+    const mockProcess = { isAlive: jest.fn().mockReturnValue(true), shutdown: jest.fn() };
+    const mockConnection = { dispose: jest.fn() };
+
+    jest.spyOn(launchArtifacts, 'prepareOpencodeLaunchArtifacts').mockResolvedValue({
+      configPath: '/tmp/claudian-opencode-config.json',
+      configContent: '{}\n',
+      databasePath: '/default/opencode.db',
+      launchKey: 'launch-key',
+      systemPromptPath: '/tmp/claudian-opencode-system.md',
+    });
+    const shutdownProcess = jest.spyOn(runtime as any, 'shutdownProcess').mockResolvedValue(undefined);
+    const startProcess = jest.spyOn(runtime as any, 'startProcess').mockImplementation(async () => {
+      (runtime as any).connection = mockConnection;
+      (runtime as any).process = mockProcess;
+      (runtime as any).transport = mockTransport;
+    });
+
+    await expect(runtime.ensureReady({ allowSessionCreation: false })).resolves.toBe(true);
+    mockTransport.isClosed = true;
+    await expect(runtime.ensureReady({ allowSessionCreation: false })).resolves.toBe(true);
+
+    expect(shutdownProcess).toHaveBeenCalledTimes(2);
+    expect(startProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces concurrent readiness for the same OpenCode target', async () => {
+    const plugin = createMockPlugin({
+      settings: { providerConfigs: { opencode: { enabled: true } } },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    jest.spyOn(launchArtifacts, 'prepareOpencodeLaunchArtifacts').mockResolvedValue({
+      configPath: '/tmp/claudian-opencode-config.json',
+      configContent: '{}\n',
+      databasePath: '/default/opencode.db',
+      launchKey: 'launch-key',
+      systemPromptPath: '/tmp/claudian-opencode-system.md',
+    });
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>(resolve => { releaseStart = resolve; });
+    const startProcess = jest.spyOn(runtime as any, 'startProcess').mockImplementation(async () => {
+      await startGate;
+      (runtime as any).ready = true;
+    });
+
+    const first = runtime.ensureReady({ allowSessionCreation: false });
+    const second = runtime.ensureReady({ allowSessionCreation: false });
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(startProcess).toHaveBeenCalledTimes(1);
+    releaseStart();
+    await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+  });
+
+  it('does not coalesce readiness across conversation targets', async () => {
+    const plugin = createMockPlugin({
+      settings: { providerConfigs: { opencode: { enabled: true } } },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    jest.spyOn(launchArtifacts, 'prepareOpencodeLaunchArtifacts').mockResolvedValue({
+      configPath: '/tmp/claudian-opencode-config.json',
+      configContent: '{}\n',
+      databasePath: '/default/opencode.db',
+      launchKey: 'launch-key',
+      systemPromptPath: '/tmp/claudian-opencode-system.md',
+    });
+    jest.spyOn(runtime as any, 'startProcess').mockImplementation(async () => {
+      (runtime as any).process = {
+        isAlive: () => true,
+        shutdown: jest.fn().mockResolvedValue(undefined),
+      };
+      (runtime as any).transport = { dispose: jest.fn(), isClosed: false };
+      (runtime as any).connection = { dispose: jest.fn() };
+    });
+    let releaseFirstLoad!: () => void;
+    const firstLoadGate = new Promise<void>(resolve => { releaseFirstLoad = resolve; });
+    const loadSession = jest.spyOn(runtime as any, 'loadSession').mockImplementation(
+      async (sessionId) => {
+        if (sessionId === 'session-a') {
+          await firstLoadGate;
+        }
+        return true;
+      },
+    );
+
+    runtime.syncConversationState({ providerState: {}, sessionId: 'session-a' });
+    const first = runtime.ensureReady({ allowSessionCreation: false });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(loadSession).toHaveBeenCalledWith(
+      'session-a',
+      '/tmp/claudian-test-vault',
+      expect.any(Number),
+    );
+
+    runtime.syncConversationState({ providerState: {}, sessionId: 'session-b' });
+    const second = runtime.ensureReady({ allowSessionCreation: false });
+    releaseFirstLoad();
+
+    await expect(first).resolves.toBe(false);
+    await expect(second).resolves.toBe(true);
+    expect(loadSession).toHaveBeenLastCalledWith(
+      'session-b',
+      '/tmp/claudian-test-vault',
+      expect.any(Number),
+    );
+    expect(runtime.getSessionId()).toBe('session-b');
+  });
+
+  it('does not start OpenCode after cleanup invalidates readiness', async () => {
+    const plugin = createMockPlugin({
+      settings: { providerConfigs: { opencode: { enabled: true } } },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    let releaseArtifacts!: () => void;
+    const artifactsGate = new Promise<void>(resolve => {
+      releaseArtifacts = resolve;
+    });
+    jest.spyOn(launchArtifacts, 'prepareOpencodeLaunchArtifacts').mockImplementation(async () => {
+      await artifactsGate;
+      return {
+        configPath: '/tmp/claudian-opencode-config.json',
+        configContent: '{}\n',
+        databasePath: '/default/opencode.db',
+        launchKey: 'launch-key',
+        systemPromptPath: '/tmp/claudian-opencode-system.md',
+      };
+    });
+    const startProcess = jest.spyOn(runtime as any, 'startProcess').mockResolvedValue(undefined);
+
+    const readiness = runtime.ensureReady({ allowSessionCreation: false });
+    await new Promise(resolve => setImmediate(resolve));
+    runtime.cleanup();
+    releaseArtifacts();
+
+    await expect(readiness).resolves.toBe(false);
+    expect(startProcess).not.toHaveBeenCalled();
+    expect(runtime.isReady()).toBe(false);
+  });
+
+  it('settles the owned query when local cancel receives no provider acknowledgement', async () => {
+    const runtime = new OpencodeChatRuntime(createMockPlugin());
+    runtime.syncConversationState({ providerState: {}, sessionId: 'session-1' });
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    (runtime as any).connection = {
+      cancel,
+      prompt: jest.fn(() => new Promise(() => {})),
+    };
+    (runtime as any).ensureReady = jest.fn().mockResolvedValue(true);
+    (runtime as any).applySelectedMode = jest.fn().mockResolvedValue(undefined);
+    (runtime as any).applySelectedModel = jest.fn().mockResolvedValue(undefined);
+    (runtime as any).applySelectedEffort = jest.fn().mockResolvedValue(undefined);
+
+    const iterator = runtime.query(runtime.prepareTurn({ text: 'Hello' }));
+    const firstChunk = iterator.next();
+    await new Promise(resolve => setImmediate(resolve));
+    runtime.cancel();
+
+    await expect(firstChunk).resolves.toEqual({ done: false, value: { type: 'done' } });
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    expect(cancel).toHaveBeenCalledWith({ sessionId: 'session-1' });
+  });
+
+  it('restarts the ACP connection before reusing a session after cancellation', async () => {
+    const runtime = new OpencodeChatRuntime(createMockPlugin({
+      settings: { providerConfigs: { opencode: { enabled: true } } },
+    }));
+    runtime.syncConversationState({ providerState: {}, sessionId: 'session-1' });
+    jest.spyOn(launchArtifacts, 'prepareOpencodeLaunchArtifacts').mockResolvedValue({
+      configPath: '/tmp/claudian-opencode-config.json',
+      configContent: '{}\n',
+      databasePath: '/default/opencode.db',
+      launchKey: 'launch-key',
+      systemPromptPath: '/tmp/claudian-opencode-system.md',
+    });
+    const cancel = jest.fn();
+    const startProcess = jest.spyOn(runtime as any, 'startProcess').mockImplementation(async () => {
+      (runtime as any).process = { isAlive: () => true, shutdown: jest.fn().mockResolvedValue(undefined) };
+      (runtime as any).transport = { dispose: jest.fn(), isClosed: false };
+      (runtime as any).connection = { cancel, dispose: jest.fn() };
+    });
+    jest.spyOn(runtime as any, 'loadSession').mockResolvedValue(true);
+
+    await runtime.ensureReady({ allowSessionCreation: false });
+    (runtime as any).activeTurn = {
+      cancelled: false,
+      queue: { close: jest.fn(), push: jest.fn() },
+      sessionId: 'session-1',
+    };
+    runtime.cancel();
+    await runtime.ensureReady({ allowSessionCreation: false });
+
+    expect(cancel).toHaveBeenCalledWith({ sessionId: 'session-1' });
+    expect(startProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores notifications from a superseded ACP connection generation', async () => {
+    const runtime = new OpencodeChatRuntime(createMockPlugin());
+    const push = jest.fn();
+    (runtime as any).sessionId = 'session-1';
+    (runtime as any).connectionGeneration = 2;
+    (runtime as any).activeTurn = {
+      cancelled: false,
+      queue: { close: jest.fn(), push },
+      sessionId: 'session-1',
+    };
+
+    await (runtime as any).handleSessionNotification({
+      sessionId: 'session-1',
+      update: {
+        content: { text: 'stale', type: 'text' },
+        messageId: 'assistant-old',
+        sessionUpdate: 'agent_message_chunk',
+      },
+    }, 1);
+
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it('rejects a second overlapping query without replacing the active route', async () => {
+    const runtime = new OpencodeChatRuntime(createMockPlugin());
+    (runtime as any).activeTurn = {
+      cancelled: false,
+      queue: { close: jest.fn(), next: jest.fn(), push: jest.fn() },
+      sessionId: 'session-1',
+    };
+
+    const chunks: unknown[] = [];
+    for await (const chunk of runtime.query(runtime.prepareTurn({ text: 'Second' }))) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toEqual([
+      { type: 'error', content: 'OpenCode does not support overlapping turns.' },
+      { type: 'done' },
+    ]);
+    expect((runtime as any).activeTurn.sessionId).toBe('session-1');
   });
 
   it('maps ACP permission options through the shared approval UI', async () => {
@@ -546,9 +805,247 @@ describe('OpencodeChatRuntime', () => {
     expect(plugin.settings.savedProviderEffort.opencode).toBe('high');
     expect(plugin.settings.model).toBe('opencode:anthropic/claude-sonnet-4');
     expect(plugin.settings.effortLevel).toBe('high');
-    expect((runtime as any).resolveSelectedRawModelId()).toBe('anthropic/claude-sonnet-4/high');
+    expect((runtime as any).resolveSelectedRawModelId()).toBe('anthropic/claude-sonnet-4');
     expect(plugin.saveSettings).not.toHaveBeenCalled();
     expect(refreshModelSelector).not.toHaveBeenCalled();
+  });
+
+  it('syncs detached ACP thought-level options into OpenCode provider state', async () => {
+    const refreshModelSelector = jest.fn();
+    const plugin = createMockPlugin({
+      getAllViews: jest.fn().mockReturnValue([{ refreshModelSelector }]),
+      settings: {
+        model: 'opencode:deepseek/deepseek-v4-pro',
+        providerConfigs: {
+          opencode: {
+            discoveredModels: [],
+            preferredThinkingByModel: {},
+            visibleModels: ['deepseek/deepseek-v4-pro'],
+          },
+        },
+        settingsProvider: 'opencode',
+      },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    jest.spyOn(ProviderRegistry, 'resolveSettingsProviderId').mockReturnValue('opencode');
+
+    await (runtime as any).syncSessionModelState({
+      configOptions: [
+        {
+          category: 'model',
+          currentValue: 'deepseek/deepseek-v4-pro',
+          id: 'model',
+          name: 'Model',
+          options: [
+            { name: 'DeepSeek/DeepSeek V4 Pro', value: 'deepseek/deepseek-v4-pro' },
+          ],
+          type: 'select',
+        },
+        {
+          category: 'thought_level',
+          currentValue: 'low',
+          id: 'effort',
+          name: 'Effort',
+          options: [
+            { name: 'Low', value: 'low' },
+            { name: 'Medium', value: 'medium' },
+            { name: 'High', value: 'high' },
+            { name: 'Max', value: 'max' },
+          ],
+          type: 'select',
+        },
+      ],
+    });
+
+    expect(getOpencodeProviderSettings(plugin.settings).thinkingOptionsByModel).toEqual({
+      'deepseek/deepseek-v4-pro': [
+        { label: 'Low', value: 'low' },
+        { label: 'Medium', value: 'medium' },
+        { label: 'High', value: 'high' },
+        { label: 'Max', value: 'max' },
+      ],
+    });
+    expect(plugin.settings.providerConfigs.opencode.preferredThinkingByModel).toEqual({
+      'deepseek/deepseek-v4-pro': 'high',
+    });
+    expect(plugin.settings.providerConfigs.opencode.thinkingOptionsByModel).toEqual({
+      'deepseek/deepseek-v4-pro': [
+        { label: 'Low', value: 'low' },
+        { label: 'Medium', value: 'medium' },
+        { label: 'High', value: 'high' },
+        { label: 'Max', value: 'max' },
+      ],
+    });
+    expect(plugin.settings.effortLevel).toBe('high');
+    expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
+    expect(refreshModelSelector).toHaveBeenCalledTimes(1);
+  });
+
+  it('clamps optimistic high defaults when ACP reports that high is unsupported', async () => {
+    const plugin = createMockPlugin({
+      settings: {
+        effortLevel: 'high',
+        model: 'opencode:custom/model',
+        providerConfigs: {
+          opencode: {
+            discoveredModels: [],
+            preferredThinkingByModel: {},
+            visibleModels: ['custom/model'],
+          },
+        },
+        savedProviderEffort: { opencode: 'high' },
+        savedProviderModel: { opencode: 'opencode:custom/model' },
+        settingsProvider: 'opencode',
+      },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    jest.spyOn(ProviderRegistry, 'resolveSettingsProviderId').mockReturnValue('opencode');
+
+    await (runtime as any).syncSessionModelState({
+      configOptions: [
+        {
+          category: 'model',
+          currentValue: 'custom/model',
+          id: 'model',
+          name: 'Model',
+          options: [{ name: 'Custom Model', value: 'custom/model' }],
+          type: 'select',
+        },
+        {
+          category: 'thought_level',
+          currentValue: 'medium',
+          id: 'effort',
+          name: 'Effort',
+          options: [
+            { name: 'Low', value: 'low' },
+            { name: 'Medium', value: 'medium' },
+          ],
+          type: 'select',
+        },
+      ],
+    });
+
+    expect(plugin.settings.providerConfigs.opencode.preferredThinkingByModel).toEqual({
+      'custom/model': 'medium',
+    });
+    expect(plugin.settings.effortLevel).toBe('medium');
+    expect(plugin.settings.savedProviderEffort.opencode).toBe('medium');
+  });
+
+  it('warms selected model metadata by switching ACP model config', async () => {
+    const plugin = createMockPlugin({
+      settings: {
+        model: 'opencode:deepseek/deepseek-v4-pro',
+        providerConfigs: {
+          opencode: {
+            discoveredModels: [
+              { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+            ],
+            preferredThinkingByModel: {},
+            visibleModels: ['deepseek/deepseek-v4-pro'],
+          },
+        },
+        settingsProvider: 'opencode',
+      },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    const setConfigOption = jest.fn().mockResolvedValue({
+      configOptions: [
+        {
+          category: 'model',
+          currentValue: 'deepseek/deepseek-v4-pro',
+          id: 'model',
+          name: 'Model',
+          options: [
+            { name: 'DeepSeek/DeepSeek V4 Pro', value: 'deepseek/deepseek-v4-pro' },
+          ],
+          type: 'select',
+        },
+        {
+          category: 'thought_level',
+          currentValue: 'low',
+          id: 'effort',
+          name: 'Effort',
+          options: [
+            { name: 'Low', value: 'low' },
+            { name: 'High', value: 'high' },
+          ],
+          type: 'select',
+        },
+      ],
+    });
+    (runtime as any).connection = { setConfigOption };
+    (runtime as any).sessionId = 'session-1';
+    jest.spyOn(runtime, 'ensureReady').mockResolvedValue(true);
+    jest.spyOn(ProviderRegistry, 'resolveSettingsProviderId').mockReturnValue('opencode');
+
+    await expect(runtime.warmModelMetadata('opencode:deepseek/deepseek-v4-pro')).resolves.toBe(true);
+
+    expect(setConfigOption).toHaveBeenCalledWith({
+      configId: 'model',
+      sessionId: 'session-1',
+      type: 'select',
+      value: 'deepseek/deepseek-v4-pro',
+    });
+    expect(plugin.settings.providerConfigs.opencode.thinkingOptionsByModel).toEqual({
+      'deepseek/deepseek-v4-pro': [
+        { label: 'Low', value: 'low' },
+        { label: 'High', value: 'high' },
+      ],
+    });
+    expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies selected OpenCode effort through the detached ACP effort option', async () => {
+    const plugin = createMockPlugin({
+      settings: {
+        effortLevel: 'high',
+        model: 'opencode:deepseek/deepseek-v4-pro',
+        providerConfigs: {
+          opencode: {
+            discoveredModels: [
+              { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
+            ],
+            thinkingOptionsByModel: {
+              'deepseek/deepseek-v4-pro': [
+                { label: 'Low', value: 'low' },
+                { label: 'High', value: 'high' },
+              ],
+            },
+            visibleModels: ['deepseek/deepseek-v4-pro'],
+          },
+        },
+        settingsProvider: 'opencode',
+      },
+    });
+    const runtime = new OpencodeChatRuntime(plugin);
+    const setConfigOption = jest.fn().mockResolvedValue({
+      configOptions: [{
+        category: 'thought_level',
+        currentValue: 'high',
+        id: 'effort',
+        name: 'Effort',
+        options: [
+          { name: 'Low', value: 'low' },
+          { name: 'High', value: 'high' },
+        ],
+        type: 'select',
+      }],
+    });
+    (runtime as any).connection = { setConfigOption };
+    (runtime as any).currentSessionEffortConfigId = 'effort';
+    (runtime as any).currentSessionEffortValue = 'low';
+    (runtime as any).currentSessionEffortValues = new Set(['low', 'high']);
+    jest.spyOn(ProviderSettingsCoordinator, 'getProviderSettingsSnapshot').mockReturnValue(plugin.settings);
+
+    await (runtime as any).applySelectedEffort('session-1');
+
+    expect(setConfigOption).toHaveBeenCalledWith({
+      configId: 'effort',
+      sessionId: 'session-1',
+      type: 'select',
+      value: 'high',
+    });
   });
 
   it('exposes the active display model for auxiliary OpenCode tasks', () => {
@@ -579,6 +1076,6 @@ describe('OpencodeChatRuntime', () => {
     jest.spyOn(ProviderRegistry, 'resolveSettingsProviderId').mockReturnValue('opencode');
     jest.spyOn(ProviderSettingsCoordinator, 'getProviderSettingsSnapshot').mockReturnValue(plugin.settings);
 
-    expect(runtime.getAuxiliaryModel()).toBe('opencode:anthropic/claude-sonnet-4/high');
+    expect(runtime.getAuxiliaryModel()).toBe('opencode:anthropic/claude-sonnet-4');
   });
 });

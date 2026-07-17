@@ -240,7 +240,7 @@ export function cliPathRequiresNode(cliPath: string): boolean {
       fd = fs.openSync(cliPath, 'r');
       const buffer = Buffer.alloc(200);
       const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
-      const header = buffer.slice(0, bytesRead).toString('utf8');
+      const header = buffer.subarray(0, bytesRead).toString('utf8');
       if (!header.startsWith('#!')) return false;
       const shebangLine = header.split(/\r?\n/)[0].toLowerCase();
       return shebangLine.includes('node');
@@ -411,8 +411,8 @@ export function migrateLegacyHostnameKeyedMap<T extends string>(
     return entries;
   }
 
-  const hasCurrentEntry = Object.prototype.hasOwnProperty.call(entries, currentKey);
-  const hasLegacyEntry = Object.prototype.hasOwnProperty.call(entries, legacyHostnameKey);
+  const hasCurrentEntry = hasOwnEntry(entries, currentKey);
+  const hasLegacyEntry = hasOwnEntry(entries, legacyHostnameKey);
   if (!hasLegacyEntry) {
     return entries;
   }
@@ -423,6 +423,10 @@ export function migrateLegacyHostnameKeyedMap<T extends string>(
   }
   delete migrated[legacyHostnameKey];
   return migrated;
+}
+
+function hasOwnEntry<T>(entries: Record<string, T>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(entries, key) === true;
 }
 
 export const MIN_CONTEXT_LIMIT = 1_000;

@@ -20,14 +20,17 @@ jobs:
         with:
           fetch-depth: 0  # Full history for changelog generation
 
-      - name: Setup Node 20
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: .node-version
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Validate release version
+        run: node scripts/check-release-version.mjs "${{ github.ref_name }}"
 
       - name: Build
         run: npm run build

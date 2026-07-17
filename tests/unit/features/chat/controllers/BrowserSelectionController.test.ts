@@ -2,29 +2,11 @@
 
 import { BrowserSelectionController } from '@/features/chat/controllers/BrowserSelectionController';
 
-function createMockIndicator() {
-  const indicatorEl = document.createElement('div');
-  indicatorEl.style.display = 'none';
-  return indicatorEl;
-}
-
-function createMockContextRow(browserIndicator: HTMLElement) {
-  const fileIndicator = { style: { display: 'none' } };
-  const imagePreview = { style: { display: 'none' } };
-  const elements: Record<string, any> = {
-    '.claudian-selection-indicator': { style: { display: 'none' } },
-    '.claudian-browser-selection-indicator': browserIndicator,
-    '.claudian-canvas-indicator': { style: { display: 'none' } },
-    '.claudian-file-indicator': fileIndicator,
-    '.claudian-image-preview': imagePreview,
-  };
-
+function createMockContextTray() {
   return {
-    classList: {
-      toggle: jest.fn(),
-    },
-    querySelector: jest.fn((selector: string) => elements[selector] ?? null),
-  } as any;
+    setItems: jest.fn(),
+    clearItems: jest.fn(),
+  };
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -35,9 +17,8 @@ async function flushMicrotasks(): Promise<void> {
 describe('BrowserSelectionController', () => {
   let controller: BrowserSelectionController;
   let app: any;
-  let indicatorEl: any;
+  let contextTray: ReturnType<typeof createMockContextTray>;
   let inputEl: HTMLTextAreaElement;
-  let contextRowEl: any;
   let containerEl: HTMLElement;
   let selectionText = 'selected web snippet';
   let getSelectionSpy: jest.SpyInstance;
@@ -46,10 +27,9 @@ describe('BrowserSelectionController', () => {
     jest.useFakeTimers();
     selectionText = 'selected web snippet';
 
-    indicatorEl = createMockIndicator();
+    contextTray = createMockContextTray();
     inputEl = document.createElement('textarea');
     document.body.appendChild(inputEl);
-    contextRowEl = createMockContextRow(indicatorEl);
     containerEl = document.createElement('div');
     const selectionAnchor = document.createElement('span');
     containerEl.appendChild(selectionAnchor);
@@ -74,7 +54,7 @@ describe('BrowserSelectionController', () => {
       },
     };
 
-    controller = new BrowserSelectionController(app, indicatorEl, inputEl, contextRowEl);
+    controller = new BrowserSelectionController(app, contextTray as any, inputEl);
   });
 
   afterEach(() => {
@@ -95,13 +75,12 @@ describe('BrowserSelectionController', () => {
       title: 'Surfing',
       url: 'https://example.com',
     });
-    expect(indicatorEl.style.display).toBe('block');
-    expect(indicatorEl.textContent).toBe('1 line selected');
-    expect(indicatorEl.textContent).not.toContain('source=');
-    expect(indicatorEl.getAttribute('title')).toContain('chars selected');
-    expect(indicatorEl.getAttribute('title')).toContain('source=browser:https://example.com');
-    expect(indicatorEl.getAttribute('title')).toContain('title=Surfing');
-    expect(indicatorEl.getAttribute('title')).toContain('https://example.com');
+    expect(contextTray.setItems).toHaveBeenLastCalledWith('browser-selection', [
+      expect.objectContaining({
+        label: '1 line selected',
+      }),
+    ]);
+    expect(contextTray.setItems.mock.calls[0][1][0]).not.toHaveProperty('title');
   });
 
   it('shows line-based indicator text for multi-line browser selection', async () => {
@@ -110,7 +89,9 @@ describe('BrowserSelectionController', () => {
     jest.advanceTimersByTime(250);
     await flushMicrotasks();
 
-    expect(indicatorEl.textContent).toBe('2 lines selected');
+    expect(contextTray.setItems).toHaveBeenLastCalledWith('browser-selection', [
+      expect.objectContaining({ label: '2 lines selected' }),
+    ]);
   });
 
   it('clears selection when text is deselected and input is not focused', async () => {
@@ -124,7 +105,7 @@ describe('BrowserSelectionController', () => {
     await flushMicrotasks();
 
     expect(controller.hasSelection()).toBe(false);
-    expect(indicatorEl.style.display).toBe('none');
+    expect(contextTray.clearItems).toHaveBeenCalledWith('browser-selection');
   });
 
   it('keeps selection while input is focused', async () => {
@@ -150,7 +131,19 @@ describe('BrowserSelectionController', () => {
     controller.clear();
 
     expect(controller.hasSelection()).toBe(false);
-    expect(indicatorEl.style.display).toBe('none');
+    expect(contextTray.clearItems).toHaveBeenCalledWith('browser-selection');
+  });
+
+  it('clears selection from the tray remove action', async () => {
+    controller.start();
+    jest.advanceTimersByTime(250);
+    await flushMicrotasks();
+
+    const items = contextTray.setItems.mock.calls[0][1];
+    items[0].onRemove();
+
+    expect(controller.hasSelection()).toBe(false);
+    expect(contextTray.clearItems).toHaveBeenCalledWith('browser-selection');
   });
 
   it('handles polling errors without unhandled rejection', async () => {

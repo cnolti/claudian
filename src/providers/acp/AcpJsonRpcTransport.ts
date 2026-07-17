@@ -82,6 +82,7 @@ export class AcpJsonRpcTransport {
   private readonly pending = new Map<number, PendingRequest>();
   private readline: Interface | null = null;
   private readonly requestHandlers = new Map<string, JsonRpcRequestHandler>();
+  private readonly streamUnsubscribers: Array<() => void> = [];
   private unregisterClose?: () => void;
 
   constructor(
@@ -112,6 +113,28 @@ export class AcpJsonRpcTransport {
         this.dispose(new JsonRpcTransportClosedError('JSON-RPC input closed'));
       }
     });
+
+    this.streamUnsubscribers.push(
+      subscribeStreamEvent(this.streams.input, 'error', (error?: unknown) => {
+        if (!this.disposed) {
+          this.dispose(error instanceof Error
+            ? error
+            : new JsonRpcTransportClosedError('JSON-RPC input error'));
+        }
+      }),
+      subscribeStreamEvent(this.streams.output, 'close', () => {
+        if (!this.disposed) {
+          this.dispose(new JsonRpcTransportClosedError('JSON-RPC output closed'));
+        }
+      }),
+      subscribeStreamEvent(this.streams.output, 'error', (error?: unknown) => {
+        if (!this.disposed) {
+          this.dispose(error instanceof Error
+            ? error
+            : new JsonRpcTransportClosedError('JSON-RPC output error'));
+        }
+      }),
+    );
 
     this.unregisterClose = this.streams.onClose?.((error) => {
       if (!this.disposed) {
@@ -169,25 +192,28 @@ export class AcpJsonRpcTransport {
     const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
 
     return new Promise<T>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      let timer: number | undefined;
       let onAbort: (() => void) | undefined;
 
       const cleanup = (): void => {
-        if (timer) clearTimeout(timer);
+        if (timer) window.clearTimeout(timer);
         if (onAbort && options.signal) {
           options.signal.removeEventListener('abort', onAbort);
         }
+      };
+      const resolvePending = (result: unknown): void => {
+        resolve(result as T);
       };
 
       const pending: PendingRequest = {
         cleanup,
         method,
         reject,
-        resolve: resolve as (result: unknown) => void,
+        resolve: resolvePending,
       };
 
       if (timeoutMs > 0) {
-        timer = setTimeout(() => {
+        timer = window.setTimeout(() => {
           this.pending.delete(id);
           cleanup();
           reject(new Error(`Request timeout: ${method} (${timeoutMs}ms)`));
@@ -215,7 +241,9 @@ export class AcpJsonRpcTransport {
       } catch (error) {
         this.pending.delete(id);
         cleanup();
-        reject(error instanceof Error ? error : new Error(String(error)));
+        const transportError = error instanceof Error ? error : new Error(String(error));
+        this.dispose(transportError);
+        reject(transportError);
       }
     });
   }
@@ -225,7 +253,7 @@ export class AcpJsonRpcTransport {
     if (this.disposed) {
       return;
     }
-    this.sendRaw({ jsonrpc: '2.0', method, params });
+    this.trySendRaw({ jsonrpc: '2.0', method, params });
   }
 
   dispose(error: Error = new JsonRpcTransportClosedError('JSON-RPC transport disposed')): void {
@@ -238,6 +266,10 @@ export class AcpJsonRpcTransport {
 
     this.unregisterClose?.();
     this.unregisterClose = undefined;
+
+    while (this.streamUnsubscribers.length > 0) {
+      this.streamUnsubscribers.pop()?.();
+    }
 
     if (this.readline) {
       this.readline.removeAllListeners();
@@ -265,12 +297,16 @@ export class AcpJsonRpcTransport {
       return;
     }
 
-    let message: JsonRpcMessage;
+    let parsed: unknown;
     try {
-      message = JSON.parse(line) as JsonRpcMessage;
+      parsed = JSON.parse(line) as unknown;
     } catch {
       return;
     }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return;
+    }
+    const message = parsed as JsonRpcMessage;
 
     if ('id' in message && !('method' in message)) {
       this.handleResponse(message);
@@ -318,7 +354,7 @@ export class AcpJsonRpcTransport {
     }
 
     for (const handler of handlers) {
-      void Promise.resolve(handler(message.params)).catch(() => {
+      void Promise.resolve().then(() => handler(message.params)).catch(() => {
         // Notification failures are non-fatal to the transport.
       });
     }
@@ -327,7 +363,7 @@ export class AcpJsonRpcTransport {
   private handleRequest(message: JsonRpcRequestMessage): void {
     const handler = this.requestHandlers.get(message.method);
     if (!handler) {
-      this.sendRaw({
+      this.trySendRaw({
         error: {
           code: -32601,
           message: `Unhandled server request: ${message.method}`,
@@ -338,12 +374,12 @@ export class AcpJsonRpcTransport {
       return;
     }
 
-    void Promise.resolve(handler(message.params)).then(
+    void Promise.resolve().then(() => handler(message.params)).then(
       (result) => {
-        this.sendRaw({ id: message.id, jsonrpc: '2.0', result });
+        this.trySendRaw({ id: message.id, jsonrpc: '2.0', result });
       },
       (error) => {
-        this.sendRaw({
+        this.trySendRaw({
           error: {
             code: -32603,
             message: error instanceof Error ? error.message : 'Internal error',
@@ -361,4 +397,35 @@ export class AcpJsonRpcTransport {
     }
     this.streams.output.write(`${JSON.stringify(message)}\n`);
   }
+
+  private trySendRaw(message: JsonRpcMessage): void {
+    try {
+      this.sendRaw(message);
+    } catch (error) {
+      const transportError = error instanceof Error ? error : new Error(String(error));
+      this.dispose(transportError);
+    }
+  }
+}
+
+type StreamWithEvents = {
+  off?: (eventName: string, listener: (...args: unknown[]) => void) => void;
+  on?: (eventName: string, listener: (...args: unknown[]) => void) => void;
+  removeListener?: (eventName: string, listener: (...args: unknown[]) => void) => void;
+};
+
+function subscribeStreamEvent(
+  stream: NodeJS.ReadableStream | NodeJS.WritableStream,
+  eventName: string,
+  listener: (...args: unknown[]) => void,
+): () => void {
+  const evented = stream as StreamWithEvents;
+  evented.on?.(eventName, listener);
+  return () => {
+    if (typeof evented.off === 'function') {
+      evented.off(eventName, listener);
+      return;
+    }
+    evented.removeListener?.(eventName, listener);
+  };
 }

@@ -1,10 +1,16 @@
 import '@/providers';
 
+import {
+  TEST_CODEX_CATALOG,
+  TEST_CODEX_MODEL,
+  TEST_CODEX_MODEL_LABEL,
+} from '@test/helpers/codexModels';
 import { createMockEl } from '@test/helpers/mockElement';
 import { Notice, Platform } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { SelectionController } from '@/features/chat/controllers/SelectionController';
 import { ChatState } from '@/features/chat/state/ChatState';
 import {
   activateTab,
@@ -17,14 +23,13 @@ import {
   initializeTabService,
   initializeTabUI,
   onProviderAvailabilityChanged,
+  recycleTabRuntime,
   setupServiceCallbacks,
   type TabCreateOptions,
+  updatePlanModeUI,
   wireTabInputEvents,
 } from '@/features/chat/tabs/Tab';
-import {
-  DEFAULT_CODEX_PRIMARY_MODEL,
-  DEFAULT_CODEX_PRIMARY_MODEL_LABEL,
-} from '@/providers/codex/types/models';
+import { TEXTAREA_BASE_MIN_HEIGHT } from '@/features/chat/ui/textareaResize';
 import * as envUtils from '@/utils/env';
 
 // Mock ResizeObserver (not available in jsdom)
@@ -201,7 +206,7 @@ let mockSelectionController: ReturnType<typeof createMockSelectionController>;
 let mockBrowserSelectionController: ReturnType<typeof createMockBrowserSelectionController>;
 let mockCanvasSelectionController: ReturnType<typeof createMockCanvasSelectionController>;
 let mockStreamController: { onAsyncSubagentStateChange: jest.Mock };
-let mockConversationController: { save: jest.Mock };
+let mockConversationController: { save: jest.Mock; rewind: jest.Mock };
 let mockInputController: ReturnType<typeof createMockInputController>;
 let mockNavigationController: { initialize: jest.Mock; dispose: jest.Mock };
 
@@ -342,7 +347,10 @@ jest.mock('@/features/chat/controllers/StreamController', () => ({
 
 jest.mock('@/features/chat/controllers/ConversationController', () => ({
   ConversationController: jest.fn().mockImplementation(() => {
-    mockConversationController = { save: jest.fn().mockResolvedValue(undefined) };
+    mockConversationController = {
+      save: jest.fn().mockResolvedValue(undefined),
+      rewind: jest.fn().mockResolvedValue(undefined),
+    };
     return mockConversationController;
   }),
 }));
@@ -364,7 +372,7 @@ jest.mock('@/features/chat/controllers/NavigationController', () => ({
 // Mock services
 jest.mock('@/features/chat/services/SubagentManager', () => ({
   SubagentManager: jest.fn().mockImplementation(() => ({
-    orphanAllActive: jest.fn(),
+    orphanAllActive: jest.fn().mockReturnValue([]),
     setCallback: jest.fn(),
     clear: jest.fn(),
   })),
@@ -392,7 +400,15 @@ jest.mock('@/utils/path', () => ({
 function createMockPlugin(overrides: Record<string, any> = {}): any {
   const claudeAgentMentionProvider = { searchAgents: jest.fn().mockReturnValue([]) };
   const codexAgentMentionProvider = { searchAgents: jest.fn().mockReturnValue([]) };
-  return {
+  const { settings: settingsOverrides = {}, ...pluginOverrides } = overrides;
+  const defaultProviderConfigs = {
+    claude: {},
+    codex: {
+      enabled: true,
+      discoveredModels: TEST_CODEX_CATALOG,
+    },
+  };
+  const plugin: any = {
     app: {
       vault: {
         adapter: { basePath: '/test/vault' },
@@ -425,16 +441,28 @@ function createMockPlugin(overrides: Record<string, any> = {}): any {
       savedProviderThinkingBudget: {
         claude: 'low',
       },
+      ...settingsOverrides,
+      providerConfigs: {
+        ...defaultProviderConfigs,
+        ...(settingsOverrides.providerConfigs ?? {}),
+      },
     },
     mcpManager: { getMcpServers: jest.fn().mockReturnValue([]) },
     agentManager: claudeAgentMentionProvider,
     codexAgentMentionProvider,
     getConversationById: jest.fn().mockResolvedValue(null),
     getConversationSync: jest.fn().mockReturnValue(null),
+    updateConversation: jest.fn().mockResolvedValue(undefined),
     saveSettings: jest.fn().mockResolvedValue(undefined),
     getActiveEnvironmentVariables: jest.fn().mockReturnValue(''),
-    ...overrides,
+    ...pluginOverrides,
   };
+  plugin.mutateSettings = jest.fn(async (mutation: (settings: any) => void | Promise<void>) => {
+    await mutation(plugin.settings);
+    await plugin.saveSettings();
+  });
+  plugin.providerHost = plugin;
+  return plugin;
 }
 
 // Helper to create mock MCP manager
@@ -565,12 +593,12 @@ describe('Tab - Creation', () => {
 
     it('should derive the blank-tab provider from the default draft model', () => {
       const plugin = createMockPlugin();
-      plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
+      plugin.settings.model = TEST_CODEX_MODEL;
 
       const tab = createTab(createMockOptions({ plugin }));
 
       expect(tab.lifecycleState).toBe('blank');
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
       expect(tab.providerId).toBe('codex');
     });
 
@@ -579,12 +607,12 @@ describe('Tab - Creation', () => {
       // Top-level model is Claude, but Codex has its own saved model
       plugin.settings.model = 'claude-sonnet-4-5';
       plugin.settings.settingsProvider = 'claude';
-      plugin.settings.savedProviderModel = { claude: 'claude-sonnet-4-5', codex: DEFAULT_CODEX_PRIMARY_MODEL };
+      plugin.settings.savedProviderModel = { claude: 'claude-sonnet-4-5', codex: TEST_CODEX_MODEL };
 
       const tab = createTab(createMockOptions({ plugin, defaultProviderId: 'codex' }));
 
       expect(tab.lifecycleState).toBe('blank');
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
       expect(tab.providerId).toBe('codex');
     });
 
@@ -616,10 +644,10 @@ describe('Tab - Creation', () => {
     it('should keep a Claude custom gpt model on Claude when Codex is disabled', () => {
       const plugin = createMockPlugin();
       plugin.settings.settingsProvider = 'claude';
-      plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
+      plugin.settings.model = TEST_CODEX_MODEL;
       plugin.settings.providerConfigs = {
         claude: {
-          environmentVariables: `ANTHROPIC_MODEL=${DEFAULT_CODEX_PRIMARY_MODEL}`,
+          environmentVariables: `ANTHROPIC_MODEL=${TEST_CODEX_MODEL}`,
         },
         codex: {
           enabled: false,
@@ -629,7 +657,7 @@ describe('Tab - Creation', () => {
       const tab = createTab(createMockOptions({ plugin }));
 
       expect(tab.lifecycleState).toBe('blank');
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
       expect(tab.providerId).toBe('claude');
     });
 
@@ -645,7 +673,7 @@ describe('Tab - Creation', () => {
       };
       plugin.settings.savedProviderModel = {
         claude: 'opus',
-        codex: DEFAULT_CODEX_PRIMARY_MODEL,
+        codex: TEST_CODEX_MODEL,
       };
 
       const tab = createTab(createMockOptions({ plugin, defaultProviderId: 'codex' }));
@@ -751,6 +779,7 @@ describe('Tab - Service Initialization', () => {
         plugin,
         providerId: 'codex',
       }));
+      expect(tab.runtimeSupervisor.current).toBe(newService);
       expect(tab.service).toBe(newService);
     });
 
@@ -905,7 +934,7 @@ describe('Tab - Service Initialization', () => {
       initializeTabUI(tab, plugin);
 
       // Simulate blank tab with Codex draft model
-      tab.draftModel = DEFAULT_CODEX_PRIMARY_MODEL;
+      tab.draftModel = TEST_CODEX_MODEL;
       tab.providerId = 'codex';
       tab.lifecycleState = 'blank';
 
@@ -915,6 +944,7 @@ describe('Tab - Service Initialization', () => {
 
       // Disable Codex
       plugin.settings.codexEnabled = false;
+      plugin.settings.providerConfigs.codex.enabled = false;
 
       onProviderAvailabilityChanged(tab, plugin);
 
@@ -934,10 +964,10 @@ describe('Tab - Service Initialization', () => {
 
       const plugin = createMockPlugin();
       plugin.settings.settingsProvider = 'claude';
-      plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
+      plugin.settings.model = TEST_CODEX_MODEL;
       plugin.settings.providerConfigs = {
         claude: {
-          environmentVariables: `ANTHROPIC_MODEL=${DEFAULT_CODEX_PRIMARY_MODEL}`,
+          environmentVariables: `ANTHROPIC_MODEL=${TEST_CODEX_MODEL}`,
         },
         codex: {
           enabled: false,
@@ -947,13 +977,14 @@ describe('Tab - Service Initialization', () => {
       const tab = createTab(createMockOptions({ plugin }));
       initializeTabUI(tab, plugin);
 
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
       expect(tab.providerId).toBe('claude');
 
       plugin.settings.providerConfigs = {
         ...plugin.settings.providerConfigs,
         codex: {
           enabled: true,
+          discoveredModels: TEST_CODEX_CATALOG,
         },
       };
 
@@ -964,7 +995,7 @@ describe('Tab - Service Initialization', () => {
       expect(createTitleGenerationServiceSpy).not.toHaveBeenCalledWith(plugin, 'codex');
     });
 
-    it('surfaces provider-scoped model settings for inactive-provider tabs and saves back to that provider snapshot', async () => {
+    it('surfaces provider-scoped model settings for inactive-provider tabs and stores bound model changes on the conversation', async () => {
       const plugin = createMockPlugin({
         settings: {
           excludedTags: [],
@@ -982,7 +1013,7 @@ describe('Tab - Service Initialization', () => {
           codexEnabled: true,
           savedProviderModel: {
             claude: 'claude-sonnet-4-5',
-            codex: DEFAULT_CODEX_PRIMARY_MODEL,
+            codex: TEST_CODEX_MODEL,
           },
           savedProviderEffort: {
             claude: 'high',
@@ -1016,18 +1047,21 @@ describe('Tab - Service Initialization', () => {
       const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
       expect(toolbarCallbacks.getSettings()).toEqual(expect.objectContaining({
-        model: DEFAULT_CODEX_PRIMARY_MODEL,
+        model: TEST_CODEX_MODEL,
         effortLevel: 'medium',
       }));
 
-      await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+      await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
 
       expect(plugin.settings.model).toBe('claude-sonnet-4-5');
       expect(plugin.settings.savedProviderModel).toEqual(expect.objectContaining({
         claude: 'claude-sonnet-4-5',
-        codex: DEFAULT_CODEX_PRIMARY_MODEL,
+        codex: TEST_CODEX_MODEL,
       }));
-      expect(plugin.saveSettings).toHaveBeenCalled();
+      expect(plugin.updateConversation).toHaveBeenCalledWith('conv-codex-settings', {
+        selectedModel: TEST_CODEX_MODEL,
+      });
+      expect(plugin.saveSettings).not.toHaveBeenCalled();
     });
 
     it('maps shared permission mode selections onto managed OpenCode modes', async () => {
@@ -1103,6 +1137,50 @@ describe('Tab - Service Initialization', () => {
       expect(mockPermissionToggle.updateDisplay).toHaveBeenCalled();
     });
 
+    it('does not update plan-mode UI before the serialized settings mutation completes', async () => {
+      const plugin = createMockPlugin();
+      let releaseMutation!: () => void;
+      const mutationGate = new Promise<void>((resolve) => {
+        releaseMutation = resolve;
+      });
+      plugin.mutateSettings = jest.fn(async (mutation: (settings: any) => void) => {
+        await mutationGate;
+        mutation(plugin.settings);
+      });
+
+      const tab = createTab(createMockOptions({ plugin }));
+      tab.ui.permissionToggle = createMockPermissionToggle() as any;
+
+      const updatePromise = updatePlanModeUI(tab, plugin, 'plan');
+      await Promise.resolve();
+
+      expect(plugin.settings.permissionMode).toBe('yolo');
+      expect(tab.ui.permissionToggle!.updateDisplay).not.toHaveBeenCalled();
+
+      releaseMutation();
+      await updatePromise;
+
+      expect(plugin.settings.permissionMode).toBe('plan');
+      expect(tab.ui.permissionToggle!.updateDisplay).toHaveBeenCalledTimes(1);
+      expect(tab.dom.inputWrapper.hasClass('claudian-input-plan-mode')).toBe(true);
+    });
+
+    it('renders the in-memory permission mode when persistence fails after mutation', async () => {
+      const plugin = createMockPlugin();
+      plugin.mutateSettings = jest.fn(async (mutation: (settings: any) => void) => {
+        mutation(plugin.settings);
+        throw new Error('persist failed');
+      });
+      const tab = createTab(createMockOptions({ plugin }));
+      tab.ui.permissionToggle = createMockPermissionToggle() as any;
+
+      await expect(updatePlanModeUI(tab, plugin, 'plan')).rejects.toThrow('persist failed');
+
+      expect(plugin.settings.permissionMode).toBe('plan');
+      expect(tab.ui.permissionToggle!.updateDisplay).toHaveBeenCalledTimes(1);
+      expect(tab.dom.inputWrapper.hasClass('claudian-input-plan-mode')).toBe(true);
+    });
+
     it('resets to blank state when the new-conversation callback fires', () => {
       jest.spyOn(ProviderRegistry, 'createInstructionRefineService').mockReturnValue({ cancel: jest.fn(), resetConversation: jest.fn() } as any);
       jest.spyOn(ProviderRegistry, 'createTitleGenerationService').mockReturnValue({ cancel: jest.fn() } as any);
@@ -1139,7 +1217,7 @@ describe('Tab - Service Initialization', () => {
       jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
 
       const plugin = createMockPlugin();
-      plugin.settings.savedProviderModel = { claude: 'claude-sonnet-4-5', codex: DEFAULT_CODEX_PRIMARY_MODEL };
+      plugin.settings.savedProviderModel = { claude: 'claude-sonnet-4-5', codex: TEST_CODEX_MODEL };
       const tab = createTab(createMockOptions({ plugin }));
       initializeTabUI(tab, plugin);
       initializeTabControllers(tab, plugin, {} as any, createMockMcpManager());
@@ -1157,7 +1235,7 @@ describe('Tab - Service Initialization', () => {
       callback();
 
       expect(tab.lifecycleState).toBe('blank');
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
       expect(tab.providerId).toBe('codex');
     });
 
@@ -1167,7 +1245,7 @@ describe('Tab - Service Initialization', () => {
       jest.spyOn(ProviderRegistry, 'getTaskResultInterpreter').mockReturnValue({} as any);
 
       const plugin = createMockPlugin();
-      plugin.settings.savedProviderModel = { claude: 'claude-sonnet-4-5', codex: DEFAULT_CODEX_PRIMARY_MODEL };
+      plugin.settings.savedProviderModel = { claude: 'claude-sonnet-4-5', codex: TEST_CODEX_MODEL };
       const tab = createTab(createMockOptions({ plugin }));
       initializeTabUI(tab, plugin);
       initializeTabControllers(tab, plugin, {} as any, createMockMcpManager());
@@ -1191,7 +1269,7 @@ describe('Tab - Service Initialization', () => {
       expect(tab.serviceInitialized).toBe(false);
       expect(tab.lifecycleState).toBe('blank');
       expect(tab.providerId).toBe('codex');
-      expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+      expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
     });
   });
 });
@@ -1243,9 +1321,6 @@ describe('Tab - Event Wiring', () => {
       const inputListeners = (tab.dom.inputEl as any).getEventListeners();
       expect(inputListeners.get('keydown')).toBeDefined();
       expect(inputListeners.get('input')).toBeDefined();
-      // focusin is registered on contentEl (not inputEl) to catch focus on any sidebar element
-      const contentListeners = (tab.dom.contentEl as any).getEventListeners();
-      expect(contentListeners.get('focusin')).toBeDefined();
     });
 
     it('should store cleanup functions for memory management', () => {
@@ -1258,7 +1333,7 @@ describe('Tab - Event Wiring', () => {
 
       wireTabInputEvents(tab, options.plugin);
 
-      expect(tab.dom.eventCleanups.length).toBe(4); // keydown, input, focus, scroll
+      expect(tab.dom.eventCleanups.length).toBe(3); // keydown, input, scroll
     });
   });
 });
@@ -1335,6 +1410,106 @@ describe('Tab - Destruction', () => {
       expect(tab.service).toBeNull();
     });
 
+    it('drains background work and persists orphaned tasks before recycling the runtime', async () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const cleanup = jest.fn();
+      const orphanAllActive = jest.fn().mockReturnValue([{}]);
+      const clear = jest.fn();
+      const save = jest.fn().mockResolvedValue(undefined);
+      let releaseWork!: () => void;
+
+      tab.conversationId = 'conversation-1';
+      tab.state.currentConversationId = 'conversation-1';
+      tab.lifecycleState = 'bound_active';
+      tab.serviceInitialized = true;
+      tab.service = { cleanup } as any;
+      tab.services.subagentManager = { orphanAllActive, clear } as any;
+      tab.controllers.conversationController = { save } as any;
+      tab.session.enqueueBackgroundWork(() => new Promise<void>((resolve) => {
+        releaseWork = resolve;
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const recycling = recycleTabRuntime(tab);
+      await Promise.resolve();
+      expect(cleanup).not.toHaveBeenCalled();
+
+      releaseWork();
+      await recycling;
+
+      expect(orphanAllActive).toHaveBeenCalled();
+      expect(save).toHaveBeenCalledWith(false);
+      expect(clear).toHaveBeenCalled();
+      expect(cleanup).toHaveBeenCalled();
+      expect(tab.service).toBeNull();
+      expect(tab.lifecycleState).toBe('bound_cold');
+      expect(save.mock.invocationCallOrder[0]).toBeLessThan(cleanup.mock.invocationCallOrder[0]);
+    });
+
+    it('resets invalidated streaming state after recycling an active runtime', async () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const cancel = jest.fn();
+      const cleanup = jest.fn();
+      const resetStreamingState = jest.fn();
+      let resolveTurn!: () => void;
+
+      tab.lifecycleState = 'bound_active';
+      tab.serviceInitialized = true;
+      tab.state.isStreaming = true;
+      tab.state.cancelRequested = false;
+      tab.service = { cancel, cleanup } as any;
+      tab.controllers.streamController = { resetStreamingState } as any;
+      tab.session.activeTurn = new Promise<void>((resolve) => {
+        resolveTurn = resolve;
+      });
+
+      const recycling = recycleTabRuntime(tab);
+      await Promise.resolve();
+
+      expect(cancel).toHaveBeenCalled();
+      expect(tab.state.isStreaming).toBe(true);
+      expect(tab.state.isSwitchingConversation).toBe(true);
+
+      resolveTurn();
+      await recycling;
+
+      expect(resetStreamingState).toHaveBeenCalled();
+      expect(tab.state.isStreaming).toBe(false);
+      expect(tab.state.cancelRequested).toBe(false);
+      expect(tab.state.isSwitchingConversation).toBe(false);
+    });
+
+    it('should cancel and await the active turn before removing the tab DOM', async () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const cancel = jest.fn();
+      const cleanup = jest.fn();
+      const removeSpy = jest.spyOn(tab.dom.contentEl, 'remove');
+      let resolveTurn!: () => void;
+      tab.session.activeTurn = new Promise<void>((resolve) => {
+        resolveTurn = resolve;
+      });
+      tab.state.isStreaming = true;
+      tab.service = { cancel, cleanup } as any;
+
+      const destruction = destroyTab(tab);
+      await Promise.resolve();
+
+      expect(cancel).toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(removeSpy).not.toHaveBeenCalled();
+
+      resolveTurn();
+      await destruction;
+
+      expect(cleanup).toHaveBeenCalled();
+      expect(removeSpy).toHaveBeenCalled();
+      expect(tab.service).toBeNull();
+    });
+
     it('should remove DOM element', async () => {
       const options = createMockOptions();
       const tab = createTab(options);
@@ -1349,7 +1524,7 @@ describe('Tab - Destruction', () => {
       const options = createMockOptions();
       const tab = createTab(options);
 
-      const orphanAllActive = jest.fn();
+      const orphanAllActive = jest.fn().mockReturnValue([]);
       const clear = jest.fn();
       tab.services.subagentManager = { orphanAllActive, clear } as any;
 
@@ -1357,6 +1532,41 @@ describe('Tab - Destruction', () => {
 
       expect(orphanAllActive).toHaveBeenCalled();
       expect(clear).toHaveBeenCalled();
+    });
+
+    it('persists orphaned subagents before clearing tab state', async () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const orphanAllActive = jest.fn().mockReturnValue([{}]);
+      const clear = jest.fn();
+      const save = jest.fn().mockResolvedValue(undefined);
+      tab.state.currentConversationId = 'conversation-1';
+      tab.services.subagentManager = { orphanAllActive, clear } as any;
+      tab.controllers.conversationController = { save } as any;
+
+      await destroyTab(tab);
+
+      expect(save).toHaveBeenCalledWith(false);
+      expect(orphanAllActive.mock.invocationCallOrder[0]).toBeLessThan(save.mock.invocationCallOrder[0]);
+      expect(save.mock.invocationCallOrder[0]).toBeLessThan(clear.mock.invocationCallOrder[0]);
+    });
+
+    it('retries conversation persistence before clearing terminal subagent state', async () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const clear = jest.fn();
+      const save = jest.fn().mockResolvedValue(undefined);
+      tab.state.currentConversationId = 'conversation-1';
+      tab.services.subagentManager = {
+        orphanAllActive: jest.fn().mockReturnValue([]),
+        clear,
+      } as any;
+      tab.controllers.conversationController = { save } as any;
+
+      await destroyTab(tab);
+
+      expect(save).toHaveBeenCalledWith(false);
+      expect(save.mock.invocationCallOrder[0]).toBeLessThan(clear.mock.invocationCallOrder[0]);
     });
 
     it('should cleanup UI components', async () => {
@@ -1405,6 +1615,11 @@ describe('Tab - Service Callbacks', () => {
       });
       const scrollToBottom = jest.fn();
       const handleStreamChunk = jest.fn().mockResolvedValue(undefined);
+      const save = jest.fn().mockResolvedValue(undefined);
+
+      tab.conversationId = 'conversation-1';
+      tab.state.currentConversationId = 'conversation-1';
+      tab.lifecycleState = 'bound_active';
 
       Object.defineProperty(tab.dom.contentEl, 'isConnected', {
         value: true,
@@ -1425,6 +1640,7 @@ describe('Tab - Service Callbacks', () => {
         finalizeCurrentTextBlock: jest.fn().mockResolvedValue(undefined),
         hideThinkingIndicator: jest.fn(),
       } as any;
+      tab.controllers.conversationController = { save } as any;
       tab.controllers.inputController = {
         handleApprovalRequest: jest.fn(),
         dismissPendingApproval: jest.fn(),
@@ -1432,7 +1648,6 @@ describe('Tab - Service Callbacks', () => {
         handleExitPlanMode: jest.fn(),
       } as any;
       tab.services.subagentManager = {
-        hasRunningSubagents: jest.fn().mockReturnValue(false),
         resetStreamingState: jest.fn(),
       } as any;
 
@@ -1441,20 +1656,120 @@ describe('Tab - Service Callbacks', () => {
         setApprovalDismisser: jest.fn(),
         setAskUserQuestionCallback: jest.fn(),
         setExitPlanModeCallback: jest.fn(),
-        setSubagentHookProvider: jest.fn(),
+        setAsyncSubagentCompletionCallback: jest.fn(),
         setAutoTurnCallback: jest.fn(),
         setPermissionModeSyncCallback: jest.fn(),
+        getSessionId: jest.fn().mockReturnValue('session-1'),
       };
       tab.service = service as any;
 
       setupServiceCallbacks(tab, plugin);
 
       const autoTurnCallback = service.setAutoTurnCallback.mock.calls[0][0];
-      return { tab, addMessageSpy, addMessage, handleStreamChunk, scrollToBottom, autoTurnCallback };
+      return {
+        tab,
+        service,
+        save,
+        addMessageSpy,
+        addMessage,
+        handleStreamChunk,
+        scrollToBottom,
+        autoTurnCallback,
+      };
     }
 
+    function setupCompletionTest() {
+      const plugin = createMockPlugin();
+      const tab = createTab(createMockOptions({ plugin }));
+      const handleAsyncSubagentCompletion = jest.fn().mockResolvedValue(true);
+      const save = jest.fn().mockResolvedValue(undefined);
+
+      tab.conversationId = 'conversation-1';
+      tab.state.currentConversationId = 'conversation-1';
+      tab.lifecycleState = 'bound_active';
+      tab.controllers.streamController = { handleAsyncSubagentCompletion } as any;
+      tab.controllers.conversationController = { save } as any;
+      tab.controllers.inputController = {
+        handleApprovalRequest: jest.fn(),
+        dismissPendingApproval: jest.fn(),
+        handleAskUserQuestion: jest.fn(),
+        handleExitPlanMode: jest.fn(),
+      } as any;
+
+      const service = {
+        setApprovalCallback: jest.fn(),
+        setApprovalDismisser: jest.fn(),
+        setAskUserQuestionCallback: jest.fn(),
+        setExitPlanModeCallback: jest.fn(),
+        setAsyncSubagentCompletionCallback: jest.fn(),
+        setAutoTurnCallback: jest.fn(),
+        setPermissionModeSyncCallback: jest.fn(),
+        getSessionId: jest.fn().mockReturnValue('session-1'),
+      };
+      tab.service = service as any;
+      setupServiceCallbacks(tab, plugin);
+
+      return {
+        tab,
+        service,
+        save,
+        handleAsyncSubagentCompletion,
+        completionCallback: service.setAsyncSubagentCompletionCallback.mock.calls[0][0],
+      };
+    }
+
+    it('serializes native subagent completion before saving the conversation', async () => {
+      const { completionCallback, handleAsyncSubagentCompletion, save } = setupCompletionTest();
+      const completion = {
+        type: 'async_subagent_completion',
+        providerSessionId: 'session-1',
+        taskId: 'agent-1',
+        toolUseId: 'task-1',
+        status: 'completed',
+        result: 'Done',
+      };
+
+      await completionCallback(completion);
+
+      expect(handleAsyncSubagentCompletion).toHaveBeenCalledWith(completion);
+      expect(save).toHaveBeenCalledWith(false);
+      expect(handleAsyncSubagentCompletion.mock.invocationCallOrder[0])
+        .toBeLessThan(save.mock.invocationCallOrder[0]);
+    });
+
+    it('ignores native completion from a different provider session', async () => {
+      const { completionCallback, handleAsyncSubagentCompletion, save } = setupCompletionTest();
+
+      await completionCallback({
+        type: 'async_subagent_completion',
+        providerSessionId: 'other-session',
+        taskId: 'agent-1',
+        status: 'completed',
+      });
+
+      expect(handleAsyncSubagentCompletion).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+    });
+
+    it('drains an accepted completion before a conversation transition', async () => {
+      const { tab, completionCallback, handleAsyncSubagentCompletion, save } = setupCompletionTest();
+      const completion = {
+        type: 'async_subagent_completion',
+        providerSessionId: 'session-1',
+        taskId: 'agent-1',
+        status: 'completed',
+      };
+
+      const pending = completionCallback(completion);
+      tab.state.isSwitchingConversation = true;
+      await pending;
+
+      expect(handleAsyncSubagentCompletion).toHaveBeenCalledWith(completion);
+      expect(save).toHaveBeenCalledWith(false);
+    });
+
     it('renders tool-only auto-triggered turns with a placeholder assistant message', async () => {
-      const { addMessageSpy, addMessage, handleStreamChunk, scrollToBottom, autoTurnCallback } = setupAutoTurnTest();
+      const { addMessageSpy, addMessage, handleStreamChunk, scrollToBottom, save, autoTurnCallback } = setupAutoTurnTest();
 
       await autoTurnCallback({
         chunks: [
@@ -1475,35 +1790,20 @@ describe('Tab - Service Callbacks', () => {
         expect.objectContaining({ role: 'assistant' })
       );
       expect(scrollToBottom).toHaveBeenCalled();
+      expect(save).toHaveBeenCalledWith(false);
     });
 
-    it('routes hidden async subagent auto-turn chunks without adding a placeholder message', async () => {
-      const { addMessageSpy, addMessage, handleStreamChunk, scrollToBottom, autoTurnCallback } = setupAutoTurnTest();
+    it('rejects an auto-triggered turn from a replaced runtime', async () => {
+      const { tab, addMessageSpy, save, autoTurnCallback } = setupAutoTurnTest();
+      tab.service = { getSessionId: jest.fn().mockReturnValue('session-1') } as any;
 
       await autoTurnCallback({
-        chunks: [
-          {
-            type: 'async_subagent_result',
-            agentId: 'agent-1',
-            status: 'completed',
-            result: 'Done',
-          },
-        ],
+        chunks: [{ type: 'text', content: 'Stale background result' }],
         metadata: {},
       });
 
-      expect(handleStreamChunk).toHaveBeenCalledWith(
-        {
-          type: 'async_subagent_result',
-          agentId: 'agent-1',
-          status: 'completed',
-          result: 'Done',
-        },
-        expect.objectContaining({ role: 'assistant' })
-      );
       expect(addMessageSpy).not.toHaveBeenCalled();
-      expect(addMessage).not.toHaveBeenCalled();
-      expect(scrollToBottom).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
     });
 
     it('skips auto-triggered rendering after the tab DOM is detached', async () => {
@@ -1605,14 +1905,14 @@ describe('Tab - UI Initialization', () => {
       expect(tab.ui.imageContextManager).toBeDefined();
     });
 
-    it('should create selection indicator element', () => {
+    it('should create a composer-owned context tray', () => {
       const options = createMockOptions();
       const tab = createTab(options);
 
       initializeTabUI(tab, options.plugin);
 
-      expect(tab.dom.selectionIndicatorEl).toBeDefined();
-      expect(tab.dom.selectionIndicatorEl!.style.display).toBe('none');
+      expect(tab.ui.contextTray).toBeDefined();
+      expect(tab.dom.contextRowEl.hasClass('has-content')).toBe(false);
     });
 
     it('should create SlashCommandDropdown', () => {
@@ -1772,6 +2072,26 @@ describe('Tab - Controller Initialization', () => {
       expect(tab.controllers.selectionController).toBeDefined();
     });
 
+    it('should include shared view controls in the selection focus scope', () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const sharedFocusScopeEl = createMockEl();
+      const mockComponent = {
+        getSharedSelectionFocusScopeEls: jest.fn(() => [sharedFocusScopeEl]),
+      } as any;
+
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
+
+      expect(SelectionController).toHaveBeenCalledWith(
+        options.plugin.app,
+        tab.ui.contextTray,
+        tab.dom.inputEl,
+        undefined,
+        [tab.dom.contentEl, tab.dom.inputComposerEl, sharedFocusScopeEl],
+      );
+    });
+
     it('should create StreamController', () => {
       const options = createMockOptions();
       const tab = createTab(options);
@@ -1792,6 +2112,23 @@ describe('Tab - Controller Initialization', () => {
       initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
 
       expect(tab.controllers.conversationController).toBeDefined();
+    });
+
+    it('should forward rewind mode from renderer to ConversationController', async () => {
+      const options = createMockOptions();
+      const tab = createTab(options);
+      const mockComponent = {} as any;
+
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, mockComponent, options.mcpManager);
+
+      const { MessageRenderer } = jest.requireMock('@/features/chat/rendering/MessageRenderer') as { MessageRenderer: jest.Mock };
+      const lastCall = MessageRenderer.mock.calls[MessageRenderer.mock.calls.length - 1];
+      const rewindCallback = lastCall[3];
+
+      await rewindCallback('message-1', 'conversation');
+
+      expect(mockConversationController.rewind).toHaveBeenCalledWith('message-1', 'conversation');
     });
 
     it('should create InputController', () => {
@@ -1829,7 +2166,7 @@ describe('Tab - Controller Initialization', () => {
       expect(tab.services.subagentManager).toBeDefined();
     });
 
-    it('persists async subagent state changes when not streaming', async () => {
+    it('updates async subagent state without starting an unowned save', async () => {
       const options = createMockOptions();
       const tab = createTab(options);
       const mockComponent = {} as any;
@@ -1859,7 +2196,7 @@ describe('Tab - Controller Initialization', () => {
       await Promise.resolve();
 
       expect(mockStreamController.onAsyncSubagentStateChange).toHaveBeenCalled();
-      expect(mockConversationController.save).toHaveBeenCalledWith(false);
+      expect(mockConversationController.save).not.toHaveBeenCalled();
     });
 
     it('does not persist async subagent state while main stream is active', async () => {
@@ -2247,25 +2584,6 @@ describe('Tab - Event Handler Behavior', () => {
     });
   });
 
-  describe('wireTabInputEvents - focus handler', () => {
-    it('should show selection highlight on focusin (any sidebar element)', () => {
-      const options = createMockOptions();
-      const tab = createTab(options);
-
-      tab.controllers.selectionController = mockSelectionController as any;
-      tab.controllers.inputController = mockInputController as any;
-
-      wireTabInputEvents(tab, options.plugin);
-
-      const listeners = (tab.dom.contentEl as any).getEventListeners();
-      const focusHandler = listeners.get('focusin')[0];
-      // Simulate focus entering from outside (relatedTarget is null)
-      focusHandler({ relatedTarget: null });
-
-      expect(mockSelectionController.showHighlight).toHaveBeenCalled();
-    });
-  });
-
   describe('wireTabInputEvents - input handlers', () => {
     it('should not call FileContextManager.handleInputChange when bang-bash mode is active', () => {
       const options = createMockOptions();
@@ -2335,7 +2653,7 @@ describe('Tab - UI Callback Wiring', () => {
   });
 
   describe('initializeTabUI callbacks', () => {
-    it('should wire onChipsChanged to scroll to bottom', () => {
+    it('should scroll to bottom when note context changes', () => {
       const options = createMockOptions();
       const tab = createTab(options);
 
@@ -2345,18 +2663,16 @@ describe('Tab - UI Callback Wiring', () => {
       // Set up renderer
       tab.renderer = mockMessageRenderer as any;
 
-      // Get the FileContextManager constructor call arguments
-      const { FileContextManager } = jest.requireMock('@/features/chat/ui/FileContext');
-      const constructorCall = FileContextManager.mock.calls[0];
-      const callbacks = constructorCall[3]; // 4th argument is callbacks
-
-      // Trigger onChipsChanged callback
-      callbacks.onChipsChanged();
+      tab.ui.contextTray?.setItems('current-note', [{
+        id: 'note',
+        kind: 'note',
+        label: 'Note.md',
+      }]);
 
       expect(mockMessageRenderer.scrollToBottomIfNeeded).toHaveBeenCalled();
     });
 
-    it('should wire onImagesChanged to scroll to bottom', () => {
+    it('should scroll to bottom when image context changes', () => {
       const options = createMockOptions();
       const tab = createTab(options);
 
@@ -2364,12 +2680,11 @@ describe('Tab - UI Callback Wiring', () => {
 
       tab.renderer = mockMessageRenderer as any;
 
-      // Get the ImageContextManager constructor call
-      const { ImageContextManager } = jest.requireMock('@/features/chat/ui/ImageContext');
-      const constructorCall = ImageContextManager.mock.calls[0];
-      const callbacks = constructorCall[2]; // 3rd argument is callbacks (app parameter was removed)
-
-      callbacks.onImagesChanged();
+      tab.ui.contextTray?.setItems('images', [{
+        id: 'image',
+        kind: 'image',
+        label: 'image.png',
+      }]);
 
       expect(mockMessageRenderer.scrollToBottomIfNeeded).toHaveBeenCalled();
     });
@@ -2607,7 +2922,7 @@ describe('Tab - UI Callback Wiring', () => {
       const plugin = createMockPlugin({
         settings: {
           excludedTags: [],
-          model: DEFAULT_CODEX_PRIMARY_MODEL,
+          model: TEST_CODEX_MODEL,
           thinkingBudget: 'low',
           effortLevel: 'high',
           permissionMode: 'yolo',
@@ -2621,7 +2936,7 @@ describe('Tab - UI Callback Wiring', () => {
           codexEnabled: true,
           savedProviderModel: {
             claude: 'claude-sonnet-4-5',
-            codex: DEFAULT_CODEX_PRIMARY_MODEL,
+            codex: TEST_CODEX_MODEL,
           },
           savedProviderEffort: {
             claude: 'high',
@@ -2667,6 +2982,7 @@ describe('Tab - Service Initialization Error Handling', () => {
     await initializeTabService(tab, options.plugin, options.mcpManager);
 
     // Should not change existing service
+    expect(tab.runtimeSupervisor.current).toBe(originalService);
     expect(tab.service).toBe(originalService);
     expect(tab.serviceInitialized).toBe(true);
   });
@@ -2751,6 +3067,26 @@ describe('Tab - Controller Configuration', () => {
       expect(config.getInstructionModeManager()).toBe(tab.ui.instructionModeManager);
       expect(config.getInstructionRefineService()).toBe(tab.services.instructionRefineService);
       expect(config.getTitleGenerationService()).toBe(tab.services.titleGenerationService);
+    });
+
+    it('should reset a grown composer to its default height after the input is cleared', () => {
+      const { InputController } = jest.requireMock('@/features/chat/controllers/InputController');
+      const options = createMockOptions();
+      const tab = createTab(options);
+
+      initializeTabUI(tab, options.plugin);
+      initializeTabControllers(tab, options.plugin, {} as any, options.mcpManager);
+
+      const constructorCall = InputController.mock.calls[0];
+      const config = constructorCall[0];
+      const inputStyle = tab.dom.inputEl.style as unknown as Record<string, string>;
+      tab.dom.inputEl.value = '';
+      inputStyle['--claudian-textarea-min-height'] = '240px';
+
+      config.resetInputHeight();
+
+      expect(inputStyle['--claudian-textarea-min-height'])
+        .toBe(`${TEXTAREA_BASE_MIN_HEIGHT}px`);
     });
 
   });
@@ -3478,7 +3814,7 @@ describe('Tab - Blank Tab Model Selector', () => {
       { value: 'sonnet', label: 'Sonnet' },
     ];
     const codexModels = [
-      { value: DEFAULT_CODEX_PRIMARY_MODEL, label: DEFAULT_CODEX_PRIMARY_MODEL_LABEL },
+      { value: TEST_CODEX_MODEL, label: TEST_CODEX_MODEL_LABEL },
     ];
 
     jest.spyOn(ProviderRegistry, 'getEnabledProviderIds').mockReturnValue(['codex', 'claude']);
@@ -3495,6 +3831,30 @@ describe('Tab - Blank Tab Model Selector', () => {
       ...codexModels.map(m => ({ ...m, group: 'Codex' })),
       ...claudeModels.map(m => ({ ...m, group: 'Claude' })),
     ]);
+  });
+
+  it('includes Codex models for blank tabs even when saved provider state is Claude-only', () => {
+    const result = getBlankTabModelOptions({
+      settingsProvider: 'claude',
+      model: 'haiku',
+      savedProviderModel: {
+        claude: 'haiku',
+      },
+      providerConfigs: {
+        claude: {},
+        codex: {
+          enabled: true,
+          discoveredModels: TEST_CODEX_CATALOG,
+        },
+      },
+    });
+
+    expect(result).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        value: TEST_CODEX_MODEL,
+        group: 'Codex',
+      }),
+    ]));
   });
 });
 
@@ -3521,7 +3881,7 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     expect(toolbarCallbacks).toBeDefined();
 
     // Attempt cross-provider model change (Claude -> Codex)
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
 
     // Should show a Notice rejecting it
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('Cannot switch provider'));
@@ -3565,7 +3925,10 @@ describe('Tab - Cross-Provider Model Rejection', () => {
     await toolbarCallbacks.onModelChange('opus');
 
     expect(Notice).not.toHaveBeenCalled();
-    expect(plugin.saveSettings).toHaveBeenCalled();
+    expect(plugin.updateConversation).toHaveBeenCalledWith('conv-1', {
+      selectedModel: 'opus',
+    });
+    expect(plugin.saveSettings).not.toHaveBeenCalled();
   });
 });
 
@@ -3600,9 +3963,9 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     // Switch to Codex model on blank tab
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
 
-    expect(tab.draftModel).toBe(DEFAULT_CODEX_PRIMARY_MODEL);
+    expect(tab.draftModel).toBe(TEST_CODEX_MODEL);
     expect(tab.providerId).toBe('codex');
     // No runtime should have been created
     expect(tab.service).toBeNull();
@@ -3638,7 +4001,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
 
     mockServiceTierToggle.updateDisplay.mockClear();
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
 
     expect(mockServiceTierToggle.updateDisplay).toHaveBeenCalled();
   });
@@ -3744,12 +4107,12 @@ describe('Tab - Blank Tab Draft Model Change', () => {
 
     const plugin = createMockPlugin();
     plugin.settings.settingsProvider = 'codex';
-    plugin.settings.model = DEFAULT_CODEX_PRIMARY_MODEL;
+    plugin.settings.model = TEST_CODEX_MODEL;
     plugin.settings.effortLevel = 'medium';
     plugin.settings.serviceTier = 'fast';
     plugin.settings.savedProviderModel = {
       claude: 'claude-sonnet-4-5',
-      codex: DEFAULT_CODEX_PRIMARY_MODEL,
+      codex: TEST_CODEX_MODEL,
     };
     plugin.settings.savedProviderEffort = {
       claude: 'high',
@@ -3775,7 +4138,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     await toolbarCallbacks.onModelChange('gpt-5.4-mini');
     expect(plugin.settings.savedProviderServiceTier.codex).toBe('fast');
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
     expect(plugin.settings.savedProviderServiceTier.codex).toBe('fast');
   });
 
@@ -3851,7 +4214,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
     // Switch to Codex model → should swap catalog
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
 
     expect(setProviderCatalogSpy).toHaveBeenCalledTimes(1);
     const [config, getEntries] = setProviderCatalogSpy.mock.calls[0];
@@ -3914,7 +4277,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
         codexEnabled: true,
         savedProviderModel: {
           claude: 'claude-sonnet-4-5',
-          codex: DEFAULT_CODEX_PRIMARY_MODEL,
+          codex: TEST_CODEX_MODEL,
         },
         savedProviderEffort: {
           claude: 'high',
@@ -3943,7 +4306,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     };
     const toolbarCallbacks = toolbarModule.createInputToolbar.mock.calls.at(-1)?.[1];
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
 
     expect(setHiddenCommandsSpy).toHaveBeenCalledWith(new Set(['analyze']));
   });
@@ -3983,7 +4346,7 @@ describe('Tab - Blank Tab Draft Model Change', () => {
     const initialInstructionCalls = createInstructionRefineServiceSpy.mock.calls.length;
     const initialTitleCalls = createTitleGenerationServiceSpy.mock.calls.length;
 
-    await toolbarCallbacks.onModelChange(DEFAULT_CODEX_PRIMARY_MODEL);
+    await toolbarCallbacks.onModelChange(TEST_CODEX_MODEL);
     await toolbarCallbacks.onModelChange('opus');
 
     expect(staleService.cleanup).toHaveBeenCalledTimes(1);
@@ -4025,7 +4388,7 @@ describe('Tab - First Send Binding', () => {
     const plugin = createMockPlugin();
     const tab = createTab(createMockOptions({ plugin }));
 
-    tab.draftModel = DEFAULT_CODEX_PRIMARY_MODEL;
+    tab.draftModel = TEST_CODEX_MODEL;
     tab.providerId = 'codex';
     tab.lifecycleState = 'blank';
 
@@ -4126,7 +4489,7 @@ describe('Tab - History Bind Without Runtime', () => {
         codexEnabled: true,
         savedProviderModel: {
           claude: 'claude-sonnet-4-5',
-          codex: DEFAULT_CODEX_PRIMARY_MODEL,
+          codex: TEST_CODEX_MODEL,
         },
         savedProviderEffort: {
           claude: 'high',

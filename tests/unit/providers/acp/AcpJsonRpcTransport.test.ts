@@ -8,8 +8,10 @@ import {
 
 interface TransportHarness {
   close: () => void;
+  closeInput: () => void;
+  closeOutput: () => void;
   nextOutbound: () => Promise<Record<string, unknown>>;
-  sendInbound: (message: Record<string, unknown>) => void;
+  sendInbound: (message: unknown) => void;
   transport: AcpJsonRpcTransport;
 }
 
@@ -35,6 +37,12 @@ function createTransportHarness(): TransportHarness {
       reader.close();
       input.end();
       output.end();
+    },
+    closeInput: () => {
+      input.end();
+    },
+    closeOutput: () => {
+      output.destroy();
     },
     nextOutbound: () => {
       if (queued.length > 0) {
@@ -144,5 +152,72 @@ describe('AcpJsonRpcTransport', () => {
     harness.transport.dispose(new Error('transport stopped'));
 
     await expect(requestPromise).rejects.toThrow('transport stopped');
+  });
+
+  it('rejects pending requests when input closes', async () => {
+    const requestPromise = harness.transport.request('session/prompt', {
+      prompt: [{ text: 'hi', type: 'text' }],
+      sessionId: 'session-1',
+    }, {
+      timeoutMs: 0,
+    });
+
+    await harness.nextOutbound();
+    harness.closeInput();
+
+    await expect(requestPromise).rejects.toThrow('JSON-RPC input closed');
+    expect(harness.transport.isClosed).toBe(true);
+  });
+
+  it('rejects pending requests when output closes', async () => {
+    const requestPromise = harness.transport.request('session/prompt', {
+      prompt: [{ text: 'hi', type: 'text' }],
+      sessionId: 'session-1',
+    }, {
+      timeoutMs: 0,
+    });
+
+    await harness.nextOutbound();
+    harness.closeOutput();
+
+    await expect(requestPromise).rejects.toThrow('JSON-RPC output closed');
+    expect(harness.transport.isClosed).toBe(true);
+  });
+
+  it.each([null, true, 42, 'text'])('ignores parsed JSON primitive %p', async (primitive) => {
+    harness.transport.start();
+    harness.sendInbound(primitive);
+
+    const request = harness.transport.request('session/new', {});
+    const outbound = await harness.nextOutbound();
+    harness.sendInbound({ id: outbound.id, jsonrpc: '2.0', result: 'ok' });
+
+    await expect(request).resolves.toBe('ok');
+  });
+
+  it('contains synchronous notification handler exceptions', async () => {
+    harness.transport.start();
+    const workingHandler = jest.fn();
+    harness.transport.onNotification('throwing', () => { throw new Error('handler failed'); });
+    harness.transport.onNotification('working', workingHandler);
+
+    harness.sendInbound({ jsonrpc: '2.0', method: 'throwing' });
+    harness.sendInbound({ jsonrpc: '2.0', method: 'working', params: { ok: true } });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(workingHandler).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('turns a synchronous request handler exception into an error response', async () => {
+    harness.transport.start();
+    harness.transport.onRequest('throwing/request', (() => {
+      throw new Error('synchronous failure');
+    }) as any);
+    harness.sendInbound({ id: 9, jsonrpc: '2.0', method: 'throwing/request' });
+
+    await expect(harness.nextOutbound()).resolves.toMatchObject({
+      error: { code: -32603, message: 'synchronous failure' },
+      id: 9,
+    });
   });
 });

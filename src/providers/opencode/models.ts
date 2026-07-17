@@ -1,3 +1,8 @@
+import {
+  DEFAULT_REASONING_VALUE,
+  resolvePreferredReasoningDefault,
+} from '../../core/providers/reasoning';
+
 export interface OpencodeDiscoveredModel {
   description?: string;
   label: string;
@@ -9,6 +14,8 @@ export interface OpencodeModelVariant {
   label: string;
   value: string;
 }
+
+export type OpencodeThinkingOptionsByModel = Record<string, OpencodeModelVariant[]>;
 
 export interface OpencodeBaseModel {
   description?: string;
@@ -40,6 +47,19 @@ const OPENCODE_VARIANT_ASCENDING_RANK = new Map<string, number>(
   OPENCODE_VARIANT_ASCENDING_ORDER.map((value, index) => [value, index] as const),
 );
 
+export function resolveOpencodeDefaultThinkingLevel(
+  options: OpencodeModelVariant[],
+  preferredValue?: string,
+  fallbackValue: string = DEFAULT_REASONING_VALUE,
+): string {
+  const values = options.map(option => option.value);
+  if (preferredValue && (values.length === 0 || values.includes(preferredValue))) {
+    return preferredValue;
+  }
+
+  return resolvePreferredReasoningDefault(values, fallbackValue);
+}
+
 export function isOpencodeModelSelectionId(model: string): boolean {
   return model === OPENCODE_SYNTHETIC_MODEL_ID || model.startsWith(OPENCODE_MODEL_PREFIX);
 }
@@ -65,15 +85,16 @@ export function normalizeOpencodeDiscoveredModels(value: unknown): OpencodeDisco
 
   const normalized: OpencodeDiscoveredModel[] = [];
   const seen = new Set<string>();
-  for (const entry of value) {
+  for (const entry of value as unknown[]) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       continue;
     }
+    const record = entry as Record<string, unknown>;
 
-    const rawId = typeof entry.rawId === 'string' ? entry.rawId.trim() : '';
-    const label = typeof entry.label === 'string' ? entry.label.trim() : rawId;
-    const description = typeof entry.description === 'string'
-      ? entry.description.trim()
+    const rawId = typeof record.rawId === 'string' ? record.rawId.trim() : '';
+    const label = typeof record.label === 'string' ? record.label.trim() : rawId;
+    const description = typeof record.description === 'string'
+      ? record.description.trim()
       : '';
 
     if (!rawId || seen.has(rawId)) {
@@ -86,6 +107,65 @@ export function normalizeOpencodeDiscoveredModels(value: unknown): OpencodeDisco
       label: label || rawId,
       rawId,
     });
+  }
+
+  return normalized;
+}
+
+export function normalizeOpencodeModelVariants(value: unknown): OpencodeModelVariant[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const variants: OpencodeModelVariant[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const rawValue = typeof record.value === 'string' ? record.value.trim() : '';
+    if (!rawValue) {
+      continue;
+    }
+
+    let rawLabel = '';
+    if (typeof record.label === 'string') {
+      rawLabel = record.label.trim();
+    } else if (typeof record.name === 'string') {
+      rawLabel = record.name.trim();
+    }
+    const description = typeof record.description === 'string'
+      ? record.description.trim()
+      : '';
+
+    variants.push({
+      ...(description ? { description } : {}),
+      label: rawLabel || formatOpencodeThinkingLevelLabel(rawValue),
+      value: rawValue,
+    });
+  }
+
+  return dedupeOpencodeVariants(variants);
+}
+
+export function normalizeOpencodeThinkingOptionsByModel(
+  value: unknown,
+  discoveredModels: OpencodeDiscoveredModel[] = [],
+): OpencodeThinkingOptionsByModel {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const normalized: OpencodeThinkingOptionsByModel = {};
+  for (const [rawId, variants] of Object.entries(value as Record<string, unknown>)) {
+    const normalizedRawId = resolveOpencodeBaseModelRawId(rawId.trim(), discoveredModels);
+    const normalizedVariants = normalizeOpencodeModelVariants(variants);
+    if (!normalizedRawId || normalizedVariants.length === 0) {
+      continue;
+    }
+
+    normalized[normalizedRawId] = normalizedVariants;
   }
 
   return normalized;

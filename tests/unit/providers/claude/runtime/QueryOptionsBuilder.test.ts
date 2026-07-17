@@ -65,8 +65,7 @@ function createMockPersistentQueryConfig(
 ): PersistentQueryConfig {
   return {
     model: 'sonnet',
-    thinkingTokens: null,
-    effortLevel: null,
+    effortLevel: 'high',
     permissionMode: 'yolo',
     sdkPermissionMode: 'bypassPermissions',
     systemPromptKey: 'key1',
@@ -200,7 +199,7 @@ describe('QueryOptionsBuilder', () => {
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
       expect(config.model).toBe('claude-sonnet-4-5');
-      expect(config.thinkingTokens).toBeNull();
+      expect(config.effortLevel).toBe('high');
       expect(config.permissionMode).toBe('yolo');
       expect(config.sdkPermissionMode).toBe('bypassPermissions');
       expect(config.settingSources).toBe('project,local');
@@ -239,13 +238,13 @@ describe('QueryOptionsBuilder', () => {
       expect(config.enableAutoMode).toBe(true);
     });
 
-    it('includes thinking tokens when budget is set', () => {
+    it('ignores legacy thinking budget when building config', () => {
       const ctx = createMockContext({
-        settings: createMockSettings({ model: 'custom-model', thinkingBudget: 'high' }),
+        settings: createMockSettings({ model: 'custom-model', thinkingBudget: 'high', effortLevel: 'medium' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
-      expect(config.thinkingTokens).toBe(16000);
+      expect(config.effortLevel).toBe('medium');
     });
 
     it('includes effortLevel for adaptive model', () => {
@@ -257,32 +256,31 @@ describe('QueryOptionsBuilder', () => {
       expect(config.effortLevel).toBe('max');
     });
 
-    it('clears thinkingTokens for adaptive models even when a budget is configured', () => {
+    it('uses effort for Claude models even when a legacy budget is configured', () => {
       const ctx = createMockContext({
         settings: createMockSettings({ model: 'sonnet', thinkingBudget: 'high', effortLevel: 'max' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
-      expect(config.thinkingTokens).toBeNull();
       expect(config.effortLevel).toBe('max');
     });
 
     it('normalizes unsupported xhigh effort for adaptive models', () => {
       const ctx = createMockContext({
-        settings: createMockSettings({ model: 'sonnet', effortLevel: 'xhigh' }),
+        settings: createMockSettings({ model: 'haiku', effortLevel: 'xhigh' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
       expect(config.effortLevel).toBe('high');
     });
 
-    it('sets effortLevel to null for custom model', () => {
+    it('sets effortLevel for custom model ids', () => {
       const ctx = createMockContext({
         settings: createMockSettings({ model: 'custom-model', effortLevel: 'high' }),
       });
       const config = QueryOptionsBuilder.buildPersistentQueryConfig(ctx);
 
-      expect(config.effortLevel).toBeNull();
+      expect(config.effortLevel).toBe('high');
     });
 
     it('includes enableChrome from settings', () => {
@@ -440,7 +438,7 @@ describe('QueryOptionsBuilder', () => {
     it('clamps unsupported xhigh effort before building adaptive options', () => {
       const ctx = {
         ...createMockContext({
-          settings: createMockSettings({ model: 'sonnet', effortLevel: 'xhigh' }),
+          settings: createMockSettings({ model: 'haiku', effortLevel: 'xhigh' }),
         }),
         abortController: new AbortController(),
         hooks: {},
@@ -451,18 +449,19 @@ describe('QueryOptionsBuilder', () => {
       expect(options.effort).toBe('high');
     });
 
-    it('sets thinking tokens for custom models', () => {
+    it('sets adaptive thinking with effort for custom models', () => {
       const ctx = {
         ...createMockContext({
-          settings: createMockSettings({ model: 'custom-model', thinkingBudget: 'high' }),
+          settings: createMockSettings({ model: 'custom-model', thinkingBudget: 'high', effortLevel: 'medium' }),
         }),
         abortController: new AbortController(),
         hooks: {},
       };
       const options = QueryOptionsBuilder.buildPersistentQueryOptions(ctx);
 
-      expect(options.maxThinkingTokens).toBe(16000);
-      expect(options.thinking).toBeUndefined();
+      expect(options.thinking).toEqual({ type: 'adaptive' });
+      expect(options.effort).toBe('medium');
+      expect(options.maxThinkingTokens).toBeUndefined();
     });
 
     it('sets resume session ID when provided', () => {

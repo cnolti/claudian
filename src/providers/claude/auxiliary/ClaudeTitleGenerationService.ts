@@ -1,20 +1,21 @@
 import { TITLE_GENERATION_SYSTEM_PROMPT } from '../../../core/prompt/titleGeneration';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import type {
   TitleGenerationCallback,
   TitleGenerationResult,
 } from '../../../core/providers/types';
-import type ClaudianPlugin from '../../../main';
 import { parseEnvironmentVariables } from '../../../utils/env';
+import { toClaudeRuntimeModelId } from '../modelSelection';
 import { runColdStartQuery } from '../runtime/claudeColdStartQuery';
 import { claudeChatUIConfig } from '../ui/ClaudeChatUIConfig';
 
 export type { TitleGenerationResult };
 
 export class TitleGenerationService {
-  private plugin: ClaudianPlugin;
+  private plugin: ProviderHost;
   private activeGenerations: Map<string, AbortController> = new Map();
 
-  constructor(plugin: ClaudianPlugin) {
+  constructor(plugin: ProviderHost) {
     this.plugin = plugin;
   }
 
@@ -77,9 +78,9 @@ export class TitleGenerationService {
     const titleModel = this.plugin.settings.titleGenerationModel;
     if (titleModel && claudeChatUIConfig.ownsModel(
       titleModel,
-      this.plugin.settings as unknown as Record<string, unknown>,
+      this.plugin.settings,
     )) {
-      return titleModel;
+      return toClaudeRuntimeModelId(titleModel);
     }
 
     return (

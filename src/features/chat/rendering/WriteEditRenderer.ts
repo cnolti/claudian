@@ -2,9 +2,9 @@ import { setIcon } from 'obsidian';
 
 import { getToolIcon } from '../../../core/tools/toolIcons';
 import type { ToolCallInfo, ToolDiffData } from '../../../core/types';
-import type { DiffLine, DiffStats } from '../../../core/types/diff';
+import type { DiffLine } from '../../../core/types/diff';
 import { setupCollapsible } from './collapsible';
-import { renderDiffContent } from './DiffRenderer';
+import { renderDiffContent, renderDiffStats } from './DiffRenderer';
 import { fileNameOnly } from './ToolCallRenderer';
 
 export interface WriteEditState {
@@ -18,6 +18,10 @@ export interface WriteEditState {
   toolCall: ToolCallInfo;
   isExpanded: boolean;
   diffLines?: DiffLine[];
+}
+
+export interface WriteEditRenderOptions {
+  initiallyExpanded?: boolean;
 }
 
 function shortenPath(filePath: string, maxLength = 40): string {
@@ -43,26 +47,14 @@ function shortenPath(filePath: string, maxLength = 40): string {
   return `${firstDir}/.../${filename}`;
 }
 
-function renderDiffStats(statsEl: HTMLElement, stats: DiffStats): void {
-  if (stats.added > 0) {
-    const addedEl = statsEl.createSpan({ cls: 'added' });
-    addedEl.setText(`+${stats.added}`);
-  }
-  if (stats.removed > 0) {
-    if (stats.added > 0) {
-      statsEl.createSpan({ text: ' ' });
-    }
-    const removedEl = statsEl.createSpan({ cls: 'removed' });
-    removedEl.setText(`-${stats.removed}`);
-  }
-}
-
 export function createWriteEditBlock(
   parentEl: HTMLElement,
-  toolCall: ToolCallInfo
+  toolCall: ToolCallInfo,
+  options: WriteEditRenderOptions = {}
 ): WriteEditState {
   const filePath = (toolCall.input.file_path as string) || 'file';
   const toolName = toolCall.name; // 'Write' or 'Edit'
+  const baseAriaLabel = `${toolName}: ${shortenPath(filePath)}`;
 
   const wrapperEl = parentEl.createDiv({ cls: 'claudian-write-edit-block' });
   wrapperEl.dataset.toolId = toolCall.id;
@@ -71,7 +63,6 @@ export function createWriteEditBlock(
   const headerEl = wrapperEl.createDiv({ cls: 'claudian-write-edit-header' });
   headerEl.setAttribute('tabindex', '0');
   headerEl.setAttribute('role', 'button');
-  headerEl.setAttribute('aria-label', `${toolName}: ${shortenPath(filePath)} - click to expand`);
 
   // File icon
   const iconEl = headerEl.createDiv({ cls: 'claudian-write-edit-icon' });
@@ -111,7 +102,10 @@ export function createWriteEditBlock(
   };
 
   // Setup collapsible behavior (handles click, keyboard, ARIA, CSS)
-  setupCollapsible(wrapperEl, headerEl, contentEl, state);
+  setupCollapsible(wrapperEl, headerEl, contentEl, state, {
+    initiallyExpanded: options.initiallyExpanded ?? false,
+    baseAriaLabel,
+  });
 
   return state;
 }
@@ -165,9 +159,14 @@ export function finalizeWriteEditBlock(state: WriteEditState, isError: boolean):
   }
 }
 
-export function renderStoredWriteEdit(parentEl: HTMLElement, toolCall: ToolCallInfo): HTMLElement {
+export function renderStoredWriteEdit(
+  parentEl: HTMLElement,
+  toolCall: ToolCallInfo,
+  options: WriteEditRenderOptions = {}
+): HTMLElement {
   const filePath = (toolCall.input.file_path as string) || 'file';
   const toolName = toolCall.name;
+  const baseAriaLabel = `${toolName}: ${shortenPath(filePath)}`;
   const isError = toolCall.status === 'error' || toolCall.status === 'blocked';
 
   const wrapperEl = parentEl.createDiv({ cls: 'claudian-write-edit-block' });
@@ -224,7 +223,10 @@ export function renderStoredWriteEdit(parentEl: HTMLElement, toolCall: ToolCallI
 
   // Setup collapsible behavior (handles click, keyboard, ARIA, CSS)
   const state = { isExpanded: false };
-  setupCollapsible(wrapperEl, headerEl, contentEl, state);
+  setupCollapsible(wrapperEl, headerEl, contentEl, state, {
+    initiallyExpanded: options.initiallyExpanded ?? false,
+    baseAriaLabel,
+  });
 
   return wrapperEl;
 }

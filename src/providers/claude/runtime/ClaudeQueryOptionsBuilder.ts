@@ -12,14 +12,14 @@ import {
 } from '../../../core/prompt/mainAgent';
 import type { AppPluginManager } from '../../../core/providers/types';
 import type { ClaudianSettings, PermissionMode } from '../../../core/types/settings';
+import { toClaudeRuntimeModelId } from '../modelSelection';
 import {
   type ClaudeSafeMode,
   getClaudeProviderSettings,
   resolveClaudeSettingSources,
 } from '../settings';
 import {
-  resolveAdaptiveEffortLevel,
-  resolveThinkingTokens,
+  resolveEffortLevel,
 } from '../types/models';
 import { createCustomSpawnFunction } from './customSpawn';
 import {
@@ -46,7 +46,7 @@ export interface PersistentQueryContext extends QueryOptionsContext {
     fork?: boolean;
   };
   canUseTool?: CanUseTool;
-  hooks: Options['hooks'];
+  hooks?: Options['hooks'];
   externalContextPaths?: string[];
 }
 
@@ -55,7 +55,7 @@ export interface ColdStartQueryContext extends QueryOptionsContext {
   sessionId?: string;
   modelOverride?: string;
   canUseTool?: CanUseTool;
-  hooks: Options['hooks'];
+  hooks?: Options['hooks'];
   mcpMentions?: Set<string>;
   enabledMcpServers?: Set<string>;
   allowedTools?: string[];
@@ -95,7 +95,7 @@ export class QueryOptionsBuilder {
     ctx: QueryOptionsContext,
     externalContextPaths?: string[]
   ): PersistentQueryConfig {
-    const claudeSettings = getClaudeProviderSettings(ctx.settings as unknown as Record<string, unknown>);
+    const claudeSettings = getClaudeProviderSettings(ctx.settings);
     const systemPromptSettings: SystemPromptSettings = {
       mediaFolder: ctx.settings.mediaFolder,
       customPrompt: ctx.settings.systemPrompt,
@@ -112,11 +112,11 @@ export class QueryOptionsBuilder {
     const pluginsKey = ctx.pluginManager.getPluginsKey();
 
     const settingSources = resolveClaudeSettingSources(claudeSettings.loadUserSettings);
+    const runtimeModel = toClaudeRuntimeModelId(ctx.settings.model);
 
     return {
-      model: ctx.settings.model,
-      thinkingTokens: resolveThinkingTokens(ctx.settings.model, ctx.settings.thinkingBudget),
-      effortLevel: resolveAdaptiveEffortLevel(ctx.settings.model, ctx.settings.effortLevel),
+      model: runtimeModel,
+      effortLevel: resolveEffortLevel(runtimeModel, ctx.settings.effortLevel),
       permissionMode: ctx.settings.permissionMode,
       sdkPermissionMode,
       systemPromptKey: computeSystemPromptKey(systemPromptSettings),
@@ -132,9 +132,10 @@ export class QueryOptionsBuilder {
   }
 
   static buildPersistentQueryOptions(ctx: PersistentQueryContext): Options {
+    const runtimeModel = toClaudeRuntimeModelId(ctx.settings.model);
     const { options, claudeSettings } = QueryOptionsBuilder.buildBaseOptions(
       ctx,
-      ctx.settings.model,
+      runtimeModel,
       ctx.abortController,
     );
 
@@ -150,9 +151,8 @@ export class QueryOptionsBuilder {
       claudeSettings.safeMode,
       ctx.canUseTool,
     );
-    QueryOptionsBuilder.applyThinking(options, ctx.settings, ctx.settings.model);
-    options.hooks = ctx.hooks;
-
+    QueryOptionsBuilder.applyThinking(options, ctx.settings, runtimeModel);
+    if (ctx.hooks) options.hooks = ctx.hooks;
     options.enableFileCheckpointing = true;
 
     if (ctx.resume) {
@@ -173,7 +173,7 @@ export class QueryOptionsBuilder {
   }
 
   static buildColdStartQueryOptions(ctx: ColdStartQueryContext): Options {
-    const selectedModel = ctx.modelOverride ?? ctx.settings.model;
+    const selectedModel = toClaudeRuntimeModelId(ctx.modelOverride ?? ctx.settings.model);
     const { options, claudeSettings } = QueryOptionsBuilder.buildBaseOptions(
       ctx,
       selectedModel,
@@ -202,8 +202,8 @@ export class QueryOptionsBuilder {
       claudeSettings.safeMode,
       ctx.canUseTool,
     );
-    options.hooks = ctx.hooks;
-    QueryOptionsBuilder.applyThinking(options, ctx.settings, ctx.modelOverride ?? ctx.settings.model);
+    if (ctx.hooks) options.hooks = ctx.hooks;
+    QueryOptionsBuilder.applyThinking(options, ctx.settings, selectedModel);
 
     if (ctx.allowedTools !== undefined && ctx.allowedTools.length > 0) {
       options.tools = ctx.allowedTools;
@@ -265,7 +265,7 @@ export class QueryOptionsBuilder {
     model: string,
     abortController?: AbortController,
   ): { options: Options; claudeSettings: ReturnType<typeof getClaudeProviderSettings> } {
-    const claudeSettings = getClaudeProviderSettings(ctx.settings as unknown as Record<string, unknown>);
+    const claudeSettings = getClaudeProviderSettings(ctx.settings);
     const systemPromptSettings: SystemPromptSettings = {
       mediaFolder: ctx.settings.mediaFolder,
       customPrompt: ctx.settings.systemPrompt,
@@ -298,19 +298,11 @@ export class QueryOptionsBuilder {
     settings: ClaudianSettings,
     model: string
   ): void {
-    const effortLevel = resolveAdaptiveEffortLevel(model, settings.effortLevel);
-    if (effortLevel !== null) {
-      options.thinking = { type: 'adaptive' };
-      // SDK runtime accepts `xhigh` on Opus 4.7+ and silently falls back to
-      // `high` elsewhere, but its type definition lags our local EffortLevel.
-      options.effort = effortLevel as Options['effort'];
-      return;
-    }
-
-    const thinkingTokens = resolveThinkingTokens(model, settings.thinkingBudget);
-    if (thinkingTokens !== null) {
-      options.maxThinkingTokens = thinkingTokens;
-    }
+    const effortLevel = resolveEffortLevel(model, settings.effortLevel);
+    options.thinking = { type: 'adaptive' };
+    // SDK runtime accepts `xhigh` on Opus 4.7+, Sonnet 5+, and Fable, and silently
+    // falls back to `high` elsewhere, but its type definition lags our local EffortLevel.
+    options.effort = effortLevel;
   }
 
   private static pathsChanged(a?: string[], b?: string[]): boolean {

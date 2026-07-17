@@ -14,12 +14,16 @@ type Listener = (event: any) => void;
 class MockClassList {
   private classes = new Set<string>();
 
+  constructor(private onChange: () => void = () => {}) {}
+
   add(...items: string[]): void {
     items.forEach((item) => this.classes.add(item));
+    this.onChange();
   }
 
   remove(...items: string[]): void {
     items.forEach((item) => this.classes.delete(item));
+    this.onChange();
   }
 
   contains(item: string): boolean {
@@ -37,6 +41,7 @@ class MockClassList {
       } else {
         this.classes.add(item);
       }
+      this.onChange();
       return;
     }
     if (force) {
@@ -44,10 +49,12 @@ class MockClassList {
     } else {
       this.classes.delete(item);
     }
+    this.onChange();
   }
 
   clear(): void {
     this.classes.clear();
+    this.onChange();
   }
 
   toArray(): string[] {
@@ -57,7 +64,7 @@ class MockClassList {
 
 class MockElement {
   tagName: string;
-  classList = new MockClassList();
+  classList: MockClassList;
   style: Record<string, string> = {};
   children: MockElement[] = [];
   attributes: Record<string, string> = {};
@@ -69,11 +76,13 @@ class MockElement {
 
   constructor(tagName: string) {
     this.tagName = tagName.toUpperCase();
+    this.classList = new MockClassList(() => this.syncDisplay());
   }
 
   set className(value: string) {
     this.classList.clear();
     value.split(/\s+/).filter(Boolean).forEach((cls) => this.classList.add(cls));
+    this.syncDisplay();
   }
 
   get className(): string {
@@ -92,10 +101,30 @@ class MockElement {
     this._scrollTop = _value;
   }
 
+  get ownerDocument(): any {
+    return (global as any).document;
+  }
+
   appendChild(child: MockElement): MockElement {
     child.parent = this;
     this.children.push(child);
     return child;
+  }
+
+  addClass(cls: string): void {
+    cls.split(/\s+/).filter(Boolean).forEach((item) => this.classList.add(item));
+  }
+
+  removeClass(cls: string): void {
+    cls.split(/\s+/).filter(Boolean).forEach((item) => this.classList.remove(item));
+  }
+
+  toggleClass(cls: string, force: boolean): void {
+    this.classList.toggle(cls, force);
+  }
+
+  hasClass(cls: string): boolean {
+    return this.classList.has(cls);
   }
 
   remove(): void {
@@ -147,6 +176,24 @@ class MockElement {
   empty(): void {
     this.children = [];
     this.textContent = '';
+  }
+
+  private syncDisplay(): void {
+    if (this.classList.has('claudian-hidden')) {
+      this.style.display = 'none';
+      return;
+    }
+    if (
+      this.classList.has('claudian-status-panel-todos')
+      || this.classList.has('claudian-status-panel-content')
+      || this.classList.has('claudian-status-panel-bash')
+      || this.classList.has('claudian-status-panel-bash-content')
+      || this.classList.has('claudian-tool-content')
+    ) {
+      this.style.display = 'block';
+      return;
+    }
+    this.style.display = '';
   }
 
   // Obsidian-style helper methods
@@ -259,6 +306,13 @@ describe('StatusPanel', () => {
       expect(todoContainer).not.toBeNull();
       expect(todoContainer!.style.display).toBe('none');
     });
+
+    it('should not reserve panel spacing before content is shown', () => {
+      panel.mount(containerEl as unknown as HTMLElement);
+
+      const panelEl = containerEl.querySelector('.claudian-status-panel');
+      expect(panelEl?.hasClass('claudian-status-panel--visible')).toBe(false);
+    });
   });
 
   describe('updateTodos', () => {
@@ -275,6 +329,8 @@ describe('StatusPanel', () => {
 
       const todoContainer = containerEl.querySelector('.claudian-status-panel-todos');
       expect(todoContainer!.style.display).toBe('block');
+      expect(containerEl.querySelector('.claudian-status-panel')
+        ?.hasClass('claudian-status-panel--visible')).toBe(true);
     });
 
     it('should hide panel when todos is null', () => {
@@ -287,6 +343,8 @@ describe('StatusPanel', () => {
 
       const todoContainer = containerEl.querySelector('.claudian-status-panel-todos');
       expect(todoContainer!.style.display).toBe('none');
+      expect(containerEl.querySelector('.claudian-status-panel')
+        ?.hasClass('claudian-status-panel--visible')).toBe(false);
     });
 
     it('should hide panel when todos is empty array', () => {

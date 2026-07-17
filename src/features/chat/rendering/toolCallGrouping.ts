@@ -84,26 +84,28 @@ function buildGroupLabel(toolCount: number, thinkingCount: number, thinkingDurat
 function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   const { toolCount, thinkingCount, thinkingDuration, hasErrors } = countGroupStats(elements);
   const labelText = buildGroupLabel(toolCount, thinkingCount, thinkingDuration);
+  // Popout-window safety: create elements in the document that owns the message.
+  const doc = parentEl.ownerDocument;
 
-  const wrapperEl = document.createElement('div');
+  const wrapperEl = doc.createElement('div');
   wrapperEl.className = 'claudian-tool-group';
 
-  const summaryEl = document.createElement('div');
+  const summaryEl = doc.createElement('div');
   summaryEl.className = 'claudian-tool-group-summary';
   summaryEl.setAttribute('tabindex', '0');
   summaryEl.setAttribute('role', 'button');
   summaryEl.setAttribute('aria-expanded', 'false');
   summaryEl.setAttribute('aria-label', labelText);
 
-  const chevron = document.createElement('span');
+  const chevron = doc.createElement('span');
   chevron.className = 'claudian-tool-group-chevron';
   chevron.textContent = '▶';
 
-  const labelEl = document.createElement('span');
+  const labelEl = doc.createElement('span');
   labelEl.className = 'claudian-tool-group-label';
   labelEl.textContent = labelText;
 
-  const statusEl = document.createElement('span');
+  const statusEl = doc.createElement('span');
   statusEl.className = 'claudian-tool-group-status';
   if (hasErrors) {
     statusEl.classList.add('has-errors');
@@ -116,7 +118,7 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   summaryEl.appendChild(labelEl);
   summaryEl.appendChild(statusEl);
 
-  const contentEl = document.createElement('div');
+  const contentEl = doc.createElement('div');
   contentEl.className = 'claudian-tool-group-content';
 
   wrapperEl.appendChild(summaryEl);

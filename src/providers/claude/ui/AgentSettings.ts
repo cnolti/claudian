@@ -9,13 +9,14 @@ import type { AgentDefinition } from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import { confirmDelete } from '../../../shared/modals/ConfirmModal';
 import { validateAgentName } from '../../../utils/agent';
+import { CLAUDE_MODEL_TIER_DEFINITIONS } from '../modelTiers';
 
 const MODEL_OPTIONS = [
   { value: 'inherit', label: 'Inherit' },
-  { value: 'sonnet', label: 'Sonnet' },
-  { value: 'opus', label: 'Opus' },
-  { value: 'haiku', label: 'Haiku' },
-] as const;
+  ...[...CLAUDE_MODEL_TIER_DEFINITIONS]
+    .sort((a, b) => a.agentOrder - b.agentOrder)
+    .map(definition => ({ value: definition.id, label: definition.agentLabel })),
+];
 
 class AgentModal extends Modal {
   private existingAgent: AgentDefinition | null;
@@ -142,7 +143,8 @@ class AgentModal extends Modal {
       text: t('common.save'),
       cls: 'claudian-save-btn',
     });
-    saveBtn.addEventListener('click', async () => {
+    saveBtn.addEventListener('click', () => {
+      void (async (): Promise<void> => {
       const name = nameInput.value.trim();
       const nameError = validateAgentName(name);
       if (nameError) {
@@ -185,7 +187,7 @@ class AgentModal extends Modal {
         prompt,
         tools: parseList(toolsInput),
         disallowedTools: parseList(disallowedToolsInput),
-        model: (modelValue as AgentDefinition['model']) || 'inherit',
+        model: (modelValue) || 'inherit',
         source: 'vault',
         filePath: this.existingAgent?.filePath,
         skills: parseList(skillsInput),
@@ -202,6 +204,7 @@ class AgentModal extends Modal {
         return;
       }
       this.close();
+      })();
     });
   }
 
@@ -297,7 +300,8 @@ export class AgentSettings {
       attr: { 'aria-label': t('common.delete') },
     });
     setIcon(deleteBtn, 'trash-2');
-    deleteBtn.addEventListener('click', async () => {
+    deleteBtn.addEventListener('click', () => {
+      void (async (): Promise<void> => {
       const confirmed = await confirmDelete(
         this.app,
         t('settings.subagents.deleteConfirm', { name: agent.name })
@@ -309,6 +313,7 @@ export class AgentSettings {
         const message = err instanceof Error ? err.message : 'Unknown error';
         new Notice(t('settings.subagents.deleteFailed', { message }));
       }
+      })();
     });
   }
 

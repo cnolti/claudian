@@ -155,14 +155,25 @@ describe('CodexAppServerProcess', () => {
     });
   });
 
+  describe('stderr snapshot', () => {
+    it('keeps a bounded stderr snapshot for startup failures', () => {
+      const server = new CodexAppServerProcess(createLaunchSpec());
+      server.start();
+
+      mockProc.stderr?.emit('data', 'failed to load configuration');
+
+      expect(server.getStderrSnapshot()).toContain('failed to load configuration');
+    });
+  });
+
   describe('onExit', () => {
-    it('calls registered exit callback when process exits', () => {
+    it('calls registered exit callback when process closes', () => {
       const server = new CodexAppServerProcess(createLaunchSpec());
       const exitCallback = jest.fn();
       server.onExit(exitCallback);
       server.start();
 
-      mockProc.emit('exit', 1, 'SIGTERM');
+      mockProc.emit('close', 1, 'SIGTERM');
 
       expect(exitCallback).toHaveBeenCalledWith(1, 'SIGTERM');
     });
@@ -174,9 +185,26 @@ describe('CodexAppServerProcess', () => {
       const exitCallback = jest.fn();
       server.onExit(exitCallback);
 
-      mockProc.emit('exit', 0, null);
+      mockProc.emit('close', 0, null);
 
       expect(exitCallback).toHaveBeenCalledWith(0, null);
+    });
+
+    it('waits for close before notifying so late stderr is included', () => {
+      const server = new CodexAppServerProcess(createLaunchSpec());
+      const exitCallback = jest.fn(() => {
+        expect(server.getStderrSnapshot()).toContain('unknown variant priority');
+      });
+      server.onExit(exitCallback);
+      server.start();
+
+      mockProc.emit('exit', 1, null);
+      mockProc.stderr?.emit('data', 'unknown variant priority');
+      expect(exitCallback).not.toHaveBeenCalled();
+
+      mockProc.emit('close', 1, null);
+
+      expect(exitCallback).toHaveBeenCalledWith(1, null);
     });
   });
 
@@ -190,6 +218,29 @@ describe('CodexAppServerProcess', () => {
       await shutdownPromise;
 
       expect(mockProc.kill).toHaveBeenCalledWith('SIGTERM');
+    });
+
+    it('kills the process tree when shutting down Windows .cmd shims', async () => {
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      const server = new CodexAppServerProcess(createLaunchSpec({
+        command: 'C:\\Users\\R&D\\AppData\\Roaming\\npm\\codex.cmd',
+      }));
+      server.start();
+
+      const shutdownPromise = server.shutdown();
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'taskkill.exe',
+        ['/pid', '12345', '/t', '/f'],
+        expect.objectContaining({
+          stdio: 'ignore',
+          windowsHide: true,
+        }),
+      );
+      expect(mockProc.kill).not.toHaveBeenCalled();
+
+      mockProc.emit('exit', 0, null);
+      await shutdownPromise;
     });
 
     it('sends SIGKILL if process does not exit within timeout', async () => {
@@ -209,6 +260,19 @@ describe('CodexAppServerProcess', () => {
       expect(mockProc.kill).toHaveBeenCalledWith('SIGTERM');
       expect(mockProc.kill).toHaveBeenCalledWith('SIGKILL');
 
+      jest.useRealTimers();
+    });
+
+    it('settles after a final deadline when no exit follows SIGKILL', async () => {
+      jest.useFakeTimers();
+      const server = new CodexAppServerProcess(createLaunchSpec());
+      server.start();
+
+      const shutdownPromise = server.shutdown();
+      jest.advanceTimersByTime(6_000);
+
+      await expect(shutdownPromise).resolves.toBeUndefined();
+      expect(mockProc.kill).toHaveBeenCalledWith('SIGKILL');
       jest.useRealTimers();
     });
 

@@ -30,6 +30,16 @@ describe('ClaudianPlugin', () => {
   beforeEach(() => {
     // Reset mocks
     jest.clearAllMocks();
+    jest.spyOn(sdkSession, 'locateSDKSession').mockImplementation(async (_vaultPath, sessionId) => ({
+      availability: 'available',
+      sessionPath: `/test/claude-project/${sessionId}.jsonl`,
+    }));
+    jest.spyOn(sdkSession, 'locateSDKSessions').mockImplementation(async (_vaultPath, sessionIds) => new Map(
+      sessionIds.map(sessionId => [sessionId, {
+        availability: 'available' as const,
+        sessionPath: `/test/claude-project/${sessionId}.jsonl`,
+      }]),
+    ));
 
     mockApp = {
       vault: {
@@ -56,6 +66,7 @@ describe('ClaudianPlugin', () => {
         getLeaf: jest.fn().mockReturnValue({
           setViewState: jest.fn().mockResolvedValue(undefined),
         }),
+        setActiveLeaf: jest.fn(),
         revealLeaf: jest.fn(),
       },
     };
@@ -324,7 +335,7 @@ describe('ClaudianPlugin', () => {
       const saveSpy = jest.spyOn(plugin, 'saveSettings');
       await plugin.loadSettings();
 
-      expect(plugin.settings.model).toBe('custom-model');
+      expect(plugin.settings.model).toBe('claude-code/custom-model');
       expect(saveSpy).toHaveBeenCalled();
     });
   });
@@ -391,7 +402,7 @@ describe('ClaudianPlugin', () => {
     it('broadcasts ensureReady with force when env changes without model change', async () => {
       await plugin.onload();
 
-      // Mock getView to return a view with tabManager
+      // Mock one open view with an initialized Claude runtime.
       const mockSyncConversationState = jest.fn();
       const mockEnsureReady = jest.fn().mockResolvedValue(true);
       const mockTabManager = {
@@ -412,13 +423,53 @@ describe('ClaudianPlugin', () => {
         invalidateProviderCommandCaches: jest.fn(),
         refreshModelSelector: jest.fn(),
       };
-      jest.spyOn(plugin, 'getView').mockReturnValue(mockView as any);
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([mockView as any]);
 
       // Change env but not in a way that affects model
       await plugin.applyEnvironmentVariables('shared', 'SOME_VAR=value');
 
       expect(mockSyncConversationState).toHaveBeenCalledWith(null, []);
       expect(mockEnsureReady).toHaveBeenCalledWith({ force: true });
+    });
+
+    it('restarts affected runtimes in every open Claudian view', async () => {
+      await plugin.onload();
+
+      const createView = () => {
+        const ensureReady = jest.fn().mockResolvedValue(true);
+        const tabManager = {
+          getAllTabs: jest.fn().mockReturnValue([{
+            providerId: 'claude',
+            conversationId: null,
+            state: { isStreaming: false },
+            serviceInitialized: true,
+            service: {
+              ensureReady,
+              syncConversationState: jest.fn(),
+            },
+            ui: { externalContextSelector: { getExternalContexts: jest.fn().mockReturnValue([]) } },
+          }]),
+        };
+        return {
+          ensureReady,
+          view: {
+            getTabManager: jest.fn().mockReturnValue(tabManager),
+            invalidateProviderCommandCaches: jest.fn(),
+            refreshModelSelector: jest.fn(),
+          },
+        };
+      };
+      const first = createView();
+      const second = createView();
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([
+        first.view as any,
+        second.view as any,
+      ]);
+
+      await plugin.applyEnvironmentVariables('shared', 'SOME_VAR=value');
+
+      expect(first.ensureReady).toHaveBeenCalledWith({ force: true });
+      expect(second.ensureReady).toHaveBeenCalledWith({ force: true });
     });
 
     it('syncs live external contexts before restarting invalidated Claude runtimes', async () => {
@@ -461,7 +512,7 @@ describe('ClaudianPlugin', () => {
         invalidateProviderCommandCaches: jest.fn(),
         refreshModelSelector: jest.fn(),
       };
-      jest.spyOn(plugin, 'getView').mockReturnValue(mockView as any);
+      jest.spyOn(plugin, 'getAllViews').mockReturnValue([mockView as any]);
 
       await plugin.applyEnvironmentVariables('provider:claude', 'ANTHROPIC_MODEL=claude-sonnet-4-5');
 
@@ -635,6 +686,66 @@ describe('ClaudianPlugin', () => {
       expect(fetched?.id).toBe(conv.id);
     });
 
+    it('should store the selected model in conversation metadata', async () => {
+      await plugin.onload();
+
+      const conv = await plugin.createConversation({ selectedModel: 'opus' });
+      const fetched = await plugin.getConversationById(conv.id);
+
+      expect(conv.selectedModel).toBe('opus');
+      expect(fetched?.selectedModel).toBe('opus');
+    });
+
+    it('should preserve custom selected models that are not in picker options', async () => {
+      await plugin.onload();
+
+      const conv = await plugin.createConversation({
+        providerId: 'codex',
+        selectedModel: 'gpt-5.4-experimental',
+      });
+      const fetched = await plugin.getConversationById(conv.id);
+
+      expect(conv.selectedModel).toBe('gpt-5.4-experimental');
+      expect(fetched?.selectedModel).toBe('gpt-5.4-experimental');
+    });
+
+    it('should lazily migrate missing selected model from usage metadata', async () => {
+      await plugin.onload();
+
+      const conv = await plugin.createConversation();
+      delete (conv as { selectedModel?: string }).selectedModel;
+      conv.usage = {
+        model: 'opus',
+        inputTokens: 1,
+        contextTokens: 1,
+        contextWindow: 200000,
+        percentage: 1,
+      };
+      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata');
+      saveMetadataSpy.mockClear();
+
+      const fetched = await plugin.getConversationById(conv.id);
+
+      expect(fetched?.selectedModel).toBe('opus');
+      expect(saveMetadataSpy).toHaveBeenCalledWith(expect.objectContaining({
+        selectedModel: 'opus',
+      }));
+    });
+
+    it('should not permanently default legacy conversations with unknown model metadata', async () => {
+      await plugin.onload();
+
+      const conv = await plugin.createConversation();
+      delete (conv as { selectedModel?: string }).selectedModel;
+      const saveMetadataSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata');
+      saveMetadataSpy.mockClear();
+
+      const fetched = await plugin.getConversationById(conv.id);
+
+      expect(fetched?.selectedModel).toBeUndefined();
+      expect(saveMetadataSpy).not.toHaveBeenCalled();
+    });
+
     it('should generate default title with timestamp', async () => {
       await plugin.onload();
 
@@ -669,6 +780,77 @@ describe('ClaudianPlugin', () => {
 
       expect(result).toBeNull();
     });
+
+    it('should preserve a conversation when local Claude history is missing', async () => {
+      await plugin.onload();
+      const conversation = await plugin.createConversation({
+        sessionId: 'session-removed-after-startup',
+      });
+      const availabilitySpy = jest.mocked(sdkSession.locateSDKSession)
+        .mockResolvedValue({ availability: 'missing' });
+
+      const result = await plugin.switchConversation(conversation.id);
+
+      expect(result?.id).toBe(conversation.id);
+      expect(plugin.getConversationList()).toHaveLength(1);
+      expect(mockApp.vault.adapter.remove).not.toHaveBeenCalledWith(
+        '.claudian/sessions/session-removed-after-startup.meta.json',
+      );
+      availabilitySpy.mockRestore();
+    });
+
+    it('should preserve a conversation whose Claude session belongs to a previous vault path', async () => {
+      await plugin.onload();
+      const conversation = await plugin.createConversation({
+        sessionId: 'session-from-previous-vault-path',
+      });
+      const availabilitySpy = jest.mocked(sdkSession.locateSDKSession)
+        .mockResolvedValue({
+          availability: 'relocated',
+          sessionPath: '/old-project/session-from-previous-vault-path.jsonl',
+        });
+      const loadSpy = jest.spyOn(sdkSession, 'loadSDKSessionMessages')
+        .mockResolvedValue({ messages: [], skippedLines: 0 });
+
+      const result = await plugin.switchConversation(conversation.id);
+
+      expect(result?.id).toBe(conversation.id);
+      expect(plugin.getConversationList()).toHaveLength(1);
+      expect(result?.sessionId).toBeNull();
+      expect(result?.providerState).toEqual(expect.objectContaining({
+        previousProviderSessionIds: ['session-from-previous-vault-path'],
+      }));
+      expect(mockApp.vault.adapter.remove).not.toHaveBeenCalledWith(
+        '.claudian/sessions/session-from-previous-vault-path.meta.json',
+      );
+      availabilitySpy.mockRestore();
+      loadSpy.mockRestore();
+    });
+
+    it('should restore resume metadata when relocated-state persistence fails', async () => {
+      await plugin.onload();
+      const conversation = await plugin.createConversation({
+        sessionId: 'session-relocation-save-failure',
+      });
+      const availabilitySpy = jest.mocked(sdkSession.locateSDKSession)
+        .mockResolvedValue({
+          availability: 'relocated',
+          sessionPath: '/old-project/session-relocation-save-failure.jsonl',
+        });
+      const loadSpy = jest.spyOn(sdkSession, 'loadSDKSessionMessages')
+        .mockResolvedValue({ messages: [], skippedLines: 0 });
+      const saveSpy = jest.spyOn(plugin.storage.sessions, 'saveMetadata')
+        .mockRejectedValueOnce(new Error('Write failed'));
+
+      const result = await plugin.switchConversation(conversation.id);
+
+      expect(result?.sessionId).toBe('session-relocation-save-failure');
+      expect(result?.providerState).toBeUndefined();
+
+      availabilitySpy.mockRestore();
+      loadSpy.mockRestore();
+      saveSpy.mockRestore();
+    });
   });
 
   describe('deleteConversation', () => {
@@ -695,6 +877,111 @@ describe('ClaudianPlugin', () => {
 
       const list = plugin.getConversationList();
       expect(list.find(c => c.id === conv.id)).toBeUndefined();
+    });
+
+    it('should preserve the provider-native session when requested', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation({ sessionId: 'provider-session-1' });
+      const deleteNativeSpy = jest.spyOn(sdkSession, 'deleteSDKSession');
+
+      await plugin.deleteConversation(conv.id, { deleteProviderSession: false });
+
+      expect(deleteNativeSpy).not.toHaveBeenCalled();
+      expect(plugin.getConversationList().find(item => item.id === conv.id)).toBeUndefined();
+      deleteNativeSpy.mockRestore();
+    });
+
+    it('should reset every open tab that references the deleted conversation', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation();
+      const cancelStreaming = jest.fn();
+      const createNew = jest.fn().mockResolvedValue(undefined);
+      mockApp.workspace.getLeavesOfType.mockReturnValue([{
+        view: {
+          getTabManager: () => ({
+            getAllTabs: () => [{
+              conversationId: conv.id,
+              controllers: {
+                inputController: { cancelStreaming },
+                conversationController: { createNew },
+              },
+            }],
+          }),
+        },
+      }]);
+
+      await plugin.deleteConversation(conv.id, { deleteProviderSession: false });
+
+      expect(cancelStreaming).toHaveBeenCalledTimes(1);
+      expect(createNew).toHaveBeenCalledWith({ force: true });
+    });
+  });
+
+  describe('handleMissingProviderSession', () => {
+    it('preserves the record when the provider cannot verify a safe disposition', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation({
+        providerId: 'codex',
+        sessionId: 'unverified-provider-session',
+      });
+
+      await expect(plugin.handleMissingProviderSession(
+        conv.id,
+        'unverified-provider-session',
+      )).resolves.toBe('preserved');
+      expect(plugin.getConversationSync(conv.id)).toBe(conv);
+    });
+
+    it('removes the record when every provider transcript segment is missing', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation({ sessionId: 'missing-current' });
+      jest.mocked(sdkSession.locateSDKSessions).mockResolvedValue(new Map([
+        ['missing-current', { availability: 'missing' }],
+      ]));
+
+      await expect(plugin.handleMissingProviderSession(
+        conv.id,
+        'missing-current',
+      )).resolves.toBe('deleted');
+      expect(plugin.getConversationList().find(item => item.id === conv.id)).toBeUndefined();
+    });
+
+    it('preserves the record and clears resume state when older history is inaccessible', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation({ sessionId: 'missing-current' });
+      await plugin.updateConversation(conv.id, {
+        providerState: {
+          providerSessionId: 'missing-current',
+          previousProviderSessionIds: ['temporarily-inaccessible'],
+        },
+      });
+      jest.mocked(sdkSession.locateSDKSessions).mockResolvedValue(new Map([
+        ['temporarily-inaccessible', { availability: 'unknown' }],
+        ['missing-current', { availability: 'missing' }],
+      ]));
+
+      await expect(plugin.handleMissingProviderSession(
+        conv.id,
+        'missing-current',
+      )).resolves.toBe('reset');
+
+      const preserved = plugin.getConversationSync(conv.id);
+      expect(preserved?.sessionId).toBeNull();
+      expect(preserved?.providerState).toEqual({
+        previousProviderSessionIds: ['temporarily-inaccessible'],
+      });
+    });
+
+    it('preserves metadata when the missing-session disposition cannot be read', async () => {
+      await plugin.onload();
+      const conv = await plugin.createConversation({ sessionId: 'missing-current' });
+      jest.mocked(sdkSession.locateSDKSessions).mockRejectedValueOnce(new Error('EACCES'));
+
+      await expect(plugin.handleMissingProviderSession(
+        conv.id,
+        'missing-current',
+      )).resolves.toBe('preserved');
+      expect(plugin.getConversationSync(conv.id)?.sessionId).toBe('missing-current');
     });
   });
 
@@ -735,6 +1022,35 @@ describe('ClaudianPlugin', () => {
 
       const updated = await plugin.getConversationById(conv.id);
       expect(updated?.messages).toEqual(messages);
+    });
+
+    it('should preserve image data when updating conversation messages', async () => {
+      await plugin.onload();
+
+      const conv = await plugin.createConversation();
+      const messages = [
+        {
+          id: 'msg-1',
+          role: 'user' as const,
+          content: 'See attached image',
+          timestamp: Date.now(),
+          images: [
+            {
+              id: 'img-1',
+              name: 'pasted.png',
+              mediaType: 'image/png' as const,
+              data: 'YmFzZTY0',
+              size: 10,
+              source: 'paste' as const,
+            },
+          ],
+        },
+      ];
+
+      await plugin.updateConversation(conv.id, { messages });
+
+      const updated = await plugin.getConversationById(conv.id);
+      expect(updated?.messages[0].images?.[0].data).toBe('YmFzZTY0');
     });
 
     it('should update conversation sessionId', async () => {
@@ -797,7 +1113,48 @@ describe('ClaudianPlugin', () => {
   });
 
   describe('loadSettings with conversations', () => {
+    it('should preserve Claude metadata during startup when local native history is missing', async () => {
+      const timestamp = Date.now();
+      const sessionMeta = JSON.stringify({
+        id: 'conv-stale-1',
+        providerId: 'claude',
+        title: 'Stale Chat',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        sessionId: 'missing-session',
+      });
+
+      mockApp.vault.adapter.exists.mockImplementation(async (path: string) => {
+        return path === '.claudian/claudian-settings.json'
+          || path === '.claudian/sessions'
+          || path === '.claudian/sessions/conv-stale-1.meta.json';
+      });
+      mockApp.vault.adapter.list.mockImplementation(async (path: string) => {
+        if (path === '.claudian/sessions') {
+          return { files: ['.claudian/sessions/conv-stale-1.meta.json'], folders: [] };
+        }
+        return { files: [], folders: [] };
+      });
+      mockApp.vault.adapter.read.mockImplementation(async (path: string) => {
+        if (path === '.claudian/sessions/conv-stale-1.meta.json') {
+          return sessionMeta;
+        }
+        if (path === '.claudian/claudian-settings.json') {
+          return JSON.stringify({});
+        }
+        return '';
+      });
+
+      await plugin.loadSettings();
+
+      expect(plugin.getConversationList()).toHaveLength(1);
+      expect(mockApp.vault.adapter.remove).not.toHaveBeenCalledWith(
+        '.claudian/sessions/conv-stale-1.meta.json',
+      );
+    });
+
     it('should load saved conversations from metadata files', async () => {
+      const existsSpy = jest.spyOn(sdkSession, 'sdkSessionExists').mockReturnValue(true);
       const timestamp = Date.now();
       const sessionMeta = JSON.stringify({
         id: 'conv-saved-1',
@@ -843,6 +1200,7 @@ describe('ClaudianPlugin', () => {
       const loaded = await plugin.getConversationById('conv-saved-1');
       expect(loaded?.id).toBe('conv-saved-1');
       expect(loaded?.title).toBe('Saved Chat');
+      existsSpy.mockRestore();
     });
 
     it('should clear session IDs when provider base URL changes', async () => {
@@ -914,6 +1272,7 @@ describe('ClaudianPlugin', () => {
 
   describe('Multi-session message loading', () => {
     it('should load messages from previousProviderSessionIds when present', async () => {
+      const existsSpy = jest.spyOn(sdkSession, 'sdkSessionExists').mockReturnValue(true);
       const timestamp = Date.now();
 
       // Setup conversation with previousProviderSessionIds
@@ -957,6 +1316,7 @@ describe('ClaudianPlugin', () => {
       const loaded = await plugin.getConversationById('conv-multi-session');
       expect((loaded?.providerState as any)?.previousProviderSessionIds).toEqual(['session-A']);
       expect((loaded?.providerState as any)?.providerSessionId).toBe('session-B');
+      existsSpy.mockRestore();
     });
 
     it('should preserve previousProviderSessionIds through conversation updates', async () => {
@@ -1000,6 +1360,73 @@ describe('ClaudianPlugin', () => {
   });
 
   describe('loadSdkMessagesForConversation - fork branch', () => {
+    it('should repair blank image data from Claude SDK history during hydration', async () => {
+      await plugin.onload();
+
+      const conv = await plugin.createConversation();
+      await plugin.updateConversation(conv.id, {
+        providerState: {
+          providerSessionId: 'session-with-image',
+        },
+        messages: [
+          {
+            id: 'user-with-image',
+            role: 'user',
+            content: 'See attached image',
+            timestamp: 1000,
+            images: [{
+              id: 'img-blank',
+              name: 'pasted.png',
+              mediaType: 'image/png',
+              data: '',
+              size: 0,
+              source: 'paste',
+            }],
+          },
+        ],
+      });
+
+      const existsSpy = jest.spyOn(sdkSession, 'sdkSessionExists').mockReturnValue(true);
+      const loadSpy = jest.spyOn(sdkSession, 'loadSDKSessionMessages').mockResolvedValue({
+        messages: [
+          {
+            id: 'user-with-image',
+            role: 'user',
+            content: 'See attached image',
+            timestamp: 1000,
+            images: [{
+              id: 'sdk-img-user-with-image-0',
+              name: 'image-1',
+              mediaType: 'image/png',
+              data: 'aGVsbG8=',
+              size: 5,
+              source: 'paste',
+            }],
+          },
+        ],
+        skippedLines: 0,
+      });
+
+      const loaded = await plugin.getConversationById(conv.id);
+
+      expect(loadSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        'session-with-image',
+        undefined,
+        undefined,
+        expect.any(Object),
+      );
+      expect(loaded?.messages[0].images?.[0]).toMatchObject({
+        id: 'img-blank',
+        data: 'aGVsbG8=',
+        mediaType: 'image/png',
+        size: 5,
+      });
+
+      existsSpy.mockRestore();
+      loadSpy.mockRestore();
+    });
+
     it('should load from forkSource.sessionId and truncate at forkSource.resumeAt for pending fork', async () => {
       await plugin.onload();
 
@@ -1026,16 +1453,19 @@ describe('ClaudianPlugin', () => {
       const loaded = await plugin.getConversationById(conv.id);
 
       // Should check existence of source session, not the conversation's own session
-      expect(existsSpy).toHaveBeenCalledWith(
+      expect(sdkSession.locateSDKSession).toHaveBeenCalledWith(
         expect.any(String),
-        'source-session-abc'
+        'source-session-abc',
+        expect.any(Object),
       );
 
       // Should load from forkSource.sessionId with forkSource.resumeAt as truncation point
       expect(loadSpy).toHaveBeenCalledWith(
         expect.any(String),
         'source-session-abc',
-        'asst-uuid-cutoff'
+        'asst-uuid-cutoff',
+        undefined,
+        expect.any(Object),
       );
 
       // Messages should be loaded
@@ -1065,9 +1495,10 @@ describe('ClaudianPlugin', () => {
       await plugin.getConversationById(conv.id);
 
       // Should load from own session, not forkSource session
-      expect(existsSpy).toHaveBeenCalledWith(
+      expect(sdkSession.locateSDKSession).toHaveBeenCalledWith(
         expect.any(String),
-        'own-session-id'
+        'own-session-id',
+        expect.any(Object),
       );
 
       existsSpy.mockRestore();
@@ -1133,7 +1564,9 @@ describe('ClaudianPlugin', () => {
       expect(loadSpy).toHaveBeenCalledWith(
         expect.any(String),
         'session-subagent-recovery',
-        undefined
+        undefined,
+        undefined,
+        expect.any(Object),
       );
       expect(loaded?.messages[0].toolCalls?.find(tc => tc.id === 'task-1')).toEqual(
         expect.objectContaining({
@@ -1206,7 +1639,9 @@ describe('ClaudianPlugin', () => {
       expect(loadSpy).toHaveBeenCalledWith(
         expect.any(String),
         'session-subagent-merge',
-        undefined
+        undefined,
+        undefined,
+        expect.any(Object),
       );
       expect(taskTool?.result).toBe('Full SDK result from queue-operation');
       expect(taskTool?.subagent?.result).toBe('Full SDK result from queue-operation');
@@ -1613,7 +2048,9 @@ describe('ClaudianPlugin', () => {
       expect(loadSubagentToolsSpy).toHaveBeenCalledWith(
         expect.any(String),
         'session-async-subagent-tools',
-        'agent-a123'
+        'agent-a123',
+        undefined,
+        expect.any(Object),
       );
       expect(taskTool?.subagent?.toolCalls).toEqual(
         expect.arrayContaining([

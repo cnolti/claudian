@@ -23,7 +23,7 @@ export class InlinePlanApproval {
   ) {
     this.containerEl = containerEl;
     this.resolveCallback = resolve;
-    this.boundKeyDown = this.handleKeyDown.bind(this);
+    this.boundKeyDown = (event) => this.handleKeyDown(event);
   }
 
   render(): void {
@@ -80,7 +80,7 @@ export class InlinePlanApproval {
     this.rootEl.setAttribute('tabindex', '0');
     this.rootEl.addEventListener('keydown', this.boundKeyDown);
 
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       this.rootEl.focus();
       this.rootEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     });
@@ -91,6 +91,8 @@ export class InlinePlanApproval {
   }
 
   private handleKeyDown(e: KeyboardEvent): void {
+    if (e.isComposing) return;
+
     if (this.isInputFocused) {
       if (e.key === 'Escape') {
         e.preventDefault();

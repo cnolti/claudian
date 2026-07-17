@@ -2,8 +2,14 @@ import type { App, TFile } from 'obsidian';
 
 import { replaceImageEmbedsWithHtml } from '@/utils/imageEmbed';
 
+type LinkResolver = (
+  linkPath: string,
+  sourcePath: string,
+  files: Map<string, TFile>
+) => TFile | null | undefined;
+
 // Mock App and vault for testing
-function createMockApp(files: Map<string, string> = new Map()): App {
+function createMockApp(files: Map<string, string> = new Map(), resolveLink?: LinkResolver): App {
   const mockFiles = new Map<string, TFile>();
   files.forEach((resourcePath, filePath) => {
     mockFiles.set(filePath, {
@@ -14,11 +20,16 @@ function createMockApp(files: Map<string, string> = new Map()): App {
 
   return {
     vault: {
-      getFileByPath: (path: string) => mockFiles.get(path) || null,
+      getAbstractFileByPath: (path: string) => mockFiles.get(path) || null,
       getResourcePath: (file: TFile) => files.get(file.path) || `app://local/${file.path}`,
     },
     metadataCache: {
-      getFirstLinkpathDest: (linkPath: string) => {
+      getFirstLinkpathDest: (linkPath: string, sourcePath: string) => {
+        const resolved = resolveLink?.(linkPath, sourcePath, mockFiles);
+        if (resolved !== undefined) {
+          return resolved;
+        }
+
         // Try to find by basename
         for (const [path, file] of mockFiles) {
           if (path.endsWith(linkPath) || path === linkPath) {
@@ -187,6 +198,30 @@ describe('replaceImageEmbedsWithHtml', () => {
     });
   });
 
+  describe('source path resolution', () => {
+    it('passes source path into Obsidian link resolution for ambiguous image embeds', () => {
+      const app = createMockApp(
+        new Map([
+          ['section-a/image.png', 'app://local/section-a/image.png'],
+          ['section-b/image.png', 'app://local/section-b/image.png'],
+        ]),
+        (linkPath, sourcePath, files) => {
+          if (linkPath === 'image.png' && sourcePath === 'section-b/note.md') {
+            return files.get('section-b/image.png');
+          }
+          return files.get('section-a/image.png');
+        }
+      );
+
+      const result = replaceImageEmbedsWithHtml('![[image.png]]', app, {
+        sourcePath: 'section-b/note.md',
+      });
+
+      expect(result).toContain('src="app://local/section-b/image.png"');
+      expect(result).not.toContain('section-a/image.png');
+    });
+  });
+
   describe('multiple image embeds', () => {
     it('replaces multiple images in text', () => {
       const app = createMockApp(
@@ -336,7 +371,7 @@ describe('replaceImageEmbedsWithHtml', () => {
       const mockFile = { path: 'test.png', basename: 'test' } as TFile;
       const app = {
         vault: {
-          getFileByPath: () => mockFile,
+          getAbstractFileByPath: () => mockFile,
           getResourcePath: () => {
             throw new Error('Resource path failed');
           },

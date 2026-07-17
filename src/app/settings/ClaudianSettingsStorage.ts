@@ -11,6 +11,7 @@ import {
   inferEnvironmentSnippetScope,
   resolveEnvironmentSnippetScope,
 } from '../../core/providers/providerEnvironment';
+import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import type { VaultFileAdapter } from '../../core/storage/VaultFileAdapter';
 import {
   CHAT_VIEW_PLACEMENTS,
@@ -21,18 +22,6 @@ import {
   type HiddenProviderCommands,
   type ProviderConfigMap,
 } from '../../core/types/settings';
-import {
-  getClaudeProviderSettings,
-  updateClaudeProviderSettings,
-} from '../../providers/claude/settings';
-import {
-  getCodexProviderSettings,
-  updateCodexProviderSettings,
-} from '../../providers/codex/settings';
-import {
-  getOpencodeProviderSettings,
-  updateOpencodeProviderSettings,
-} from '../../providers/opencode/settings';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './defaultSettings';
 
 export {
@@ -42,56 +31,37 @@ export {
 
 export type StoredClaudianSettings = ClaudianSettings;
 
-const LEGACY_TOP_LEVEL_PROVIDER_FIELDS = [
-  'claudeSafeMode',
-  'codexSafeMode',
-  'claudeCliPath',
-  'claudeCliPathsByHost',
-  'codexCliPath',
-  'codexCliPathsByHost',
-  'codexReasoningSummary',
-  'loadUserClaudeSettings',
-  'codexEnabled',
-  'lastClaudeModel',
-  'enableChrome',
-  'enableBangBash',
-  'enableOpus1M',
-  'enableSonnet1M',
-  'environmentVariables',
-  'lastEnvHash',
-  'lastCodexEnvHash',
+const LEGACY_STRIPPED_SHARED_SETTING_FIELDS = [
+  'activeConversationId',
+  'show1MModel',
+  'hiddenSlashCommands',
+  'slashCommands',
+  'allowExternalAccess',
+  'allowedExportPaths',
+  'enableBlocklist',
+  'blockedCommands',
+  'openInMainTab',
 ] as const;
 
+function getProviderSettingsAdapters() {
+  return ProviderRegistry.getRegisteredProviderIds().map(providerId => ({
+    adapter: ProviderRegistry.getSettingsStorageAdapter(providerId),
+    providerId,
+  }));
+}
+
+function getLegacyTopLevelProviderFields(): string[] {
+  return getProviderSettingsAdapters().flatMap(({ adapter }) => adapter.legacyTopLevelFields ?? []);
+}
+
 function stripLegacyFields(settings: Record<string, unknown>): Record<string, unknown> {
-  const {
-    activeConversationId: _activeConversationId,
-    show1MModel: _show1MModel,
-    hiddenSlashCommands: _hiddenSlashCommands,
-    slashCommands: _slashCommands,
-    allowExternalAccess: _allowExternalAccess,
-    allowedExportPaths: _allowedExportPaths,
-    enableBlocklist: _enableBlocklist,
-    blockedCommands: _blockedCommands,
-    claudeSafeMode: _claudeSafeMode,
-    codexSafeMode: _codexSafeMode,
-    claudeCliPath: _claudeCliPath,
-    claudeCliPathsByHost: _claudeCliPathsByHost,
-    codexCliPath: _codexCliPath,
-    codexCliPathsByHost: _codexCliPathsByHost,
-    codexReasoningSummary: _codexReasoningSummary,
-    loadUserClaudeSettings: _loadUserClaudeSettings,
-    codexEnabled: _codexEnabled,
-    lastClaudeModel: _lastClaudeModel,
-    enableChrome: _enableChrome,
-    enableBangBash: _enableBangBash,
-    enableOpus1M: _enableOpus1M,
-    enableSonnet1M: _enableSonnet1M,
-    environmentVariables: _environmentVariables,
-    lastEnvHash: _lastEnvHash,
-    lastCodexEnvHash: _lastCodexEnvHash,
-    openInMainTab: _openInMainTab,
-    ...cleaned
-  } = settings;
+  const cleaned = { ...settings };
+  for (const key of [
+    ...LEGACY_STRIPPED_SHARED_SETTING_FIELDS,
+    ...getLegacyTopLevelProviderFields(),
+  ]) {
+    delete cleaned[key];
+  }
   return cleaned;
 }
 
@@ -140,11 +110,30 @@ function normalizeProviderConfigs(value: unknown): ProviderConfigMap {
   return result;
 }
 
-const HOST_SCOPED_PROVIDER_CONFIG_FIELDS: Record<string, string[]> = {
-  claude: ['cliPathsByHost'],
-  codex: ['cliPathsByHost', 'installationMethodsByHost', 'wslDistroOverridesByHost'],
-  opencode: ['cliPathsByHost'],
-};
+function projectPersistableProviderConfigs(value: unknown): {
+  changed: boolean;
+  providerConfigs: ProviderConfigMap;
+} {
+  const providerConfigs = normalizeProviderConfigs(value);
+  let changed = false;
+
+  for (const { adapter, providerId } of getProviderSettingsAdapters()) {
+    const fields = adapter.runtimeOnlyFields ?? [];
+    const config = providerConfigs[providerId];
+    if (!config) {
+      continue;
+    }
+
+    for (const field of fields) {
+      if (field in config) {
+        delete config[field];
+        changed = true;
+      }
+    }
+  }
+
+  return { changed, providerConfigs };
+}
 
 function hasHostScopedProviderConfigNormalization(
   original: ProviderConfigMap,
@@ -155,7 +144,8 @@ function hasHostScopedProviderConfigNormalization(
   }
 
   const normalizedConfigs = normalized as ProviderConfigMap;
-  for (const [providerId, fields] of Object.entries(HOST_SCOPED_PROVIDER_CONFIG_FIELDS)) {
+  for (const { adapter, providerId } of getProviderSettingsAdapters()) {
+    const fields = adapter.hostScopedFields ?? [];
     const originalConfig = original[providerId];
     const normalizedConfig = normalizedConfigs[providerId];
     if (!originalConfig || !normalizedConfig) {
@@ -194,6 +184,27 @@ function normalizeContextLimits(value: unknown): Record<string, number> | undefi
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function normalizeModelAliases(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const result: Record<string, string> = {};
+  for (const [key, alias] of Object.entries(value)) {
+    if (typeof alias !== 'string') {
+      continue;
+    }
+
+    const modelId = key.trim();
+    const normalizedAlias = alias.trim();
+    if (modelId && normalizedAlias) {
+      result[modelId] = normalizedAlias;
+    }
+  }
+
+  return result;
+}
+
 function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
   if (!Array.isArray(value)) {
     return [];
@@ -215,6 +226,10 @@ function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
       continue;
     }
 
+    const modelAliases = 'modelAliases' in candidate
+      ? normalizeModelAliases(candidate.modelAliases)
+      : undefined;
+
     snippets.push({
       id: candidate.id,
       name: candidate.name,
@@ -227,6 +242,7 @@ function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
           : inferEnvironmentSnippetScope(candidate.envVars),
       ),
       contextLimits: normalizeContextLimits(candidate.contextLimits),
+      modelAliases,
     });
   }
 
@@ -234,7 +250,7 @@ function normalizeEnvSnippets(value: unknown): EnvSnippet[] {
 }
 
 function hasLegacyTopLevelProviderFields(stored: Record<string, unknown>): boolean {
-  return LEGACY_TOP_LEVEL_PROVIDER_FIELDS.some((key) => key in stored);
+  return getLegacyTopLevelProviderFields().some((key) => key in stored);
 }
 
 function mergeLegacyClaudeHiddenCommands(
@@ -268,7 +284,11 @@ export class ClaudianSettingsStorage {
       stored.hiddenSlashCommands,
     );
     const envSnippets = normalizeEnvSnippets(stored.envSnippets);
-    const providerConfigs = normalizeProviderConfigs(stored.providerConfigs);
+    const customModelAliases = normalizeModelAliases(stored.customModelAliases);
+    const {
+      changed: didStripRuntimeProviderConfig,
+      providerConfigs,
+    } = projectPersistableProviderConfigs(stored.providerConfigs);
     const chatViewPlacement = normalizeChatViewPlacement(
       stored.chatViewPlacement,
       stored.openInMainTab,
@@ -286,6 +306,7 @@ export class ClaudianSettingsStorage {
       ...storedWithoutLegacy,
       sharedEnvironmentVariables: getSharedEnvironmentVariables(legacyProviderSettings),
       envSnippets,
+      customModelAliases,
       hiddenProviderCommands,
       providerConfigs,
       chatViewPlacement,
@@ -294,20 +315,15 @@ export class ClaudianSettingsStorage {
     const merged = {
       ...this.getDefaults(),
       ...legacyNormalized,
-    } as StoredClaudianSettings;
+    };
 
-    updateClaudeProviderSettings(
-      merged as unknown as Record<string, unknown>,
-      getClaudeProviderSettings(legacyProviderSettings),
-    );
-    updateCodexProviderSettings(
-      merged as unknown as Record<string, unknown>,
-      getCodexProviderSettings(legacyProviderSettings),
-    );
-    updateOpencodeProviderSettings(
-      merged,
-      getOpencodeProviderSettings(legacyProviderSettings),
-    );
+    let didNormalizeProviderSettings = false;
+    for (const { adapter } of getProviderSettingsAdapters()) {
+      didNormalizeProviderSettings = adapter.normalizeStored(
+        merged,
+        legacyProviderSettings,
+      ) || didNormalizeProviderSettings;
+    }
     const didNormalizeHostScopedProviderConfigs = hasHostScopedProviderConfigNormalization(
       providerConfigs,
       merged.providerConfigs,
@@ -327,6 +343,12 @@ export class ClaudianSettingsStorage {
       || 'blockedCommands' in stored
       || shouldPersistChatViewPlacementMigration(stored, chatViewPlacement)
       || JSON.stringify(envSnippets) !== JSON.stringify(stored.envSnippets ?? [])
+      || (
+        'customModelAliases' in stored
+        && JSON.stringify(customModelAliases) !== JSON.stringify(stored.customModelAliases ?? {})
+      )
+      || didNormalizeProviderSettings
+      || didStripRuntimeProviderConfig
       || didNormalizeHostScopedProviderConfigs
       )
     ) {
@@ -337,8 +359,12 @@ export class ClaudianSettingsStorage {
   }
 
   async save(settings: StoredClaudianSettings): Promise<void> {
+    const { providerConfigs } = projectPersistableProviderConfigs(settings.providerConfigs);
     const content = JSON.stringify(
-      stripLegacyFields(settings as unknown as Record<string, unknown>),
+      stripLegacyFields({
+        ...settings,
+        providerConfigs,
+      }),
       null,
       2,
     );
@@ -357,29 +383,6 @@ export class ClaudianSettingsStorage {
   async update(updates: Partial<StoredClaudianSettings>): Promise<void> {
     const current = await this.load();
     await this.save({ ...current, ...updates });
-  }
-
-  async setLastModel(model: string, isCustom: boolean): Promise<void> {
-    if (isCustom) {
-      await this.update({ lastCustomModel: model });
-      return;
-    }
-
-    const current = await this.load();
-    updateClaudeProviderSettings(
-      current as unknown as Record<string, unknown>,
-      { lastModel: model },
-    );
-    await this.save(current);
-  }
-
-  async setLastEnvHash(hash: string): Promise<void> {
-    const current = await this.load();
-    updateClaudeProviderSettings(
-      current as unknown as Record<string, unknown>,
-      { environmentHash: hash },
-    );
-    await this.save(current);
   }
 
   private getDefaults(): StoredClaudianSettings {

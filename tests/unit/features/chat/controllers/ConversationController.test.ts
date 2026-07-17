@@ -136,6 +136,21 @@ describe('ConversationController', () => {
         expect(deps.plugin.updateConversation).toHaveBeenCalledWith('old-conv', expect.any(Object));
       });
 
+      it('drains async completions and terminalizes tasks before saving', async () => {
+        const awaitCompletion = jest.fn().mockResolvedValue(undefined);
+        deps = createMockDeps({ awaitBackgroundWork: awaitCompletion });
+        deps.state.messages = [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }];
+        deps.state.currentConversationId = 'old-conv';
+        controller = new ConversationController(deps);
+
+        await controller.createNew();
+
+        expect(awaitCompletion.mock.invocationCallOrder[0])
+          .toBeLessThan((deps.subagentManager.orphanAllActive as jest.Mock).mock.invocationCallOrder[0]);
+        expect((deps.subagentManager.orphanAllActive as jest.Mock).mock.invocationCallOrder[0])
+          .toBeLessThan((deps.plugin.updateConversation as jest.Mock).mock.invocationCallOrder[0]);
+      });
+
       it('should reset file context for new conversation', async () => {
         const fileContextManager = deps.getFileContextManager()!;
 
@@ -161,7 +176,8 @@ describe('ConversationController', () => {
         // Conversation is created lazily on first message send
         await controller.createNew();
 
-        expect(deps.plugin.findEmptyConversation).not.toHaveBeenCalled();
+        expect((deps.plugin as unknown as { findEmptyConversation: jest.Mock }).findEmptyConversation)
+          .not.toHaveBeenCalled();
         expect(deps.plugin.createConversation).not.toHaveBeenCalled();
         expect(deps.plugin.switchConversation).not.toHaveBeenCalled();
         expect(deps.state.currentConversationId).toBeNull();
@@ -761,6 +777,222 @@ describe('ConversationController', () => {
         expect(container.children.length).toBe(2); // header + list
       });
 
+      it('should highlight conversations already open in a tab', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationOpenState: (id) => id === 'conv-2' ? 'open' : 'current',
+        });
+
+        const list = container.children[1];
+        const openItem = list.children[1];
+        const openItemDate = openItem.querySelector('.claudian-history-item-date');
+
+        expect(openItem.hasClass('open')).toBe(true);
+        expect(openItem.hasClass('active')).toBe(false);
+        expect(openItem.getAttribute('data-open-state')).toBe('open');
+        expect(openItemDate?.textContent).toBe('Open in tab');
+      });
+
+      it('should display the current tab number when available', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: () => ({
+            openState: 'current',
+            isRunning: false,
+            location: 'current-view',
+            tabIndex: 1,
+          }),
+        });
+
+        const list = container.children[1];
+        const currentItem = list.children[0];
+        const currentItemDate = currentItem.querySelector('.claudian-history-item-date');
+
+        expect(currentItem.getAttribute('data-tab-index')).toBe('1');
+        expect(currentItem.getAttribute('data-tab-location')).toBe('current-view');
+        expect(currentItemDate?.textContent).toBe('Current tab 1');
+      });
+
+      it('should display the open tab number when available', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: (id) => id === 'conv-2'
+            ? { openState: 'open', isRunning: false, location: 'current-view', tabIndex: 2 }
+            : { openState: 'current', isRunning: false, location: 'current-view', tabIndex: 1 },
+        });
+
+        const list = container.children[1];
+        const openItem = list.children[1];
+        const openItemDate = openItem.querySelector('.claudian-history-item-date');
+
+        expect(openItem.getAttribute('data-tab-index')).toBe('2');
+        expect(openItem.getAttribute('data-tab-location')).toBe('current-view');
+        expect(openItemDate?.textContent).toBe('Open in tab 2');
+      });
+
+      it('should display running status for the current conversation', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: () => ({
+            openState: 'current',
+            isRunning: true,
+          }),
+        });
+
+        const list = container.children[1];
+        const currentItem = list.children[0];
+        const currentItemDate = currentItem.querySelector('.claudian-history-item-date');
+
+        expect(currentItem.hasClass('active')).toBe(true);
+        expect(currentItem.hasClass('running')).toBe(true);
+        expect(currentItem.getAttribute('data-running')).toBe('true');
+        expect(currentItemDate?.textContent).toBe('Running in current tab');
+      });
+
+      it('should display running status for a conversation open in another tab', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Running elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: (id) => id === 'conv-2'
+            ? { openState: 'open', isRunning: true, location: 'current-view', tabIndex: 2 }
+            : { openState: 'current', isRunning: false },
+        });
+
+        const list = container.children[1];
+        const runningItem = list.children[1];
+        const runningItemDate = runningItem.querySelector('.claudian-history-item-date');
+
+        expect(runningItem.hasClass('open')).toBe(true);
+        expect(runningItem.hasClass('running')).toBe(true);
+        expect(runningItem.getAttribute('data-open-state')).toBe('open');
+        expect(runningItem.getAttribute('data-running')).toBe('true');
+        expect(runningItemDate?.textContent).toBe('Running in tab 2');
+      });
+
+      it('should display another-pane status without a local tab number', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+          { id: 'conv-3', title: 'Running elsewhere', createdAt: 3000, lastResponseAt: 500 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          getConversationStatus: (id) => {
+            if (id === 'conv-2') {
+              return { openState: 'open', isRunning: false, location: 'other-view' };
+            }
+            if (id === 'conv-3') {
+              return { openState: 'open', isRunning: true, location: 'other-view' };
+            }
+            return { openState: 'current', isRunning: false, location: 'current-view', tabIndex: 1 };
+          },
+        });
+
+        const list = container.children[1];
+        const openOtherPaneItem = list.children[1];
+        const runningOtherPaneItem = list.children[2];
+        const runningOtherPaneDate = runningOtherPaneItem.querySelector('.claudian-history-item-date');
+        const openOtherPaneDate = openOtherPaneItem.querySelector('.claudian-history-item-date');
+
+        expect(runningOtherPaneItem.getAttribute('data-tab-location')).toBe('other-view');
+        expect(runningOtherPaneItem.getAttribute('data-tab-index')).toBeNull();
+        expect(runningOtherPaneDate?.textContent).toBe('Running in another pane');
+        expect(openOtherPaneDate?.textContent).toBe('Open in another pane');
+      });
+
+      it('should render a new-tab button for closed conversations', async () => {
+        const container = createMockEl();
+        const onSelectConversation = jest.fn();
+        const onOpenConversationInNewTab = jest.fn().mockResolvedValue(undefined);
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Closed', createdAt: 2000, lastResponseAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation,
+          onOpenConversationInNewTab,
+          getConversationOpenState: (id) => id === 'conv-2' ? 'closed' : 'current',
+        });
+
+        const list = container.children[1];
+        const closedItem = list.children[1];
+        const openInNewTabBtn = closedItem.querySelector('.claudian-open-new-tab-btn');
+        const clickHandlers = openInNewTabBtn?._eventListeners?.get('click');
+
+        expect(openInNewTabBtn).toBeTruthy();
+        expect(clickHandlers).toBeDefined();
+
+        await clickHandlers![0]({ stopPropagation: jest.fn() });
+
+        expect(onOpenConversationInNewTab).toHaveBeenCalledWith('conv-2', true);
+        expect(onSelectConversation).not.toHaveBeenCalled();
+      });
+
+      it('should not render a new-tab button for already-open conversations', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Open elsewhere', createdAt: 2000, lastResponseAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          onOpenConversationInNewTab: jest.fn().mockResolvedValue(undefined),
+          getConversationOpenState: (id) => id === 'conv-2' ? 'open' : 'current',
+        });
+
+        const list = container.children[1];
+        const openItem = list.children[1];
+
+        expect(openItem.querySelector('.claudian-open-new-tab-btn')).toBeNull();
+      });
+
       it('should open a conversation in a new tab on modifier click when supported', async () => {
         const container = createMockEl();
         const onSelectConversation = jest.fn();
@@ -855,8 +1087,8 @@ describe('ConversationController', () => {
 
         const menu = (Menu as typeof Menu & { instances: Array<{ items: Array<{ title: string }> }> }).instances[0];
         expect(menu.items.map(item => item.title)).toEqual([
-          'Open in New Tab',
-          'Open in Background Tab',
+          'Open in new tab',
+          'Open in background tab',
           'Rename',
           'Delete',
         ]);
@@ -887,7 +1119,40 @@ describe('ConversationController', () => {
 
         const menu = (Menu as typeof Menu & { instances: Array<{ items: Array<{ title: string }> }> }).instances[0];
         expect(menu.items.map(item => item.title)).toEqual([
-          'Switch to Open Session',
+          'Switch to open session',
+          'Rename',
+          'Delete',
+        ]);
+      });
+
+      it('should derive context menu open state from conversation status', () => {
+        const container = createMockEl();
+
+        deps.state.currentConversationId = 'conv-1';
+        (deps.plugin.getConversationList as jest.Mock).mockReturnValue([
+          { id: 'conv-1', title: 'Current', createdAt: 1000, lastResponseAt: 2000 },
+          { id: 'conv-2', title: 'Other', createdAt: 2000, lastResponseAt: 1000 },
+        ]);
+
+        controller.renderHistoryDropdown(container, {
+          onSelectConversation: jest.fn(),
+          onOpenConversationInNewTab: jest.fn().mockResolvedValue(undefined),
+          getConversationStatus: (id) => id === 'conv-2'
+            ? { openState: 'open', isRunning: false, location: 'current-view', tabIndex: 2 }
+            : { openState: 'current', isRunning: false, location: 'current-view', tabIndex: 1 },
+        });
+
+        const list = container.children[1];
+        const otherItem = list.children[1];
+        otherItem.dispatchEvent({
+          type: 'contextmenu',
+          stopPropagation: jest.fn(),
+          preventDefault: jest.fn(),
+        });
+
+        const menu = (Menu as typeof Menu & { instances: Array<{ items: Array<{ title: string }> }> }).instances[0];
+        expect(menu.items.map(item => item.title)).toEqual([
+          'Switch to open session',
           'Rename',
           'Delete',
         ]);
@@ -920,6 +1185,7 @@ describe('ConversationController', () => {
       expect(clickHandlers).toBeDefined();
 
       await clickHandlers![0]({ stopPropagation: jest.fn() });
+      await Promise.resolve();
 
       expect(deps.plugin.switchConversation).toHaveBeenCalledWith('conv-2');
     });
@@ -2292,7 +2558,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m3');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
   });
 
   it('should show Notice when message ID not found', async () => {
@@ -2335,7 +2601,7 @@ describe('ConversationController - Rewind', () => {
     expect(mockAgentService.rewind).not.toHaveBeenCalled();
   });
 
-  it('should show Notice when no previous assistant with uuid exists', async () => {
+  it('should allow rewind when no previous assistant with uuid exists', async () => {
     deps.state.messages = [
       { id: 'm1', role: 'user', content: 'test', timestamp: 1, userMessageId: 'u1' },
       { id: 'm2', role: 'assistant', content: '', timestamp: 2, assistantMessageId: 'a1' },
@@ -2343,8 +2609,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m1');
 
-    expect(mockNotice).toHaveBeenCalled();
-    expect(mockAgentService.rewind).not.toHaveBeenCalled();
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('u1', undefined, 'code-and-conversation');
   });
 
   it('should show Notice when no response assistant with uuid exists', async () => {
@@ -2403,7 +2668,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m2');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
     expect(truncateSpy).toHaveBeenCalledWith('m2');
     expect(deps.renderer.renderMessages).toHaveBeenCalledWith(
       expect.any(Array),
@@ -2424,6 +2689,61 @@ describe('ConversationController - Rewind', () => {
     expect(noticeMsg).toContain('1');
 
     truncateSpy.mockRestore();
+  });
+
+  it('should rewind to before the first user message and clear provider session state', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'user', content: 'first prompt', timestamp: 1, userMessageId: 'user-uuid' },
+      { id: 'm2', role: 'assistant', content: 'resp', timestamp: 2, assistantMessageId: 'resp-a' },
+    ];
+    (deps.plugin.getConversationSync as jest.Mock).mockReturnValue({
+      id: 'conv-1',
+      providerId: 'claude',
+      sessionId: 'old-session',
+      providerState: { providerSessionId: 'old-session' },
+      messages: deps.state.messages,
+    });
+
+    await controller.rewind('m1');
+
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', undefined, 'code-and-conversation');
+    expect(mockAgentService.buildSessionUpdates).not.toHaveBeenCalled();
+    expect(deps.state.messages).toEqual([]);
+    expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
+      'conv-1',
+      expect.objectContaining({
+        messages: [],
+        sessionId: null,
+        providerState: undefined,
+        resumeAtMessageId: undefined,
+      })
+    );
+    expect(deps.getInputEl().value).toBe('first prompt');
+  });
+
+  it('should pass conversation-only mode and keep file changes', async () => {
+    deps.state.currentConversationId = 'conv-1';
+    deps.state.messages = [
+      { id: 'm1', role: 'assistant', content: '', timestamp: 1, assistantMessageId: 'prev-a' },
+      { id: 'm2', role: 'user', content: 'test', timestamp: 2, userMessageId: 'user-uuid' },
+      { id: 'm3', role: 'assistant', content: 'resp', timestamp: 3, assistantMessageId: 'resp-a' },
+    ];
+
+    await controller.rewind('m2', 'conversation');
+
+    expect(confirm).toHaveBeenCalledWith(
+      deps.plugin.app,
+      'Rewind conversation to this point? File changes will be kept.',
+      'Rewind',
+    );
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'conversation');
+    expect(deps.plugin.updateConversation).toHaveBeenCalledWith(
+      'conv-1',
+      expect.objectContaining({ resumeAtMessageId: 'prev-a' })
+    );
+    const noticeMsg = mockNotice.mock.calls[0][0] as string;
+    expect(noticeMsg).toBe('Rewound conversation; file changes kept');
   });
 
   it('should abort when confirmation is declined', async () => {
@@ -2471,7 +2791,7 @@ describe('ConversationController - Rewind', () => {
 
     await controller.rewind('m2');
 
-    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a');
+    expect(mockAgentService.rewind).toHaveBeenCalledWith('user-uuid', 'prev-a', 'code-and-conversation');
     const msg = mockNotice.mock.calls[0][0] as string;
     expect(msg).toContain('Save failed');
   });

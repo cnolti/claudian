@@ -6,6 +6,7 @@ import {
   type SystemPromptSettings,
 } from '../../../core/prompt/mainAgent';
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type {
@@ -17,14 +18,15 @@ import type {
   ApprovalDecisionOption,
   AskUserQuestionCallback,
   AutoTurnCallback,
+  ChatRewindMode,
   ChatRewindResult,
+  ChatRuntimeConversationState,
   ChatRuntimeEnsureReadyOptions,
   ChatRuntimeQueryOptions,
   ChatTurnMetadata,
   ChatTurnRequest,
   PreparedChatTurn,
   SessionUpdateResult,
-  SubagentRuntimeState,
 } from '../../../core/runtime/types';
 import type {
   ApprovalDecision,
@@ -35,7 +37,6 @@ import type {
   StreamChunk,
   ToolCallInfo,
 } from '../../../core/types';
-import type ClaudianPlugin from '../../../main';
 import { getEnhancedPath } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import {
@@ -56,6 +57,7 @@ import {
   buildAcpUsageInfo,
   extractAcpSessionModelState,
   extractAcpSessionModeState,
+  extractAcpSessionThoughtLevelState,
 } from '../../acp';
 import { OPENCODE_PROVIDER_CAPABILITIES } from '../capabilities';
 import { updateOpencodeDiscoveryState } from '../discoveryState';
@@ -64,18 +66,19 @@ import {
   sameModes,
   sameStringList,
   sameStringMap,
+  sameThinkingOptionsByModel,
 } from '../internal/compareCollections';
 import { ensureProviderProjectionMap } from '../internal/providerProjection';
 import {
-  combineOpencodeRawModelSelection,
   decodeOpencodeModelId,
   encodeOpencodeModelId,
-  extractOpencodeModelVariantValue,
   isOpencodeModelSelectionId,
   normalizeOpencodeDiscoveredModels,
+  normalizeOpencodeModelVariants,
   OPENCODE_DEFAULT_THINKING_LEVEL,
   OPENCODE_SYNTHETIC_MODEL_ID,
   resolveOpencodeBaseModelRawId,
+  resolveOpencodeDefaultThinkingLevel,
 } from '../models';
 import {
   getManagedOpencodeModes,
@@ -92,6 +95,7 @@ import { prepareOpencodeLaunchArtifacts } from './OpencodeLaunchArtifacts';
 import { buildOpencodeRuntimeEnv } from './OpencodeRuntimeEnvironment';
 
 interface ActiveTurn {
+  cancelled: boolean;
   queue: StreamChunkQueue;
   sessionId: string;
 }
@@ -102,6 +106,9 @@ class StreamChunkQueue {
   private readonly waiters: Array<(chunk: StreamChunk | null) => void> = [];
 
   push(chunk: StreamChunk): void {
+    if (this.closed) {
+      return;
+    }
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter(chunk);
@@ -142,10 +149,17 @@ export class OpencodeChatRuntime implements ChatRuntime {
   private activeTurn: ActiveTurn | null = null;
   private approvalCallback: ApprovalCallback | null = null;
   private connection: AcpClientConnection | null = null;
+  private connectionGeneration = 0;
+  private conversationId: string | null = null;
+  private conversationGeneration = 0;
   private contextUsage: AcpUsageUpdate | null = null;
   private currentDatabasePath: string | null = null;
   private currentLaunchKey: string | null = null;
+  private currentSessionEffortConfigId: string | null = null;
+  private currentSessionEffortValue: string | null = null;
+  private currentSessionEffortValues = new Set<string>();
   private currentSessionModelId: string | null = null;
+  private currentConversationModel: string | null = null;
   private currentSessionModeId: string | null = null;
   private currentTurnMetadata: ChatTurnMetadata = {};
   private loadedSessionId: string | null = null;
@@ -154,6 +168,10 @@ export class OpencodeChatRuntime implements ChatRuntime {
   private promptUsage: AcpUsage | null = null;
   private readonly readyListeners: Array<(ready: boolean) => void> = [];
   private ready = false;
+  private readinessFlight: { key: string; promise: Promise<boolean> } | null = null;
+  private disposed = false;
+  private lifecycleGeneration = 0;
+  private restartRequiredAfterCancel = false;
   private sessionInvalidated = false;
   private readonly supportedCommandWaiters: Array<(commands: SlashCommand[]) => void> = [];
   private supportedCommands: SlashCommand[] = [];
@@ -162,9 +180,10 @@ export class OpencodeChatRuntime implements ChatRuntime {
   private readonly sessionUpdateNormalizer = new AcpSessionUpdateNormalizer();
   private readonly toolStreamAdapter = createOpencodeToolStreamAdapter();
   private transport: AcpJsonRpcTransport | null = null;
+  private unregisterTransportClose: (() => void) | null = null;
 
   constructor(
-    private readonly plugin: ClaudianPlugin,
+    private readonly plugin: ProviderHost,
   ) {}
 
   getCapabilities(): Readonly<ProviderCapabilities> {
@@ -194,32 +213,119 @@ export class OpencodeChatRuntime implements ChatRuntime {
   setResumeCheckpoint(_checkpointId: string | undefined): void {}
 
   syncConversationState(
-    conversation: { providerState?: Record<string, unknown>; sessionId?: string | null } | null,
+    conversation: ChatRuntimeConversationState | null,
   ): void {
+    this.setCurrentConversationModel(conversation?.selectedModel);
     const previousSessionId = this.sessionId;
+    const nextConversationId = conversation?.id ?? null;
     const nextSessionId = conversation?.sessionId ?? null;
+    const state = getOpencodeState(conversation?.providerState);
+    const nextDatabasePath = state.databasePath
+      ?? ((!nextSessionId || nextSessionId !== previousSessionId) ? null : this.currentDatabasePath);
+    const targetChanged = nextConversationId !== this.conversationId
+      || nextSessionId !== this.sessionId
+      || nextDatabasePath !== this.currentDatabasePath;
     if (this.sessionId !== nextSessionId) {
+      this.currentSessionEffortConfigId = null;
+      this.currentSessionEffortValue = null;
+      this.currentSessionEffortValues = new Set<string>();
       this.currentSessionModelId = null;
       this.currentSessionModeId = null;
       this.sessionInvalidated = false;
       this.setSupportedCommands([]);
     }
+    this.conversationId = nextConversationId;
     this.sessionId = nextSessionId;
-    const state = getOpencodeState(conversation?.providerState);
-    if (state.databasePath) {
-      this.currentDatabasePath = state.databasePath;
-      return;
-    }
-
-    if (!nextSessionId || nextSessionId !== previousSessionId) {
-      this.currentDatabasePath = null;
+    this.currentDatabasePath = nextDatabasePath;
+    if (targetChanged) {
+      this.conversationGeneration += 1;
+      if (this.readinessFlight) {
+        void this.shutdownProcess();
+      }
     }
   }
 
   async reloadMcpServers(): Promise<void> {}
 
+  async warmModelMetadata(model: string): Promise<boolean> {
+    const conversationGeneration = this.conversationGeneration;
+    const selectedRawModelId = decodeOpencodeModelId(model);
+    if (!selectedRawModelId) {
+      return false;
+    }
+
+    if (!(await this.ensureReady({ allowSessionCreation: true }))) {
+      return false;
+    }
+    if (
+      !this.connection
+      || !this.sessionId
+      || !this.isConversationCurrent(conversationGeneration)
+    ) {
+      return false;
+    }
+
+    const discoveredModels = getOpencodeProviderSettings(this.plugin.settings).discoveredModels;
+    const selectedBaseRawModelId = resolveOpencodeBaseModelRawId(selectedRawModelId, discoveredModels);
+    if (!selectedBaseRawModelId) {
+      return false;
+    }
+
+    const availableModelIds = new Set(discoveredModels.map((entry) => entry.rawId));
+    if (availableModelIds.size > 0 && !availableModelIds.has(selectedBaseRawModelId)) {
+      return false;
+    }
+
+    const response = await this.connection.setConfigOption({
+      configId: 'model',
+      sessionId: this.sessionId,
+      type: 'select',
+      value: selectedBaseRawModelId,
+    });
+    if (!this.isConversationCurrent(conversationGeneration)) {
+      return false;
+    }
+    this.currentSessionModelId = selectedBaseRawModelId;
+    await this.syncSessionModelState({
+      configOptions: response.configOptions,
+    }, conversationGeneration);
+    return this.isConversationCurrent(conversationGeneration);
+  }
+
   async ensureReady(options?: ChatRuntimeEnsureReadyOptions): Promise<boolean> {
-    const settings = getOpencodeProviderSettings(this.plugin.settings as unknown as Record<string, unknown>);
+    if (this.disposed) {
+      return false;
+    }
+    const conversationGeneration = this.conversationGeneration;
+    const key = JSON.stringify({ conversationGeneration, options: options ?? {} });
+    if (this.readinessFlight) {
+      if (this.readinessFlight.key === key) {
+        return this.readinessFlight.promise;
+      }
+      await this.readinessFlight.promise.catch(() => undefined);
+      return this.ensureReady(options);
+    }
+
+    const lifecycleGeneration = this.lifecycleGeneration;
+    const promise = this.ensureReadyInternal(
+      options,
+      lifecycleGeneration,
+      conversationGeneration,
+    );
+    this.readinessFlight = { key, promise };
+    return promise.finally(() => {
+      if (this.readinessFlight?.promise === promise) {
+        this.readinessFlight = null;
+      }
+    });
+  }
+
+  private async ensureReadyInternal(
+    options: ChatRuntimeEnsureReadyOptions | undefined,
+    lifecycleGeneration: number,
+    conversationGeneration: number,
+  ): Promise<boolean> {
+    const settings = getOpencodeProviderSettings(this.plugin.settings);
     if (!settings.enabled) {
       this.setReady(false);
       return false;
@@ -238,12 +344,15 @@ export class OpencodeChatRuntime implements ChatRuntime {
       settings: promptSettings,
       workspaceRoot: cwd,
     });
+    if (!this.isReadinessCurrent(lifecycleGeneration, conversationGeneration)) {
+      return false;
+    }
     this.currentDatabasePath = artifacts.databasePath;
 
     const nextLaunchKey = JSON.stringify({
       command: resolvedCliPath,
       configPath: artifacts.configPath,
-      envText: getRuntimeEnvironmentText(this.plugin.settings as unknown as Record<string, unknown>, 'opencode'),
+      envText: getRuntimeEnvironmentText(this.plugin.settings, 'opencode'),
       promptKey: computeSystemPromptKey(promptSettings),
       artifactKey: artifacts.launchKey,
     });
@@ -252,24 +361,39 @@ export class OpencodeChatRuntime implements ChatRuntime {
       || !this.transport
       || !this.connection
       || !this.process.isAlive()
+      || this.transport.isClosed
       || options?.force === true
+      || this.restartRequiredAfterCancel
       || this.currentLaunchKey !== nextLaunchKey;
 
     if (shouldRestart) {
       await this.shutdownProcess();
+      if (!this.isReadinessCurrent(lifecycleGeneration, conversationGeneration)) {
+        return false;
+      }
       await this.startProcess({
         command: resolvedCliPath,
         configPath: artifacts.configPath,
         cwd,
         runtimeEnv,
       });
+      if (!this.isReadinessCurrent(lifecycleGeneration, conversationGeneration)) {
+        await this.shutdownProcess();
+        return false;
+      }
+      this.restartRequiredAfterCancel = false;
       this.currentLaunchKey = nextLaunchKey;
       this.loadedSessionId = null;
+      this.setReady(true);
     }
 
     if (targetSessionId) {
       if (this.loadedSessionId !== targetSessionId) {
-        const loaded = await this.loadSession(targetSessionId, cwd);
+        const loaded = await this.loadSession(targetSessionId, cwd, conversationGeneration);
+        if (!this.isReadinessCurrent(lifecycleGeneration, conversationGeneration)) {
+          await this.shutdownProcess();
+          return false;
+        }
         if (!loaded) {
           this.sessionInvalidated = true;
           this.clearActiveSession();
@@ -282,7 +406,12 @@ export class OpencodeChatRuntime implements ChatRuntime {
       if (options?.allowSessionCreation === false) {
         return true;
       }
-      return Boolean(await this.createSession(cwd));
+      const sessionId = await this.createSession(cwd, conversationGeneration);
+      if (!this.isReadinessCurrent(lifecycleGeneration, conversationGeneration)) {
+        await this.shutdownProcess();
+        return false;
+      }
+      return Boolean(sessionId);
     }
 
     return true;
@@ -293,6 +422,15 @@ export class OpencodeChatRuntime implements ChatRuntime {
     conversationHistory?: ChatMessage[],
     queryOptions?: ChatRuntimeQueryOptions,
   ): AsyncGenerator<StreamChunk> {
+    if (this.activeTurn) {
+      yield { type: 'error', content: 'OpenCode does not support overlapping turns.' };
+      yield { type: 'done' };
+      return;
+    }
+    if (queryOptions?.model) {
+      this.setCurrentConversationModel(queryOptions.model);
+    }
+    const conversationGeneration = this.conversationGeneration;
     const previousMessages = conversationHistory ?? [];
     const expectedSessionId = this.sessionId;
     let shouldBootstrapHistory = previousMessages.length > 0
@@ -300,6 +438,12 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
     if (!(await this.ensureReady())) {
       yield { type: 'error', content: 'Failed to start OpenCode. Check the CLI path and login state.' };
+      yield { type: 'done' };
+      return;
+    }
+
+    if (!this.isConversationCurrent(conversationGeneration)) {
+      yield { type: 'error', content: 'OpenCode conversation changed before the turn started.' };
       yield { type: 'done' };
       return;
     }
@@ -316,7 +460,7 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
 
     if (!this.sessionId) {
-      const sessionId = await this.createSession(cwd);
+      const sessionId = await this.createSession(cwd, conversationGeneration);
       if (!sessionId) {
         yield { type: 'error', content: 'Failed to create an OpenCode session.' };
         yield { type: 'done' };
@@ -325,8 +469,8 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
 
     const sessionId = this.sessionId!;
-    this.activeTurn?.queue.close();
     this.activeTurn = {
+      cancelled: false,
       queue: new StreamChunkQueue(),
       sessionId,
     };
@@ -338,8 +482,12 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
     const activeTurn = this.activeTurn;
     try {
-      await this.applySelectedMode(sessionId);
-      await this.applySelectedModel(sessionId, queryOptions);
+      await this.applySelectedMode(sessionId, conversationGeneration);
+      await this.applySelectedModel(sessionId, queryOptions, conversationGeneration);
+      await this.applySelectedEffort(sessionId, conversationGeneration);
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        throw new Error('OpenCode conversation changed before the turn started.');
+      }
     } catch (error) {
       yield {
         type: 'error',
@@ -395,7 +543,9 @@ export class OpencodeChatRuntime implements ChatRuntime {
         }
         yield chunk;
       }
-      await promptPromise;
+      if (!activeTurn.cancelled) {
+        await promptPromise;
+      }
     } finally {
       if (this.activeTurn === activeTurn) {
         this.activeTurn = null;
@@ -404,9 +554,15 @@ export class OpencodeChatRuntime implements ChatRuntime {
   }
 
   cancel(): void {
+    const activeTurn = this.activeTurn;
+    if (!activeTurn || activeTurn.cancelled) {
+      return;
+    }
     if (this.connection && this.sessionId) {
       this.connection.cancel({ sessionId: this.sessionId });
     }
+    this.restartRequiredAfterCancel = true;
+    this.settleActiveTurn();
   }
 
   resetSession(): void {
@@ -456,13 +612,19 @@ export class OpencodeChatRuntime implements ChatRuntime {
   }
 
   cleanup(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.lifecycleGeneration += 1;
     this.activeTurn?.queue.close();
     void this.shutdownProcess();
   }
 
   async rewind(
     _userMessageId: string,
-    _assistantMessageId: string,
+    _assistantMessageId: string | undefined,
+    _mode?: ChatRewindMode,
   ): Promise<ChatRewindResult> {
     return { canRewind: false };
   }
@@ -480,8 +642,6 @@ export class OpencodeChatRuntime implements ChatRuntime {
   setPermissionModeSyncCallback(callback: ((sdkMode: string) => void) | null): void {
     this.permissionModeSyncCallback = callback;
   }
-
-  setSubagentHookProvider(_getState: () => SubagentRuntimeState): void {}
 
   setAutoTurnCallback(_callback: AutoTurnCallback | null): void {}
 
@@ -561,7 +721,15 @@ export class OpencodeChatRuntime implements ChatRuntime {
       onClose: (listener) => this.process!.onClose(listener),
       output: this.process.stdin,
     });
+    const transport = this.transport;
+    this.unregisterTransportClose = transport.onClose((error) => {
+      if (this.transport === transport) {
+        this.setReady(false);
+        this.settleActiveTurn(error ?? new Error('OpenCode runtime closed'));
+      }
+    });
 
+    const connectionGeneration = ++this.connectionGeneration;
     this.connection = new AcpClientConnection({
       clientInfo: {
         name: 'claudian',
@@ -572,7 +740,10 @@ export class OpencodeChatRuntime implements ChatRuntime {
           readTextFile: (request) => this.readTextFile(request),
           writeTextFile: (request) => this.writeTextFile(request),
         },
-        onSessionNotification: (notification) => this.handleSessionNotification(notification),
+        onSessionNotification: (notification) => this.handleSessionNotification(
+          notification,
+          connectionGeneration,
+        ),
         requestPermission: (request) => this.handlePermissionRequest(request),
       },
       transport: this.transport,
@@ -580,16 +751,18 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
     this.transport.start();
     await this.connection.initialize();
-    this.setReady(true);
   }
 
   private async shutdownProcess(): Promise<void> {
+    this.connectionGeneration += 1;
     this.setReady(false);
-    this.activeTurn?.queue.close();
-    this.activeTurn = null;
+    this.settleActiveTurn();
     this.currentSessionModelId = null;
     this.currentSessionModeId = null;
     this.setSupportedCommands([]);
+
+    this.unregisterTransportClose?.();
+    this.unregisterTransportClose = null;
 
     this.connection?.dispose();
     this.connection = null;
@@ -614,6 +787,22 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
   }
 
+  private isLifecycleCurrent(generation: number): boolean {
+    return !this.disposed && generation === this.lifecycleGeneration;
+  }
+
+  private isConversationCurrent(generation: number): boolean {
+    return generation === this.conversationGeneration;
+  }
+
+  private isReadinessCurrent(
+    lifecycleGeneration: number,
+    conversationGeneration: number,
+  ): boolean {
+    return this.isLifecycleCurrent(lifecycleGeneration)
+      && this.isConversationCurrent(conversationGeneration);
+  }
+
   private getSystemPromptSettings(vaultPath: string): SystemPromptSettings {
     return {
       customPrompt: this.plugin.settings.systemPrompt,
@@ -628,17 +817,21 @@ export class OpencodeChatRuntime implements ChatRuntime {
     databasePathOverride?: string | null,
   ): NodeJS.ProcessEnv {
     return buildOpencodeRuntimeEnv(
-      this.plugin.settings as unknown as Record<string, unknown>,
+      this.plugin.settings,
       cliPath,
       databasePathOverride,
     );
   }
 
   private getProviderSettings(): Record<string, unknown> {
-    return ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-      this.plugin.settings as unknown as Record<string, unknown>,
+    const settings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+      this.plugin.settings,
       this.providerId,
     );
+    if (this.currentConversationModel) {
+      settings.model = this.currentConversationModel;
+    }
+    return settings;
   }
 
   private resolveSelectedRawModelId(queryOptions?: ChatRuntimeQueryOptions): string | null {
@@ -659,29 +852,26 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
 
     const discoveredModels = getOpencodeProviderSettings(providerSettings).discoveredModels;
-    const effortLevel = typeof providerSettings.effortLevel === 'string'
-      ? providerSettings.effortLevel
-      : OPENCODE_DEFAULT_THINKING_LEVEL;
     const normalizedBaseRawModelId = resolveOpencodeBaseModelRawId(selectedBaseRawModelId, discoveredModels);
-    const resolvedRawModelId = combineOpencodeRawModelSelection(
-      normalizedBaseRawModelId,
-      effortLevel,
-      discoveredModels,
-    );
-    if (!resolvedRawModelId) {
+    if (!normalizedBaseRawModelId) {
       return null;
     }
 
     const availableModelIds = new Set(discoveredModels.map((model) => model.rawId));
-    if (availableModelIds.size > 0 && !availableModelIds.has(resolvedRawModelId)) {
+    if (availableModelIds.size > 0 && !availableModelIds.has(normalizedBaseRawModelId)) {
       return null;
     }
 
-    return resolvedRawModelId;
+    return normalizedBaseRawModelId;
   }
 
   getAuxiliaryModel(): string | null {
-    return this.getActiveDisplayModel() ?? null;
+    return this.currentConversationModel ?? this.getActiveDisplayModel() ?? null;
+  }
+
+  private setCurrentConversationModel(model: unknown): void {
+    const selectedModel = typeof model === 'string' ? model.trim() : '';
+    this.currentConversationModel = selectedModel || null;
   }
 
   private getActiveDisplayModel(queryOptions?: ChatRuntimeQueryOptions): string | undefined {
@@ -731,7 +921,10 @@ export class OpencodeChatRuntime implements ChatRuntime {
     return availableModes[0]?.id || null;
   }
 
-  private async applySelectedMode(sessionId: string): Promise<void> {
+  private async applySelectedMode(
+    sessionId: string,
+    conversationGeneration = this.conversationGeneration,
+  ): Promise<void> {
     if (!this.connection) {
       return;
     }
@@ -747,15 +940,19 @@ export class OpencodeChatRuntime implements ChatRuntime {
       type: 'select',
       value: selectedModeId,
     });
+    if (!this.isConversationCurrent(conversationGeneration)) {
+      return;
+    }
     this.currentSessionModeId = selectedModeId;
     await this.syncSessionModeState({
       configOptions: response.configOptions,
-    });
+    }, conversationGeneration);
   }
 
   private async applySelectedModel(
     sessionId: string,
     queryOptions?: ChatRuntimeQueryOptions,
+    conversationGeneration = this.conversationGeneration,
   ): Promise<void> {
     if (!this.connection) {
       return;
@@ -772,18 +969,69 @@ export class OpencodeChatRuntime implements ChatRuntime {
       type: 'select',
       value: selectedRawModelId,
     });
+    if (!this.isConversationCurrent(conversationGeneration)) {
+      return;
+    }
     this.currentSessionModelId = selectedRawModelId;
     await this.syncSessionModelState({
       configOptions: response.configOptions,
+    }, conversationGeneration);
+  }
+
+  private resolveSelectedEffortValue(): string | null {
+    const providerSettings = this.getProviderSettings();
+    const selectedEffort = typeof providerSettings.effortLevel === 'string'
+      ? providerSettings.effortLevel.trim()
+      : '';
+    if (!selectedEffort || selectedEffort === OPENCODE_DEFAULT_THINKING_LEVEL) {
+      return null;
+    }
+
+    return this.currentSessionEffortValues.has(selectedEffort)
+      ? selectedEffort
+      : null;
+  }
+
+  private async applySelectedEffort(
+    sessionId: string,
+    conversationGeneration = this.conversationGeneration,
+  ): Promise<void> {
+    if (!this.connection || !this.currentSessionEffortConfigId) {
+      return;
+    }
+
+    const selectedEffort = this.resolveSelectedEffortValue();
+    if (!selectedEffort || selectedEffort === this.currentSessionEffortValue) {
+      return;
+    }
+
+    const response = await this.connection.setConfigOption({
+      configId: this.currentSessionEffortConfigId,
+      sessionId,
+      type: 'select',
+      value: selectedEffort,
     });
+    if (!this.isConversationCurrent(conversationGeneration)) {
+      return;
+    }
+    this.currentSessionEffortValue = selectedEffort;
+    await this.syncSessionModelState({
+      configOptions: response.configOptions,
+    }, conversationGeneration);
   }
 
   private async syncSessionModelState(params: {
     configOptions?: AcpSessionConfigOption[] | null;
     models?: AcpSessionModelState | null;
-  }): Promise<void> {
+  }, conversationGeneration?: number): Promise<void> {
+    if (
+      conversationGeneration !== undefined
+      && !this.isConversationCurrent(conversationGeneration)
+    ) {
+      return;
+    }
     const acpState = extractAcpSessionModelState(params);
-    const currentRawModelId = acpState.currentModelId;
+    const currentRawModelId = acpState.currentModelId ?? this.currentSessionModelId;
     const discoveredModels = normalizeOpencodeDiscoveredModels(
       acpState.availableModels.map((model) => ({
         ...(model.description ? { description: model.description } : {}),
@@ -800,16 +1048,58 @@ export class OpencodeChatRuntime implements ChatRuntime {
     const currentBaseRawModelId = currentRawModelId
       ? resolveOpencodeBaseModelRawId(currentRawModelId, discoveredModels)
       : null;
-    const currentThinkingLevel = currentRawModelId
-      ? extractOpencodeModelVariantValue(currentRawModelId, discoveredModels)
+    const currentPreferredThinking = currentBaseRawModelId
+      ? currentSettings.preferredThinkingByModel[currentBaseRawModelId]
+      : '';
+    const thoughtLevelState = extractAcpSessionThoughtLevelState(params);
+    const currentThinkingOptions = normalizeOpencodeModelVariants(
+      thoughtLevelState.availableLevels.map((level) => ({
+        ...(level.description ? { description: level.description } : {}),
+        label: level.name,
+        value: level.id,
+      })),
+    );
+    const currentThinkingLevel = thoughtLevelState.currentLevel;
+    const defaultThinkingLevel = currentThinkingOptions.length > 0
+      ? resolveOpencodeDefaultThinkingLevel(
+        currentThinkingOptions,
+        currentPreferredThinking,
+        currentThinkingLevel ?? undefined,
+      )
+      : currentThinkingLevel;
+    this.currentSessionEffortConfigId = currentThinkingOptions.length > 0
+      ? thoughtLevelState.configId
       : null;
+    this.currentSessionEffortValue = currentThinkingOptions.length > 0
+      ? currentThinkingLevel
+      : null;
+    this.currentSessionEffortValues = new Set(currentThinkingOptions.map((option) => option.value));
+
+    const nextThinkingOptionsByModel = { ...currentSettings.thinkingOptionsByModel };
+    if (currentBaseRawModelId) {
+      if (currentThinkingOptions.length > 0) {
+        nextThinkingOptionsByModel[currentBaseRawModelId] = currentThinkingOptions;
+      } else {
+        delete nextThinkingOptionsByModel[currentBaseRawModelId];
+      }
+    }
+
     const nextVisibleModels = currentSettings.visibleModels.length === 0 && currentBaseRawModelId
       ? [currentBaseRawModelId]
       : currentSettings.visibleModels;
-    const nextPreferredThinkingByModel = currentBaseRawModelId && currentThinkingLevel
+    const shouldSeedCurrentThinking = currentBaseRawModelId
+      && defaultThinkingLevel
+      && (
+        !currentPreferredThinking
+        || (
+          currentThinkingOptions.length > 0
+          && !this.currentSessionEffortValues.has(currentPreferredThinking)
+        )
+      );
+    const nextPreferredThinkingByModel = shouldSeedCurrentThinking && currentBaseRawModelId && defaultThinkingLevel
       ? {
         ...currentSettings.preferredThinkingByModel,
-        [currentBaseRawModelId]: currentThinkingLevel,
+        [currentBaseRawModelId]: defaultThinkingLevel,
       }
       : currentSettings.preferredThinkingByModel;
     const shouldSeedVisibleModels = !sameStringList(currentSettings.visibleModels, nextVisibleModels);
@@ -817,33 +1107,67 @@ export class OpencodeChatRuntime implements ChatRuntime {
       currentSettings.preferredThinkingByModel,
       nextPreferredThinkingByModel,
     );
-    const discoveryChanged = discoveredModels.length > 0
-      && !sameDiscoveredModels(currentSettings.discoveredModels, discoveredModels)
+    const shouldUpdateDiscoveredModels = discoveredModels.length > 0
+      && !sameDiscoveredModels(currentSettings.discoveredModels, discoveredModels);
+    const shouldUpdateThinkingOptions = !sameThinkingOptionsByModel(
+      currentSettings.thinkingOptionsByModel,
+      nextThinkingOptionsByModel,
+    );
+    const discoveryChanged = shouldUpdateDiscoveredModels
       && updateOpencodeDiscoveryState(settingsBag, { discoveredModels });
     let changed = shouldSeedVisibleModels || shouldSeedPreferredThinking;
 
-    if (changed) {
-      updateOpencodeProviderSettings(settingsBag, {
-        ...(shouldSeedPreferredThinking ? { preferredThinkingByModel: nextPreferredThinkingByModel } : {}),
-        ...(shouldSeedVisibleModels ? { visibleModels: nextVisibleModels } : {}),
-      });
-    }
-
     if (currentBaseRawModelId) {
+      const probeSettings = {
+        ...settingsBag,
+        savedProviderEffort: {
+          ...(settingsBag.savedProviderEffort as Record<string, unknown> | undefined),
+        },
+        savedProviderModel: {
+          ...(settingsBag.savedProviderModel as Record<string, unknown> | undefined),
+        },
+      };
       const seeded = this.seedActiveModelSelection(
-        settingsBag,
+        probeSettings,
         encodeOpencodeModelId(currentBaseRawModelId),
-        currentThinkingLevel,
+        defaultThinkingLevel,
       );
       changed = changed || seeded;
     }
 
-    if (!changed && !discoveryChanged) {
+    if (!changed && !discoveryChanged && !shouldUpdateThinkingOptions) {
       return;
     }
 
-    if (changed) {
-      await this.plugin.saveSettings();
+    if (changed || shouldUpdateThinkingOptions) {
+      await this.plugin.mutateSettings((settings) => {
+        if (
+          conversationGeneration !== undefined
+          && !this.isConversationCurrent(conversationGeneration)
+        ) {
+          return;
+        }
+        if (currentBaseRawModelId) {
+          this.seedActiveModelSelection(
+            settings,
+            encodeOpencodeModelId(currentBaseRawModelId),
+            defaultThinkingLevel,
+          );
+        }
+        if (shouldUpdateThinkingOptions || shouldSeedPreferredThinking || shouldSeedVisibleModels) {
+          updateOpencodeProviderSettings(settings, {
+            ...(shouldSeedPreferredThinking ? { preferredThinkingByModel: nextPreferredThinkingByModel } : {}),
+            ...(shouldUpdateThinkingOptions ? { thinkingOptionsByModel: nextThinkingOptionsByModel } : {}),
+            ...(shouldSeedVisibleModels ? { visibleModels: nextVisibleModels } : {}),
+          });
+        }
+      });
+    }
+    if (
+      conversationGeneration !== undefined
+      && !this.isConversationCurrent(conversationGeneration)
+    ) {
+      return;
     }
     this.refreshModelSelectors();
   }
@@ -865,7 +1189,14 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
     if (thinkingLevel) {
       const savedProviderEffort = ensureProviderProjectionMap(settingsBag, 'savedProviderEffort');
-      if (typeof savedProviderEffort.opencode !== 'string' || !savedProviderEffort.opencode) {
+      const savedEffort = typeof savedProviderEffort.opencode === 'string'
+        ? savedProviderEffort.opencode.trim()
+        : '';
+      if (
+        !savedEffort
+        || savedEffort === OPENCODE_DEFAULT_THINKING_LEVEL
+        || !this.currentSessionEffortValues.has(savedEffort)
+      ) {
         savedProviderEffort.opencode = thinkingLevel;
         changed = true;
       }
@@ -882,7 +1213,11 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
     if (thinkingLevel) {
       const activeEffort = typeof settingsBag.effortLevel === 'string' ? settingsBag.effortLevel : '';
-      if (!activeEffort) {
+      if (
+        !activeEffort
+        || activeEffort === OPENCODE_DEFAULT_THINKING_LEVEL
+        || !this.currentSessionEffortValues.has(activeEffort)
+      ) {
         settingsBag.effortLevel = thinkingLevel;
         changed = true;
       }
@@ -894,7 +1229,13 @@ export class OpencodeChatRuntime implements ChatRuntime {
     configOptions?: AcpSessionConfigOption[] | null;
     currentModeId?: string | null;
     modes?: AcpSessionModeState | null;
-  }): Promise<void> {
+  }, conversationGeneration?: number): Promise<void> {
+    if (
+      conversationGeneration !== undefined
+      && !this.isConversationCurrent(conversationGeneration)
+    ) {
+      return;
+    }
     const acpState = extractAcpSessionModeState(params);
     const availableModes = normalizeOpencodeAvailableModes(acpState.availableModes);
     const currentModeId = params.currentModeId ?? acpState.currentModeId;
@@ -917,16 +1258,27 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
 
     if (shouldSeedSelectedMode && currentModeId) {
-      updateOpencodeProviderSettings(settingsBag, { selectedMode: currentModeId });
-      await this.plugin.saveSettings();
+      await this.plugin.mutateSettings((settings) => {
+        if (
+          conversationGeneration !== undefined
+          && !this.isConversationCurrent(conversationGeneration)
+        ) {
+          return;
+        }
+        updateOpencodeProviderSettings(settings, { selectedMode: currentModeId });
+      });
+    }
+    if (
+      conversationGeneration !== undefined
+      && !this.isConversationCurrent(conversationGeneration)
+    ) {
+      return;
     }
     this.refreshModelSelectors();
   }
 
   private refreshModelSelectors(): void {
-    for (const view of this.plugin.getAllViews()) {
-      view.refreshModelSelector();
-    }
+    this.plugin.refreshModelSelectors?.();
   }
 
   private emitPermissionModeSync(modeId: string): void {
@@ -942,7 +1294,27 @@ export class OpencodeChatRuntime implements ChatRuntime {
     }
   }
 
-  private async createSession(cwd: string): Promise<string | null> {
+  private settleActiveTurn(error?: Error): void {
+    const activeTurn = this.activeTurn;
+    if (!activeTurn || activeTurn.cancelled) {
+      return;
+    }
+
+    activeTurn.cancelled = true;
+    if (error) {
+      activeTurn.queue.push({ type: 'error', content: this.formatRuntimeError(error) });
+    }
+    activeTurn.queue.push({ type: 'done' });
+    activeTurn.queue.close();
+    if (this.activeTurn === activeTurn) {
+      this.activeTurn = null;
+    }
+  }
+
+  private async createSession(
+    cwd: string,
+    conversationGeneration = this.conversationGeneration,
+  ): Promise<string | null> {
     if (!this.connection) {
       return null;
     }
@@ -953,24 +1325,37 @@ export class OpencodeChatRuntime implements ChatRuntime {
         cwd,
         mcpServers: [],
       });
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        return null;
+      }
       this.loadedSessionId = response.sessionId;
       this.sessionId = response.sessionId;
       this.sessionCwds.set(response.sessionId, cwd);
       await this.syncSessionModelState({
         configOptions: response.configOptions ?? null,
         models: response.models ?? null,
-      });
+      }, conversationGeneration);
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        return null;
+      }
       await this.syncSessionModeState({
         configOptions: response.configOptions ?? null,
         modes: response.modes ?? null,
-      });
+      }, conversationGeneration);
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        return null;
+      }
       return response.sessionId;
     } catch {
       return null;
     }
   }
 
-  private async loadSession(sessionId: string, cwd: string): Promise<boolean> {
+  private async loadSession(
+    sessionId: string,
+    cwd: string,
+    conversationGeneration = this.conversationGeneration,
+  ): Promise<boolean> {
     if (!this.connection) {
       return false;
     }
@@ -982,6 +1367,9 @@ export class OpencodeChatRuntime implements ChatRuntime {
         mcpServers: [],
         sessionId,
       });
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        return false;
+      }
       this.sessionInvalidated = false;
       this.loadedSessionId = response.sessionId;
       this.sessionId = response.sessionId;
@@ -989,11 +1377,17 @@ export class OpencodeChatRuntime implements ChatRuntime {
       await this.syncSessionModelState({
         configOptions: response.configOptions ?? null,
         models: response.models ?? null,
-      });
+      }, conversationGeneration);
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        return false;
+      }
       await this.syncSessionModeState({
         configOptions: response.configOptions ?? null,
         modes: response.modes ?? null,
-      });
+      }, conversationGeneration);
+      if (!this.isConversationCurrent(conversationGeneration)) {
+        return false;
+      }
       return true;
     } catch {
       return false;
@@ -1002,7 +1396,11 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
   private async handleSessionNotification(
     notification: AcpSessionNotification,
+    connectionGeneration = this.connectionGeneration,
   ): Promise<void> {
+    if (connectionGeneration !== this.connectionGeneration) {
+      return;
+    }
     if (notification.sessionId !== this.sessionId) {
       return;
     }
@@ -1118,10 +1516,10 @@ export class OpencodeChatRuntime implements ChatRuntime {
 
     return new Promise<SlashCommand[]>((resolve) => {
       const waiter = (commands: SlashCommand[]) => {
-        clearTimeout(timeoutId);
+        window.clearTimeout(timeoutId);
         resolve([...commands]);
       };
-      const timeoutId = setTimeout(() => {
+      const timeoutId = window.setTimeout(() => {
         const index = this.supportedCommandWaiters.indexOf(waiter);
         if (index >= 0) {
           this.supportedCommandWaiters.splice(index, 1);

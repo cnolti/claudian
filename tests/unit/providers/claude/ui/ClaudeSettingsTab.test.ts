@@ -86,11 +86,11 @@ jest.mock('obsidian', () => {
   };
 });
 
-jest.mock('@/features/settings/ui/EnvironmentSettingsSection', () => ({
+jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
 
-jest.mock('@/features/settings/ui/McpSettingsManager', () => ({
+jest.mock('@/shared/settings/McpSettingsManager', () => ({
   McpSettingsManager: jest.fn(),
 }));
 
@@ -138,6 +138,7 @@ interface MockInputEl {
   style: Record<string, string>;
   dataset: Record<string, string>;
   addClass: jest.Mock;
+  toggleClass: jest.Mock;
   addEventListener: jest.Mock;
 }
 
@@ -190,6 +191,7 @@ function createInputEl(): MockInputEl & { _listeners: Map<string, Array<() => vo
     style: {},
     dataset: {},
     addClass: jest.fn(),
+    toggleClass: jest.fn(),
     addEventListener: jest.fn((event: string, handler: () => void) => {
       const handlers = listeners.get(event) ?? [];
       handlers.push(handler);
@@ -272,6 +274,7 @@ function createToggleComponent(): MockToggleComponent {
 }
 
 function createElement(): any {
+  const classes = new Set<string>();
   const element: any = {
     value: '',
     style: {},
@@ -282,6 +285,41 @@ function createElement(): any {
     createSpan: jest.fn(() => createElement()),
     setText: jest.fn(),
     empty: jest.fn(),
+    addClass: jest.fn((cls: string) => {
+      cls.split(/\s+/).filter(Boolean).forEach((item) => classes.add(item));
+    }),
+    removeClass: jest.fn((cls: string) => {
+      cls.split(/\s+/).filter(Boolean).forEach((item) => classes.delete(item));
+    }),
+    toggleClass: jest.fn((cls: string, force: boolean) => {
+      if (force) {
+        classes.add(cls);
+      } else {
+        classes.delete(cls);
+      }
+    }),
+    hasClass: jest.fn((cls: string) => classes.has(cls)),
+    classList: {
+      add: jest.fn((cls: string) => classes.add(cls)),
+      remove: jest.fn((cls: string) => classes.delete(cls)),
+      toggle: jest.fn((cls: string, force?: boolean) => {
+        if (force === undefined) {
+          if (classes.has(cls)) {
+            classes.delete(cls);
+            return false;
+          }
+          classes.add(cls);
+          return true;
+        }
+        if (force) {
+          classes.add(cls);
+        } else {
+          classes.delete(cls);
+        }
+        return force;
+      }),
+      contains: jest.fn((cls: string) => classes.has(cls)),
+    },
   };
 
   return element;
@@ -295,7 +333,7 @@ function createContainer(): any {
 }
 
 function createPlugin(overrides: Record<string, unknown> = {}): any {
-  return {
+  const plugin: any = {
     settings: {
       settingsProvider: 'claude',
       model: 'claude-opus-4-6',
@@ -311,6 +349,7 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     },
     saveSettings: mockSaveSettings,
     normalizeModelVariantSettings: jest.fn(() => false),
+    recycleProviderRuntimes: jest.fn().mockResolvedValue(undefined),
     getView: jest.fn(() => ({
       getTabManager: jest.fn(() => ({
         broadcastToAllTabs: jest.fn().mockResolvedValue(undefined),
@@ -324,12 +363,18 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
       },
     },
   };
+  plugin.mutateSettings = jest.fn(async (mutation: (settings: any) => void | Promise<void>) => {
+    await mutation(plugin.settings);
+    await plugin.saveSettings();
+  });
+  return plugin;
 }
 
 function createContext(plugin: any) {
   return {
     plugin,
     refreshModelSelectors: jest.fn(),
+    refreshTitleGenerationModelOptions: jest.fn(),
     renderHiddenProviderCommandSetting: jest.fn(),
     renderCustomContextLimits: jest.fn(),
   };
@@ -365,6 +410,16 @@ describe('ClaudeSettingsTab', () => {
 
     expect(cliPathInput.placeholder).toContain('cli-wrapper.cjs');
     expect(cliPathInput.placeholder).not.toContain('cli.js');
+  });
+
+  it('does not render obsolete Opus and Sonnet 1M toggles', () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+
+    claudeSettingsTabRenderer.render(createContainer(), context);
+
+    expect(createdSettings.map(setting => setting.name)).not.toContain('settings.enableOpus1M.name');
+    expect(createdSettings.map(setting => setting.name)).not.toContain('settings.enableSonnet1M.name');
   });
 
   it('does not switch the active model while the custom models textarea is mid-edit', async () => {

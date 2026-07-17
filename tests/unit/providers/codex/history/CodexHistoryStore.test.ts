@@ -3,6 +3,7 @@ import * as path from 'path';
 import {
   deriveCodexMemoriesDirFromSessionsRoot,
   deriveCodexSessionsRootFromSessionPath,
+  findCodexSessionFileAsync,
   parseCodexSessionContent,
   parseCodexSessionFile,
   parseCodexSessionTurns,
@@ -11,6 +12,30 @@ import {
 const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures');
 
 describe('CodexHistoryStore', () => {
+  it('settles lookup at the deadline when a directory read never resolves', async () => {
+    jest.useFakeTimers();
+    try {
+      const root = '/virtual/codex/sessions';
+      const pathExists = jest.fn(async (value: string) => value === root);
+      const readDirectory = jest.fn(() => new Promise<never>(() => {}));
+      const lookup = findCodexSessionFileAsync('thread', root, 10, {
+        pathExists,
+        readDirectory,
+      });
+
+      for (let index = 0; index < 10 && !readDirectory.mock.calls.length; index += 1) {
+        await Promise.resolve();
+      }
+      expect(pathExists).toHaveBeenCalled();
+      expect(readDirectory).toHaveBeenCalled();
+      jest.advanceTimersByTime(11);
+
+      await expect(lookup).resolves.toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   describe('path helpers', () => {
     it('derives transcript and memories roots from POSIX session paths', () => {
       const sessionFilePath = '/home/user/.codex/sessions/2026/04/14/rollout-thread.jsonl';
@@ -93,6 +118,148 @@ describe('CodexHistoryStore', () => {
         { type: 'thinking', content: 'First thought\n\nsecond thought' },
         { type: 'text', content: 'Done.' },
       ]);
+    });
+
+    it('preserves interleaved reasoning, tools, and assistant text in transcript order', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: 'Inspecting the note.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'Inspecting the note.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_read',
+            input: 'const r = await tools.exec_command({cmd:"sed -n \'1,20p\' DEMO.md"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_read',
+            output: 'Script completed\nOutput:\nDemo content',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:04.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: 'Verifying the edit.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:04.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'Verifying the edit.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_verify',
+            input: 'const r = await tools.exec_command({cmd:"tail -n 2 DEMO.md"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:06.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_verify',
+            output: 'Script completed\nOutput:\nEdited',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:07.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Done.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:07.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.contentBlocks).toEqual([
+        { type: 'thinking', content: 'Inspecting the note.' },
+        { type: 'tool_use', toolId: 'call_read' },
+        { type: 'thinking', content: 'Verifying the edit.' },
+        { type: 'tool_use', toolId: 'call_verify' },
+        { type: 'text', content: 'Done.' },
+      ]);
+    });
+
+    it('rehydrates user images from persisted input_image parts', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-06T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: '<image name=[Image #1] path="/tmp/1-image-1.png">' },
+              { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+              { type: 'input_text', text: '</image>' },
+              { type: 'input_text', text: 'What is in this image?' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-06T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'It says hello.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages[0]).toMatchObject({
+        content: 'What is in this image?',
+        images: [{
+          data: 'aGVsbG8=',
+          id: 'codex-img-turn-1-0',
+          mediaType: 'image/png',
+          name: 'image-1.png',
+          size: 5,
+          source: 'paste',
+        }],
+        role: 'user',
+      });
     });
   });
 
@@ -354,6 +521,295 @@ describe('CodexHistoryStore', () => {
       expect(patchTool!.status).toBe('completed');
     });
 
+    it('restores completed exec envelopes as their nested tools', () => {
+      const patch = '*** Begin Patch\n*** Update File: note.md\n*** End Patch';
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_exec_wrapper',
+            input: 'const r = await tools.exec_command({cmd:"ls -1",workdir:"/vault"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_exec_wrapper',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'file.txt\n' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_patch_wrapper',
+            input: `const patch = ${JSON.stringify(patch)};\ntext(await tools.apply_patch(patch));`,
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_patch_wrapper',
+            output: [{ type: 'input_text', text: 'Script completed\nOutput:\nApplied patch' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const toolCalls = messages.flatMap(message => message.toolCalls ?? []);
+
+      expect(toolCalls).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: 'call_exec_wrapper',
+          name: 'Bash',
+          input: { command: 'ls -1' },
+          status: 'completed',
+          result: 'file.txt\n',
+        }),
+        expect.objectContaining({
+          id: 'call_patch_wrapper',
+          name: 'apply_patch',
+          input: { patch },
+          status: 'completed',
+        }),
+      ]));
+    });
+
+    it('restores every command from a multi-command exec envelope', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_exec_group',
+            input: [
+              'const first = await tools.exec_command({cmd:"pwd",workdir:"/vault"});',
+              'text(first.output);',
+              'const second = await tools.exec_command({cmd:"printf edit",workdir:"/vault"});',
+              'text(second.output);',
+              'const third = await tools.exec_command({cmd:"wc -l note.md",workdir:"/vault"});',
+              'text(third.output);',
+            ].join('\n'),
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_exec_group',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+              { type: 'input_text', text: '/vault\n' },
+              { type: 'input_text', text: '' },
+              { type: 'input_text', text: '80 note.md\n' },
+            ],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.toolCalls).toEqual([
+        expect.objectContaining({
+          id: 'call_exec_group:1',
+          name: 'Bash',
+          input: { command: 'pwd' },
+          result: '/vault\n',
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_exec_group:2',
+          name: 'Bash',
+          input: { command: 'printf edit' },
+          result: '',
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_exec_group:3',
+          name: 'Bash',
+          input: { command: 'wc -l note.md' },
+          result: '80 note.md\n',
+          status: 'completed',
+        }),
+      ]);
+      expect(assistantMessage?.contentBlocks).toEqual([
+        { type: 'tool_use', toolId: 'call_exec_group:1' },
+        { type: 'tool_use', toolId: 'call_exec_group:2' },
+        { type: 'tool_use', toolId: 'call_exec_group:3' },
+      ]);
+    });
+
+    it('restores every image view from a multi-call exec envelope', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_image_group',
+            input: [
+              'const first = await tools.view_image({path:"/tmp/first.png",detail:"original"});',
+              'image(first.image_url);',
+              'const second = await tools.view_image({path:"/tmp/second.png",detail:"original"});',
+              'image(second.image_url);',
+            ].join('\n'),
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_image_group',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.0 seconds\nOutput:\n' },
+              { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+              { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+            ],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.toolCalls).toEqual([
+        expect.objectContaining({
+          id: 'call_image_group:1',
+          name: 'Read',
+          input: expect.objectContaining({ file_path: '/tmp/first.png' }),
+          result: '/tmp/first.png',
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_image_group:2',
+          name: 'Read',
+          input: expect.objectContaining({ file_path: '/tmp/second.png' }),
+          result: '/tmp/second.png',
+          status: 'completed',
+        }),
+      ]);
+    });
+
+    it('restores yielded exec envelopes as one completed Bash tool', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_exec_wrapper',
+            input: 'const r = await tools.exec_command({cmd:"npm test"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_exec_wrapper',
+            output: [
+              { type: 'input_text', text: 'Script running with cell ID 42\nWall time 10.0 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'tests started\n' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'wait',
+            call_id: 'call_wait_1',
+            arguments: '{"cell_id":"42","yield_time_ms":30000}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_wait_1',
+            output: [
+              { type: 'input_text', text: 'Script running with cell ID 42\nWall time 30.0 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'tests still running\n' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'wait',
+            call_id: 'call_wait_2',
+            arguments: '{"cell_id":"42","yield_time_ms":30000}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:06.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_wait_2',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'tests passed\n' },
+            ],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const toolCalls = messages.flatMap(message => message.toolCalls ?? []);
+
+      expect(toolCalls).toEqual([expect.objectContaining({
+        id: 'call_exec_wrapper',
+        name: 'Bash',
+        input: { command: 'npm test' },
+        status: 'completed',
+        result: 'tests started\ntests still running\ntests passed\n',
+      })]);
+    });
+
     it('restores raw custom_tool_call apply_patch input as patch text', () => {
       const content = [
         JSON.stringify({
@@ -460,7 +916,7 @@ describe('CodexHistoryStore', () => {
       expect(readTool!.input.file_path).toBe('/tmp/screenshot.png');
     });
 
-    it('restores write_stdin as native write_stdin', () => {
+    it('restores non-empty write_stdin as native write_stdin', () => {
       const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
       const messages = parseCodexSessionFile(filePath);
 
@@ -469,6 +925,216 @@ describe('CodexHistoryStore', () => {
       expect(stdinTool).toBeDefined();
       expect(stdinTool!.id).toBe('call_stdin_1');
       expect(stdinTool!.input.session_id).toBe('sess_1');
+      expect(stdinTool!.input.chars).toBe('y\n');
+    });
+
+    it('suppresses standalone empty write_stdin polling calls', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'write_stdin',
+            arguments: '{"session_id":2404,"chars":"","yield_time_ms":1000}',
+            call_id: 'call_poll',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_poll',
+            output: 'Input sent.',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant');
+
+      expect(assistantMsg!.toolCalls).toBeUndefined();
+    });
+
+    it('maps long-running write_stdin polling output back to the parent Bash tool', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Run checks.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"cmd":"bun run check"}',
+            call_id: 'call_cmd',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_cmd',
+            output: 'Chunk ID: aaa\nWall time: 0.0000 seconds\nProcess running with session ID 2404\nOriginal token count: 3\nOutput:\n$ bun run check\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'write_stdin',
+            arguments: '{"session_id":2404,"chars":"","yield_time_ms":1000}',
+            call_id: 'call_poll',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_poll',
+            output: 'Chunk ID: bbb\nWall time: 1.0000 seconds\nProcess exited with code 0\nOriginal token count: 2\nOutput:\nall good\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+
+      expect(assistantMsg!.toolCalls!.map(tc => tc.name)).not.toContain('write_stdin');
+      const bashTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'Bash');
+      expect(bashTool).toMatchObject({
+        id: 'call_cmd',
+        status: 'completed',
+        result: '$ bun run check\nall good\n',
+      });
+    });
+
+    it('keeps non-empty write_stdin separate from the parent Bash tool', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Confirm the prompt.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"cmd":"npm init"}',
+            call_id: 'call_cmd',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_cmd',
+            output: 'Chunk ID: aaa\nWall time: 0.0000 seconds\nProcess running with session ID 2404\nOriginal token count: 2\nOutput:\nProceed? [y/N]\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'write_stdin',
+            arguments: '{"session_id":2404,"chars":"y\\n"}',
+            call_id: 'call_stdin',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_stdin',
+            output: 'Input sent.',
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const bashTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'Bash');
+      const stdinTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'write_stdin');
+
+      expect(bashTool).toMatchObject({
+        id: 'call_cmd',
+        status: 'running',
+        result: 'Proceed? [y/N]\n',
+      });
+      expect(stdinTool).toMatchObject({
+        id: 'call_stdin',
+        status: 'completed',
+        input: { session_id: 2404, chars: 'y\n' },
+        result: 'Input sent.',
+      });
+    });
+
+    it('drops orphan custom_tool_call_output rows instead of rendering generic tool cards', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_patch_orphan',
+            output: 'Success. Updated the following files:\nM /tmp/a.ts\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0].role).toBe('assistant');
+      expect(messages[0].toolCalls).toBeUndefined();
+      expect(messages[0].content).toBe('Done.');
     });
   });
 
@@ -594,6 +1260,142 @@ describe('CodexHistoryStore', () => {
 
       expect(messages).toHaveLength(1);
       expect(messages[0]).toMatchObject({ role: 'assistant', content: 'Ready.' });
+    });
+
+    it('should skip recommended plugin metadata before AGENTS.md instructions', () => {
+      const metadataText = [
+        '<recommended_plugins>',
+        'Install Google Drive when it would help.',
+        '</recommended_plugins>',
+        '# AGENTS.md instructions for /Users/test/project',
+        '',
+        '<INSTRUCTIONS>',
+        'Do good work.',
+        '</INSTRUCTIONS>',
+        '<environment_context>',
+        '  <cwd>/Users/test/project</cwd>',
+        '</environment_context>',
+      ].join('\n');
+      const content = [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: metadataText }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Ready.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ role: 'assistant', content: 'Ready.' });
+    });
+
+    it('should skip Conductor interrupt control envelope persisted as user message', () => {
+      const conductorControlText = [
+        '<system_instruction>',
+        'You are working inside Conductor, a Mac app that lets the user run many coding agents in parallel.',
+        '</system_instruction>',
+        '',
+        '<turn_aborted>',
+        'The user interrupted the previous turn on purpose.',
+        '</turn_aborted>',
+        '',
+        '<user-preferences>',
+        'dev notes and throwaway scripts should be placed inside .context/',
+        '</user-preferences>',
+      ].join('\n');
+
+      const content = [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: conductorControlText }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Fix the interrupt rendering bug.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Fixed.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Fix the interrupt rendering bug.' });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'Fixed.' });
+    });
+
+    it('should strip leading Conductor control blocks and keep visible user text', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{
+              type: 'input_text',
+              text: [
+                '<system_instruction>',
+                'You are working inside Conductor.',
+                '</system_instruction>',
+                '',
+                '<turn_aborted>',
+                'The user interrupted the previous turn on purpose.',
+                '</turn_aborted>',
+                '',
+                'Hide the interrupt envelope, but keep this prompt.',
+              ].join('\n'),
+            }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        content: 'Hide the interrupt envelope, but keep this prompt.',
+      });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'Done.' });
     });
 
     it('should set displayContent stripping bracket context from user messages', () => {
@@ -1784,13 +2586,152 @@ describe('CodexHistoryStore', () => {
   });
 
   describe('parseCodexSessionContent - context_compacted boundary', () => {
-    it('applies compacted replacement_history before rendering the compact boundary', () => {
+    it('keeps post-compaction records in the active turn when auto-compaction happens mid-turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:07.987Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'uuid-auto-compact' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:10.303Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Update the template.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:54.927Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'I will update the template.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:54.927Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'I will update the template.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:20:02.971Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: 'call-before-compact',
+            arguments: '{"cmd":"rg breadcrumb template"}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:20:03.061Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call-before-compact',
+            output: 'Process exited with code 0\nOutput:\nmatch',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:48.653Z',
+          type: 'compacted',
+          payload: { message: '', replacement_history: [] },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:48.660Z',
+          type: 'event_msg',
+          payload: { type: 'context_compacted' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:52.499Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: 'call-after-compact',
+            arguments: '{"cmd":"npm test"}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:52.934Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call-after-compact',
+            output: 'Process exited with code 0\nOutput:\npassed',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:25:41.421Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Template updated.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:25:41.424Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Template updated.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:25:41.432Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'uuid-auto-compact' },
+        }),
+      ].join('\n');
+
+      const turns = parseCodexSessionTurns(content);
+
+      expect(turns).toHaveLength(1);
+      expect(turns[0].turnId).toBe('uuid-auto-compact');
+      expect(turns[0].messages.map(message => ({
+        role: message.role,
+        content: message.content,
+        blockTypes: message.contentBlocks?.map(block => block.type),
+        tools: message.toolCalls?.map(tool => tool.id),
+      }))).toEqual([
+        {
+          role: 'user',
+          content: 'Update the template.',
+          blockTypes: undefined,
+          tools: undefined,
+        },
+        {
+          role: 'assistant',
+          content: 'I will update the template.',
+          blockTypes: ['text', 'tool_use'],
+          tools: ['call-before-compact'],
+        },
+        {
+          role: 'assistant',
+          content: '',
+          blockTypes: ['context_compacted'],
+          tools: undefined,
+        },
+        {
+          role: 'assistant',
+          content: 'Template updated.',
+          blockTypes: ['tool_use', 'text'],
+          tools: ['call-after-compact'],
+        },
+      ]);
+    });
+
+    it('preserves visible transcript records instead of replaying compacted replacement_history', () => {
       const content = [
         JSON.stringify({ timestamp: '2026-03-03T16:00:00.000Z', type: 'event_msg', payload: { type: 'task_started' } }),
         JSON.stringify({ timestamp: '2026-03-03T16:00:01.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:01.500Z', type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'call-1', arguments: '{"cmd":"npm test"}' } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:01.700Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: 'Process exited with code 0\nOutput:\npassed' } }),
         JSON.stringify({ timestamp: '2026-03-03T16:00:02.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Hi there!' }] } }),
         JSON.stringify({ timestamp: '2026-03-03T16:00:03.000Z', type: 'event_msg', payload: { type: 'task_complete' } }),
-        // Compaction happens here
+        JSON.stringify({ timestamp: '2026-03-03T16:00:03.500Z', type: 'event_msg', payload: { type: 'task_started' } }),
+        // Compaction replacement_history is provider context, not visible UI history.
         JSON.stringify({
           timestamp: '2026-03-03T16:00:04.000Z',
           type: 'compacted',
@@ -1801,6 +2742,11 @@ describe('CodexHistoryStore', () => {
                 type: 'message',
                 role: 'user',
                 content: [{ type: 'input_text', text: '<COMPACTION_SUMMARY>\nSummary after compact' }],
+              },
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: 'replacement-only user message' }],
               },
               {
                 type: 'compaction',
@@ -1819,11 +2765,23 @@ describe('CodexHistoryStore', () => {
 
       const messages = parseCodexSessionContent(content);
 
-      expect(messages.map(m => m.content)).not.toContain('hello');
-      expect(messages.map(m => m.content)).not.toContain('Hi there!');
+      expect(messages.map(m => m.content)).toContain('hello');
+      expect(messages.map(m => m.content)).toContain('Hi there!');
+      expect(messages.map(m => m.content)).not.toContain('<COMPACTION_SUMMARY>\nSummary after compact');
+      expect(messages.map(m => m.content)).not.toContain('replacement-only user message');
+
+      const firstAssistant = messages.find(m => m.role === 'assistant' && m.content === 'Hi there!');
+      expect(firstAssistant).toBeDefined();
+      expect(firstAssistant!.toolCalls).toHaveLength(1);
+      expect(firstAssistant!.toolCalls![0]).toMatchObject({
+        id: 'call-1',
+        name: 'Bash',
+        status: 'completed',
+      });
+
       expect(messages[0]).toMatchObject({
         role: 'user',
-        content: '<COMPACTION_SUMMARY>\nSummary after compact',
+        content: 'hello',
       });
 
       const compactMsg = messages.find(m =>
@@ -1833,20 +2791,20 @@ describe('CodexHistoryStore', () => {
       expect(compactMsg!.role).toBe('assistant');
       expect(compactMsg!.content).toBe('');
 
-      // context_compacted should appear after the compacted replacement history
+      // context_compacted should appear after the preserved pre-compaction transcript.
       const compactIdx = messages.indexOf(compactMsg!);
       expect(compactIdx).toBeGreaterThan(0);
 
       const beforeCompact = messages[compactIdx - 1];
-      expect(beforeCompact.role).toBe('user');
-      expect(beforeCompact.content).toBe('<COMPACTION_SUMMARY>\nSummary after compact');
+      expect(beforeCompact.role).toBe('assistant');
+      expect(beforeCompact.content).toBe('Hi there!');
 
       const afterCompact = messages[compactIdx + 1];
       expect(afterCompact.role).toBe('user');
       expect(afterCompact.content).toContain('continue');
     });
 
-    it('uses the latest compacted replacement_history when multiple compactions occur', () => {
+    it('renders compact boundaries without surfacing replacement_history summaries', () => {
       const content = [
         JSON.stringify({
           timestamp: '2026-03-03T16:00:00.000Z',
@@ -1883,14 +2841,12 @@ describe('CodexHistoryStore', () => {
       const messages = parseCodexSessionContent(content);
 
       expect(messages).toHaveLength(2);
-      expect(messages[0]).toMatchObject({
-        role: 'user',
-        content: 'Second summary',
-      });
+      expect(messages.map(m => m.content)).not.toContain('First summary');
+      expect(messages.map(m => m.content)).not.toContain('Second summary');
       const compactMessages = messages.filter(m =>
         m.contentBlocks?.some(b => b.type === 'context_compacted'),
       );
-      expect(compactMessages).toHaveLength(1);
+      expect(compactMessages).toHaveLength(2);
     });
   });
 });

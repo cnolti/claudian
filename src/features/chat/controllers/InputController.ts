@@ -22,18 +22,20 @@ import {
 import type {
   ApprovalCallbackOptions,
   ApprovalDecisionOption,
+  ChatRuntimeQueryOptions,
   ChatTurnRequest,
 } from '../../../core/runtime/types';
 import { TOOL_EXIT_PLAN_MODE } from '../../../core/tools/toolNames';
 import type { ApprovalDecision, ChatMessage, ExitPlanModeDecision, StreamChunk } from '../../../core/types';
-import type ClaudianPlugin from '../../../main';
 import { ResumeSessionDropdown } from '../../../shared/components/ResumeSessionDropdown';
 import { InstructionModal } from '../../../shared/modals/InstructionConfirmModal';
 import type { BrowserSelectionContext } from '../../../utils/browser';
 import type { CanvasSelectionContext } from '../../../utils/canvas';
+import { extractUserDisplayContent } from '../../../utils/context';
 import { formatDurationMmSs } from '../../../utils/date';
 import type { EditorSelectionContext } from '../../../utils/editor';
 import { appendMarkdownSnippet } from '../../../utils/markdown';
+import type { FeatureHost } from '../../FeatureHost';
 import { COMPLETION_FLAVOR_WORDS } from '../constants';
 import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../rendering/InlineAskUserQuestion';
 import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
@@ -53,6 +55,8 @@ import type { CanvasSelectionController } from './CanvasSelectionController';
 import type { ConversationController } from './ConversationController';
 import type { SelectionController } from './SelectionController';
 import type { StreamController } from './StreamController';
+import type { ActiveTurnOwner } from './TurnCoordinator';
+import { TurnCoordinator } from './TurnCoordinator';
 
 const APPROVAL_OPTION_MAP: Record<string, ApprovalDecision> = {
   'Deny': 'deny',
@@ -67,8 +71,12 @@ const DEFAULT_APPROVAL_DECISION_OPTIONS: ApprovalDecisionOption[] =
     decision,
   }));
 
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 export interface InputControllerDeps {
-  plugin: ClaudianPlugin;
+  plugin: FeatureHost;
   state: ChatState;
   renderer: MessageRenderer;
   streamController: StreamController;
@@ -102,7 +110,17 @@ export interface InputControllerDeps {
   ensureServiceInitialized?: () => Promise<boolean>;
   openConversation?: (conversationId: string) => Promise<void>;
   onForkAll?: () => Promise<void>;
-  restorePrePlanPermissionModeIfNeeded?: () => void;
+  restorePrePlanPermissionModeIfNeeded?: () => void | Promise<void>;
+  turnOwner?: ActiveTurnOwner;
+}
+
+export interface SendMessageOptions {
+  editorContextOverride?: EditorSelectionContext | null;
+  browserContextOverride?: BrowserSelectionContext | null;
+  canvasContextOverride?: CanvasSelectionContext | null;
+  content?: string;
+  images?: ChatMessage['images'];
+  turnRequestOverride?: ChatTurnRequest;
 }
 
 export class InputController {
@@ -125,9 +143,14 @@ export class InputController {
   }> = [];
   private sawInitialProviderUserMessage = false;
   private awaitingProviderAssistantStart = false;
+  private readonly turnCoordinator: TurnCoordinator<SendMessageOptions>;
 
   constructor(deps: InputControllerDeps) {
     this.deps = deps;
+    this.turnCoordinator = new TurnCoordinator(
+      (options) => this.executeSendMessage(options),
+      deps.turnOwner,
+    );
   }
 
   private getAgentService(): ChatRuntime | null {
@@ -184,14 +207,11 @@ export class InputController {
   // Message Sending
   // ============================================
 
-  async sendMessage(options?: {
-    editorContextOverride?: EditorSelectionContext | null;
-    browserContextOverride?: BrowserSelectionContext | null;
-    canvasContextOverride?: CanvasSelectionContext | null;
-    content?: string;
-    images?: ChatMessage['images'];
-    turnRequestOverride?: ChatTurnRequest;
-  }): Promise<void> {
+  async sendMessage(options?: SendMessageOptions): Promise<void> {
+    await this.turnCoordinator.run(options);
+  }
+
+  private async executeSendMessage(options?: SendMessageOptions): Promise<void> {
     const {
       plugin,
       state,
@@ -275,7 +295,7 @@ export class InputController {
     // Hide welcome message when sending first message
     const welcomeEl = this.deps.getWelcomeEl();
     if (welcomeEl) {
-      welcomeEl.style.display = 'none';
+      welcomeEl.addClass('claudian-hidden');
     }
 
     fileContextManager?.startSession();
@@ -304,6 +324,8 @@ export class InputController {
         canvasContextOverride: options?.canvasContextOverride,
       });
     const { displayContent, turnRequest } = turnSubmission;
+    const messagesBeforeTurn = state.messages;
+    const hadPendingConversationSave = state.hasPendingConversationSave;
 
     fileContextManager?.markCurrentNoteSent();
 
@@ -319,7 +341,13 @@ export class InputController {
     state.hasPendingConversationSave = true;
     renderer.addMessage(userMsg);
 
-    await this.triggerTitleGeneration();
+    try {
+      await this.triggerTitleGeneration();
+    } catch (error) {
+      this.restoreMessageToInput(this.createQueuedMessage(displayContent, turnRequest));
+      this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
+      throw error;
+    }
 
     const assistantMsg: ChatMessage = {
       id: this.deps.generateId(),
@@ -355,8 +383,8 @@ export class InputController {
       const ready = await this.deps.ensureServiceInitialized();
       if (!ready) {
         new Notice('Failed to initialize agent service. Please try again.');
-        streamController.hideThinkingIndicator();
-        state.isStreaming = false;
+        this.restoreMessageToInput(this.createQueuedMessage(displayContent, turnRequest));
+        this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
         this.activeStreamingAssistantMessage = null;
         this.resetProviderMessageBoundaryState();
         return;
@@ -366,6 +394,8 @@ export class InputController {
     const agentService = this.getAgentService();
     if (!agentService) {
       new Notice('Agent service not available. Please reload the plugin.');
+      this.restoreMessageToInput(this.createQueuedMessage(displayContent, turnRequest));
+      this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
       this.activeStreamingAssistantMessage = null;
       this.resetProviderMessageBoundaryState();
       return;
@@ -398,13 +428,55 @@ export class InputController {
       // Pass history WITHOUT current turn (userMsg + assistantMsg we just added)
       // This prevents duplication when rebuilding context for new sessions
       const previousMessages = state.messages.slice(0, -2);
-      for await (const chunk of agentService.query(preparedTurn, previousMessages)) {
+      const selectedModel = this.getAuxiliaryModel();
+      const queryOptions: ChatRuntimeQueryOptions | undefined = selectedModel
+        ? { model: selectedModel }
+        : undefined;
+      for await (const chunk of agentService.query(preparedTurn, previousMessages, queryOptions)) {
         if (state.streamGeneration !== streamGeneration) {
           wasInvalidated = true;
           break;
         }
         if (state.cancelRequested) {
           wasInterrupted = true;
+          break;
+        }
+
+        if (chunk.type === 'error' && chunk.code === 'provider_session_missing') {
+          const retryMessage = this.createQueuedMessage(displayContent, {
+            ...turnRequest,
+            images: imagesForMessage ?? turnRequest.images,
+          });
+          const pendingMessagesToRestore = this.mergePendingMessages(
+            this.pendingSteerMessage,
+            state.queuedMessage,
+          );
+          const composerDraftToRestore = this.captureComposerDraft();
+          const staleConversationId = state.currentConversationId;
+          const resolution = staleConversationId
+            ? await plugin.handleMissingProviderSession(
+                staleConversationId,
+                chunk.providerSessionId,
+              )
+            : 'not_found';
+          if (resolution === 'deleted') {
+            this.restoreMessageToInput(composerDraftToRestore, { mergeWithComposer: true });
+            this.restoreMessageToInput(pendingMessagesToRestore, { mergeWithComposer: true });
+            this.restoreMessageToInput(retryMessage, { mergeWithComposer: true });
+          } else {
+            this.restoreMessageToInput(retryMessage, { mergeWithComposer: true });
+            this.restorePendingSteerMessageToQueue();
+            this.rollbackFailedTurn(messagesBeforeTurn, hadPendingConversationSave);
+          }
+          const notice = resolution === 'deleted'
+            ? 'The provider session no longer exists. Its Claudian record was removed; send again to start a new session.'
+            : resolution === 'reset'
+              ? 'The provider session no longer exists. Claudian preserved the recoverable history; send again to rebuild the session.'
+              : resolution === 'preserved'
+                ? 'The provider session no longer exists. Claudian preserved its record because the remaining history could not be verified.'
+                : 'The provider session no longer exists. Send again to start a new session.';
+          new Notice(notice);
+          wasInvalidated = true;
           break;
         }
 
@@ -435,7 +507,10 @@ export class InputController {
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {
         const didCancelThisTurn = wasInterrupted || state.cancelRequested;
         if (didCancelThisTurn && !state.pendingNewSessionPlan) {
-          await streamController.appendText('\n\n<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>');
+          finalAssistantMsg.isInterrupt = true;
+          if (state.currentContentEl) {
+            renderer.appendInterruptIndicator(state.currentContentEl);
+          }
         }
         streamController.hideThinkingIndicator();
         state.isStreaming = false;
@@ -501,7 +576,7 @@ export class InputController {
           if (state.streamGeneration !== streamGeneration || invalidated) {
             planApprovalInvalidated = true;
           } else if (decision?.type === 'implement') {
-            this.deps.restorePrePlanPermissionModeIfNeeded?.();
+            await this.deps.restorePrePlanPermissionModeIfNeeded?.();
             planAutoSendContent = 'Implement the plan.';
           } else if (decision?.type === 'revise') {
             // Keep plan mode active, populate input with feedback text
@@ -509,7 +584,7 @@ export class InputController {
             shouldProcessQueuedMessage = false;
           } else {
             // cancel or null (dismissed)
-            this.deps.restorePrePlanPermissionModeIfNeeded?.();
+            await this.deps.restorePrePlanPermissionModeIfNeeded?.();
           }
         }
 
@@ -614,11 +689,13 @@ export class InputController {
         });
       }
 
-      indicatorEl.style.display = 'flex';
+      indicatorEl.addClass('claudian-visible-flex');
+      indicatorEl.removeClass('claudian-hidden');
       return;
     }
 
-    indicatorEl.style.display = 'none';
+    indicatorEl.removeClass('claudian-visible-flex');
+    indicatorEl.addClass('claudian-hidden');
   }
 
   clearQueuedMessage(): void {
@@ -662,6 +739,20 @@ export class InputController {
     inputEl.focus();
   }
 
+  private captureComposerDraft(): QueuedMessage | null {
+    const content = this.deps.getInputEl().value;
+    const attachedImages = this.deps.getImageContextManager()?.getAttachedImages() ?? [];
+    const images = attachedImages.length > 0 ? [...attachedImages] : undefined;
+    if (!content.trim() && !images) {
+      return null;
+    }
+
+    return this.createQueuedMessage(content, {
+      text: content,
+      images,
+    });
+  }
+
   private restorePendingMessagesToInput(): void {
     const { state } = this.deps;
     const combinedMessage = this.mergePendingMessages(
@@ -682,7 +773,7 @@ export class InputController {
     state.queuedMessage = null;
     this.updateQueueIndicator();
 
-    setTimeout(
+    window.setTimeout(
       () => {
         void this.sendMessage({
           content: queuedMessage.content,
@@ -961,7 +1052,7 @@ export class InputController {
   private activateStreamingAssistantMessage(message: ChatMessage): void {
     const { state, renderer } = this.deps;
     const msgEl = renderer.addMessage(message);
-    const contentEl = msgEl.querySelector('.claudian-message-content') as HTMLElement | null;
+    const contentEl = msgEl.querySelector<HTMLElement>('.claudian-message-content');
 
     if (!contentEl) {
       return;
@@ -1097,6 +1188,35 @@ export class InputController {
     state.currentThinkingState = null;
   }
 
+  private rollbackFailedTurn(
+    messagesBeforeTurn: ChatMessage[],
+    hadPendingConversationSave: boolean,
+  ): void {
+    const { state, renderer, streamController } = this.deps;
+    const retainedMessageIds = new Set(messagesBeforeTurn.map(message => message.id));
+    for (const message of state.messages) {
+      if (!retainedMessageIds.has(message.id)) {
+        renderer.removeMessage(message.id);
+      }
+    }
+
+    state.messages = messagesBeforeTurn;
+    state.hasPendingConversationSave = hadPendingConversationSave;
+    streamController.hideThinkingIndicator();
+    state.isStreaming = false;
+    state.cancelRequested = false;
+    state.currentContentEl = null;
+    state.currentTextEl = null;
+    state.currentTextContent = '';
+    state.currentThinkingState = null;
+    state.responseStartTime = null;
+    this.deps.getSubagentManager().resetStreamingState();
+
+    if (messagesBeforeTurn.length === 0) {
+      this.deps.getWelcomeEl()?.removeClass('claudian-hidden');
+    }
+  }
+
   // ============================================
   // Title Generation
   // ============================================
@@ -1114,9 +1234,11 @@ export class InputController {
 
     if (!state.currentConversationId) {
       const sessionId = this.getAgentService()?.getSessionId() ?? undefined;
+      const selectedModel = this.getAuxiliaryModel() ?? undefined;
       const conversation = await plugin.createConversation({
         providerId: this.getActiveProviderId(),
         sessionId,
+        ...(selectedModel ? { selectedModel } : {}),
       });
       state.currentConversationId = conversation.id;
     }
@@ -1128,7 +1250,9 @@ export class InputController {
       return;
     }
 
-    const userContent = firstUserMsg.displayContent || firstUserMsg.content;
+    const userContent = firstUserMsg.displayContent
+      ?? extractUserDisplayContent(firstUserMsg.content)
+      ?? firstUserMsg.content;
 
     // Set immediate fallback title
     const fallbackTitle = conversationController.generateFallbackTitle(userContent);
@@ -1199,7 +1323,7 @@ export class InputController {
     if (!(plugin.settings.enableAutoScroll ?? true)) return;
     if (!state.autoScrollEnabled) return;
 
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       if (!(this.deps.plugin.settings.enableAutoScroll ?? true)) return;
       if (!this.deps.state.autoScrollEnabled) return;
 
@@ -1229,13 +1353,18 @@ export class InputController {
         plugin.app,
         rawInstruction,
         {
-          onAccept: async (finalInstruction) => {
-            const currentPrompt = plugin.settings.systemPrompt;
-            plugin.settings.systemPrompt = appendMarkdownSnippet(currentPrompt, finalInstruction);
-            await plugin.saveSettings();
+          onAccept: (finalInstruction) => {
+            void (async (): Promise<void> => {
+              await plugin.mutateSettings((settings) => {
+                settings.systemPrompt = appendMarkdownSnippet(
+                  settings.systemPrompt,
+                  finalInstruction,
+                );
+              });
 
-            new Notice('Instruction added to custom system prompt');
-            instructionModeManager?.clear();
+              new Notice('Instruction added to custom system prompt');
+              instructionModeManager?.clear();
+            })();
           },
           onReject: () => {
             wasCancelled = true;
@@ -1444,7 +1573,7 @@ export class InputController {
       } catch (err) {
         setPending(null);
         this.restoreInputContainer(inputContainerEl);
-        reject(err);
+        reject(toError(err));
       }
     });
   }
@@ -1491,7 +1620,7 @@ export class InputController {
       } catch (err) {
         this.pendingExitPlanModeInline = null;
         this.restoreInputContainer(inputContainerEl);
-        reject(err);
+        reject(toError(err));
       }
     });
   }
@@ -1545,7 +1674,7 @@ export class InputController {
         this.pendingPlanApproval = null;
         this.pendingPlanApprovalInvalidated = false;
         this.restoreInputContainer(inputContainerEl);
-        reject(err);
+        reject(toError(err));
       }
     });
   }
@@ -1564,21 +1693,21 @@ export class InputController {
 
   private hideInputContainer(inputContainerEl: HTMLElement): void {
     this.inputContainerHideDepth++;
-    inputContainerEl.style.display = 'none';
+    inputContainerEl.addClass('claudian-hidden');
   }
 
   private restoreInputContainer(inputContainerEl: HTMLElement): void {
     if (this.inputContainerHideDepth <= 0) return;
     this.inputContainerHideDepth--;
     if (this.inputContainerHideDepth === 0) {
-      inputContainerEl.style.display = '';
+      inputContainerEl.removeClass('claudian-hidden');
     }
   }
 
   private resetInputContainerVisibility(): void {
     if (this.inputContainerHideDepth > 0) {
       this.inputContainerHideDepth = 0;
-      this.deps.getInputContainerEl().style.display = '';
+      this.deps.getInputContainerEl().removeClass('claudian-hidden');
     }
   }
 
@@ -1628,9 +1757,14 @@ export class InputController {
         await this.deps.onForkAll();
         break;
       }
-      default:
+      default: {
         // Unknown command - notify user
-        new Notice(`Unknown command: ${command.action}`);
+        const unknownAction = typeof (command as { action?: unknown }).action === 'string'
+          ? (command as { action: string }).action
+          : 'unknown';
+        new Notice(`Unknown command: ${unknownAction}`);
+        break;
+      }
     }
   }
 

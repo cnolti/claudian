@@ -2,6 +2,7 @@ import { Notice } from 'obsidian';
 import * as path from 'path';
 
 import type { ImageAttachment, ImageMediaType } from '../../../core/types';
+import { ComposerContextTray } from './ComposerContextTray';
 
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 
@@ -14,14 +15,14 @@ const IMAGE_EXTENSIONS: Record<string, ImageMediaType> = {
 };
 
 export interface ImageContextCallbacks {
-  onImagesChanged: () => void;
+  onImagesChanged?: () => void;
 }
 
 export class ImageContextManager {
   private callbacks: ImageContextCallbacks;
   private containerEl: HTMLElement;
-  private previewContainerEl: HTMLElement;
-  private imagePreviewEl: HTMLElement;
+  private contextTray: ComposerContextTray;
+  private ownedContextTray: ComposerContextTray | null = null;
   private inputEl: HTMLTextAreaElement;
   private dropOverlay: HTMLElement | null = null;
   private attachedImages: Map<string, ImageAttachment> = new Map();
@@ -31,18 +32,18 @@ export class ImageContextManager {
     containerEl: HTMLElement,
     inputEl: HTMLTextAreaElement,
     callbacks: ImageContextCallbacks,
-    previewContainerEl?: HTMLElement
+    previewContainerEl?: HTMLElement,
+    contextTray?: ComposerContextTray,
   ) {
     this.containerEl = containerEl;
-    this.previewContainerEl = previewContainerEl ?? containerEl;
     this.inputEl = inputEl;
     this.callbacks = callbacks;
-
-    // Create image preview in previewContainerEl, before file indicator if present
-    const fileIndicator = this.previewContainerEl.querySelector('.claudian-file-indicator');
-    this.imagePreviewEl = this.previewContainerEl.createDiv({ cls: 'claudian-image-preview' });
-    if (fileIndicator && fileIndicator.parentElement === this.previewContainerEl) {
-      this.previewContainerEl.insertBefore(this.imagePreviewEl, fileIndicator);
+    const ownedTrayContainer = contextTray
+      ? null
+      : (previewContainerEl ?? containerEl).createDiv({ cls: 'claudian-context-row' });
+    this.contextTray = contextTray ?? new ComposerContextTray(ownedTrayContainer!);
+    if (!contextTray) {
+      this.ownedContextTray = this.contextTray;
     }
 
     this.setupDragAndDrop();
@@ -67,7 +68,7 @@ export class ImageContextManager {
   clearImages() {
     this.attachedImages.clear();
     this.updateImagePreview();
-    this.callbacks.onImagesChanged();
+    this.callbacks.onImagesChanged?.();
   }
 
   /** Sets images directly (used for queued messages). */
@@ -77,7 +78,13 @@ export class ImageContextManager {
       this.attachedImages.set(image.id, image);
     }
     this.updateImagePreview();
-    this.callbacks.onImagesChanged();
+    this.callbacks.onImagesChanged?.();
+  }
+
+  destroy(): void {
+    this.contextTray.clearItems('images');
+    this.ownedContextTray?.destroy();
+    this.ownedContextTray = null;
   }
 
   private setupDragAndDrop() {
@@ -86,18 +93,19 @@ export class ImageContextManager {
 
     this.dropOverlay = inputWrapper.createDiv({ cls: 'claudian-drop-overlay' });
     const dropContent = this.dropOverlay.createDiv({ cls: 'claudian-drop-content' });
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const ownerDocument = inputWrapper.ownerDocument ?? window.document;
+    const svg = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('width', '32');
     svg.setAttribute('height', '32');
     svg.setAttribute('fill', 'none');
     svg.setAttribute('stroke', 'currentColor');
     svg.setAttribute('stroke-width', '2');
-    const pathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const pathEl = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'path');
     pathEl.setAttribute('d', 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4');
-    const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+    const polyline = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'polyline');
     polyline.setAttribute('points', '17 8 12 3 7 8');
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    const line = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'line');
     line.setAttribute('x1', '12');
     line.setAttribute('y1', '3');
     line.setAttribute('x2', '12');
@@ -110,10 +118,12 @@ export class ImageContextManager {
 
     const dropZone = inputWrapper;
 
-    dropZone.addEventListener('dragenter', (e) => this.handleDragEnter(e as DragEvent));
-    dropZone.addEventListener('dragover', (e) => this.handleDragOver(e as DragEvent));
-    dropZone.addEventListener('dragleave', (e) => this.handleDragLeave(e as DragEvent));
-    dropZone.addEventListener('drop', (e) => this.handleDrop(e as DragEvent));
+    dropZone.addEventListener('dragenter', (e) => this.handleDragEnter(e));
+    dropZone.addEventListener('dragover', (e) => this.handleDragOver(e));
+    dropZone.addEventListener('dragleave', (e) => this.handleDragLeave(e));
+    dropZone.addEventListener('drop', (e) => {
+      void this.handleDrop(e);
+    });
   }
 
   private handleDragEnter(e: DragEvent) {
@@ -168,7 +178,8 @@ export class ImageContextManager {
   }
 
   private setupPasteHandler() {
-    this.inputEl.addEventListener('paste', async (e) => {
+    this.inputEl.addEventListener('paste', (e) => {
+      void (async (): Promise<void> => {
       const items = e.clipboardData?.items;
       if (!items) return;
 
@@ -183,6 +194,7 @@ export class ImageContextManager {
           return;
         }
       }
+      })();
     });
   }
 
@@ -226,7 +238,7 @@ export class ImageContextManager {
 
       this.attachedImages.set(attachment.id, attachment);
       this.updateImagePreview();
-      this.callbacks.onImagesChanged();
+      this.callbacks.onImagesChanged?.();
       return true;
     } catch (error) {
       this.notifyImageError('Failed to attach image.', error);
@@ -245,57 +257,30 @@ export class ImageContextManager {
   // ============================================
 
   private updateImagePreview() {
-    this.imagePreviewEl.empty();
-
     if (this.attachedImages.size === 0) {
-      this.imagePreviewEl.style.display = 'none';
+      this.contextTray.clearItems('images');
       return;
     }
 
-    this.imagePreviewEl.style.display = 'flex';
-
-    for (const [id, image] of this.attachedImages) {
-      this.renderImagePreview(id, image);
-    }
-  }
-
-  private renderImagePreview(id: string, image: ImageAttachment) {
-    const previewEl = this.imagePreviewEl.createDiv({ cls: 'claudian-image-chip' });
-
-    const thumbEl = previewEl.createDiv({ cls: 'claudian-image-thumb' });
-    thumbEl.createEl('img', {
-      attr: {
-        src: `data:${image.mediaType};base64,${image.data}`,
-        alt: image.name,
+    const images = Array.from(this.attachedImages);
+    this.contextTray.setItems('images', images.map(([id, image], index) => ({
+      id,
+      kind: 'image' as const,
+      label: images.length === 1 ? 'Image' : `Image ${index + 1}`,
+      title: `${image.name} · ${this.formatSize(image.size)}`,
+      ariaLabel: `Image attachment: ${image.name}`,
+      onActivate: () => this.showFullImage(image),
+      onRemove: () => {
+        this.attachedImages.delete(id);
+        this.updateImagePreview();
+        this.callbacks.onImagesChanged?.();
       },
-    });
-
-    const infoEl = previewEl.createDiv({ cls: 'claudian-image-info' });
-    const nameEl = infoEl.createSpan({ cls: 'claudian-image-name' });
-    nameEl.setText(this.truncateName(image.name, 20));
-    nameEl.setAttribute('title', image.name);
-
-    const sizeEl = infoEl.createSpan({ cls: 'claudian-image-size' });
-    sizeEl.setText(this.formatSize(image.size));
-
-    const removeEl = previewEl.createSpan({ cls: 'claudian-image-remove' });
-    removeEl.setText('\u00D7');
-    removeEl.setAttribute('aria-label', 'Remove image');
-
-    removeEl.addEventListener('click', (e) => {
-      e.stopPropagation();
-      this.attachedImages.delete(id);
-      this.updateImagePreview();
-      this.callbacks.onImagesChanged();
-    });
-
-    thumbEl.addEventListener('click', () => {
-      this.showFullImage(image);
-    });
+    })));
   }
 
   private showFullImage(image: ImageAttachment) {
-    const overlay = document.body.createDiv({ cls: 'claudian-image-modal-overlay' });
+    const ownerDocument = this.containerEl.ownerDocument ?? window.document;
+    const overlay = ownerDocument.body.createDiv({ cls: 'claudian-image-modal-overlay' });
     const modal = overlay.createDiv({ cls: 'claudian-image-modal' });
 
     modal.createEl('img', {
@@ -315,7 +300,7 @@ export class ImageContextManager {
     };
 
     const close = () => {
-      document.removeEventListener('keydown', handleEsc);
+      ownerDocument.removeEventListener('keydown', handleEsc);
       overlay.remove();
     };
 
@@ -323,19 +308,11 @@ export class ImageContextManager {
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) close();
     });
-    document.addEventListener('keydown', handleEsc);
+    ownerDocument.addEventListener('keydown', handleEsc);
   }
 
   private generateId(): string {
     return `img-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-  }
-
-  private truncateName(name: string, maxLen: number): string {
-    if (name.length <= maxLen) return name;
-    const ext = path.extname(name);
-    const base = name.slice(0, name.length - ext.length);
-    const truncatedBase = base.slice(0, maxLen - ext.length - 3);
-    return `${truncatedBase}...${ext}`;
   }
 
   private formatSize(bytes: number): string {

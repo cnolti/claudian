@@ -600,14 +600,13 @@ describe('ClaudianService', () => {
   // MessageChannel tests moved to tests/unit/core/agent/MessageChannel.test.ts
 
   describe('persistent query updates', () => {
-    it('updates model on the active persistent query', async () => {
+    it('uses a query model override when starting the persistent query', async () => {
       const chunks: any[] = [];
       for await (const chunk of service.query('hello', undefined, undefined, { model: 'claude-opus-4-5' })) {
         chunks.push(chunk);
       }
 
-      const response = getLastResponse();
-      expect(response?.setModel).toHaveBeenCalledWith('claude-opus-4-5');
+      expect(getLastOptions()?.model).toBe('claude-opus-4-5');
     });
   });
 
@@ -1139,7 +1138,7 @@ describe('ClaudianService', () => {
       // Now test the standalone function directly
       const context = buildContextFromHistory(messages);
 
-      expect(context).toContain('<current_note>');
+      expect(context).toContain('<linked_note>');
       expect(context).toContain('notes/file.md');
     });
 
@@ -1201,7 +1200,7 @@ describe('ClaudianService', () => {
       expect(prompts[0]).toBe('Follow up');
       expect(prompts[1]).toContain('User: First question');
       expect(prompts[1]).toContain('Assistant: Answer');
-      expect(prompts[1]).toContain('<current_note>');
+      expect(prompts[1]).toContain('<linked_note>');
       expect(prompts[1]).toContain('note.md');
       expect(chunks.some((c) => c.type === 'text' && c.content === 'Recovered')).toBe(true);
       expect(service.getSessionId()).toBeNull();
@@ -1530,27 +1529,25 @@ describe('ClaudianService', () => {
   });
 
   describe('persistent query dynamic updates', () => {
-    it('updates thinking tokens on the active persistent query when budget changes (custom model)', async () => {
-      // Use a custom model so the legacy budget path is used
+    it('ignores legacy thinking budget changes', async () => {
       mockPlugin.settings.model = 'custom-model';
       mockPlugin.settings.thinkingBudget = 'off';
 
       const chunks1: any[] = [];
       for await (const c of service.query('first')) chunks1.push(c);
 
-      // Change thinking budget - this should trigger setMaxThinkingTokens on next query
+      const queryCountBefore = getQueryCallCount();
       mockPlugin.settings.thinkingBudget = 'high';
 
       const chunks2: any[] = [];
       for await (const c of service.query('second')) chunks2.push(c);
 
       const response = getLastResponse();
-      // setMaxThinkingTokens should be called with the new budget value (16000 for 'high')
-      expect(response?.setMaxThinkingTokens).toHaveBeenCalledWith(16000);
+      expect(response?.setMaxThinkingTokens).not.toHaveBeenCalled();
+      expect(getQueryCallCount()).toBe(queryCountBefore);
     });
 
-    it('does not call setMaxThinkingTokens for adaptive models when budget changes', async () => {
-      // Adaptive model (sonnet) should use effort levels, not token budgets
+    it('uses effort levels instead of token budgets for built-in models', async () => {
       mockPlugin.settings.model = 'sonnet';
       mockPlugin.settings.thinkingBudget = 'off';
 
@@ -1653,8 +1650,7 @@ describe('ClaudianService', () => {
         model: 'claude-opus-4-5',
       })) chunks2.push(c);
 
-      const response = getLastResponse();
-      expect(response?.setModel).toHaveBeenCalledWith('claude-opus-4-5');
+      expect(getLastOptions()?.model).toBe('claude-opus-4-5');
     });
 
     it('falls back to cold-start when restart fails during dynamic updates', async () => {

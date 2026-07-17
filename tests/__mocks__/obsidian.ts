@@ -114,6 +114,7 @@ export class App {
     getLeaf: jest.fn().mockReturnValue({
       setViewState: jest.fn().mockResolvedValue(undefined),
     }),
+    setActiveLeaf: jest.fn(),
     revealLeaf: jest.fn(),
   };
 }
@@ -251,8 +252,13 @@ export class Menu {
   }
 }
 
+const renderMarkdownMock = jest.fn<Promise<void>, [string, unknown, string, unknown]>().mockResolvedValue(undefined);
+
 export const MarkdownRenderer = {
-  renderMarkdown: jest.fn().mockResolvedValue(undefined),
+  render: jest.fn<Promise<void>, [unknown, string, unknown, string, unknown]>(
+    (_app, markdown, el, sourcePath, component) => renderMarkdownMock(markdown, el, sourcePath, component),
+  ),
+  renderMarkdown: renderMarkdownMock,
 };
 
 export const setIcon = jest.fn();

@@ -119,8 +119,18 @@ export function parseApplyPatchDiffs(patchText: string): ApplyPatchFileDiff[] {
   return fileDiffs;
 }
 
+export function parseFileUpdateChangeDiffs(changes: unknown): ApplyPatchFileDiff[] {
+  if (!Array.isArray(changes)) return [];
+
+  return changes
+    .map(parseFileUpdateChangeDiff)
+    .filter((diff): diff is ApplyPatchFileDiff => diff !== null);
+}
+
 export function extractDiffData(toolUseResult: unknown, toolCall: ToolCallInfo): ToolDiffData | undefined {
-  const filePath = (toolCall.input.file_path as string) || 'file';
+  const filePath = getNonEmptyStringValue(toolCall.input.file_path)
+    ?? getNonEmptyStringValue(toolCall.input.path)
+    ?? 'file';
 
   if (toolUseResult && typeof toolUseResult === 'object') {
     const result = toolUseResult as Record<string, unknown>;
@@ -130,6 +140,17 @@ export function extractDiffData(toolUseResult: unknown, toolCall: ToolCallInfo):
       const diffLines = structuredPatchToDiffLines(hunks);
       const stats = countLineChanges(diffLines);
       return { filePath: resultFilePath, diffLines, stats };
+    }
+
+    const unifiedDiff = getUnifiedDiffText(result);
+    if (unifiedDiff) {
+      const diffLines = parseUnifiedDiffLines(unifiedDiff);
+      if (diffLines.length > 0) {
+        const resultFilePath = (typeof result.filePath === 'string' ? result.filePath : null)
+          || (typeof result.path === 'string' ? result.path : null)
+          || filePath;
+        return { filePath: resultFilePath, diffLines, stats: countLineChanges(diffLines) };
+      }
     }
   }
 
@@ -141,17 +162,13 @@ export function diffFromToolInput(toolCall: ToolCallInfo, filePath: string): Too
     const oldStr = toolCall.input.old_string;
     const newStr = toolCall.input.new_string;
     if (typeof oldStr === 'string' && typeof newStr === 'string') {
-      const diffLines: DiffLine[] = [];
-      const oldLines = oldStr.split('\n');
-      const newLines = newStr.split('\n');
-      let oldLineNum = 1;
-      for (const line of oldLines) {
-        diffLines.push({ type: 'delete', text: line, oldLineNum: oldLineNum++ });
-      }
-      let newLineNum = 1;
-      for (const line of newLines) {
-        diffLines.push({ type: 'insert', text: line, newLineNum: newLineNum++ });
-      }
+      const diffLines = buildReplacementDiffLines([{ oldText: oldStr, newText: newStr }]);
+      return { filePath, diffLines, stats: countLineChanges(diffLines) };
+    }
+
+    const editPairs = getEditPairs(toolCall.input);
+    if (editPairs.length > 0) {
+      const diffLines = buildReplacementDiffLines(editPairs);
       return { filePath, diffLines, stats: countLineChanges(diffLines) };
     }
   }
@@ -170,6 +187,79 @@ export function diffFromToolInput(toolCall: ToolCallInfo, filePath: string): Too
   }
 
   return undefined;
+}
+
+function getUnifiedDiffText(result: Record<string, unknown>): string | null {
+  if (typeof result.diff === 'string' && result.diff.trim()) {
+    return result.diff;
+  }
+
+  const details = result.details;
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    const diff = (details as Record<string, unknown>).diff;
+    if (typeof diff === 'string' && diff.trim()) {
+      return diff;
+    }
+  }
+
+  return null;
+}
+
+interface ReplacementPair {
+  oldText: string;
+  newText: string;
+}
+
+function getEditPairs(input: Record<string, unknown>): ReplacementPair[] {
+  const topLevelPair = getReplacementPair(input);
+  if (topLevelPair) {
+    return [topLevelPair];
+  }
+
+  const edits = input.edits;
+  if (!Array.isArray(edits)) {
+    return [];
+  }
+
+  return edits
+    .map(getReplacementPair)
+    .filter((pair): pair is ReplacementPair => pair !== null);
+}
+
+function getReplacementPair(value: unknown): ReplacementPair | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const oldText = getStringValue(record.oldText ?? record.old_text ?? record.old_string);
+  const newText = getStringValue(record.newText ?? record.new_text ?? record.new_string);
+  return oldText !== null && newText !== null ? { oldText, newText } : null;
+}
+
+function getStringValue(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function getNonEmptyStringValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function buildReplacementDiffLines(pairs: ReplacementPair[]): DiffLine[] {
+  const diffLines: DiffLine[] = [];
+  let oldLineNum = 1;
+  let newLineNum = 1;
+
+  for (const pair of pairs) {
+    for (const line of pair.oldText.split('\n')) {
+      diffLines.push({ type: 'delete', text: line, oldLineNum: oldLineNum++ });
+    }
+    for (const line of pair.newText.split('\n')) {
+      diffLines.push({ type: 'insert', text: line, newLineNum: newLineNum++ });
+    }
+  }
+
+  return diffLines;
 }
 
 function buildApplyPatchFileDiff(current: {
@@ -207,4 +297,88 @@ function buildApplyPatchFileDiff(current: {
   };
   if (current.movedTo) result.movedTo = current.movedTo;
   return result;
+}
+
+function parseFileUpdateChangeDiff(change: unknown): ApplyPatchFileDiff | null {
+  if (!change || typeof change !== 'object' || Array.isArray(change)) {
+    return null;
+  }
+
+  const record = change as Record<string, unknown>;
+  const filePath = typeof record.path === 'string' ? record.path : '';
+  const diff = typeof record.diff === 'string' ? record.diff : '';
+  if (!filePath || !diff.trim()) {
+    return null;
+  }
+
+  const kindInfo = parseFileUpdateKind(record.kind ?? record.type);
+  const diffLines = parseUnifiedDiffLines(diff);
+  return {
+    filePath,
+    operation: kindInfo.operation,
+    ...(kindInfo.movedTo ? { movedTo: kindInfo.movedTo } : {}),
+    diffLines,
+    stats: countLineChanges(diffLines),
+  };
+}
+
+function parseFileUpdateKind(value: unknown): {
+  operation: ApplyPatchFileDiff['operation'];
+  movedTo?: string;
+} {
+  if (typeof value === 'string') {
+    return { operation: normalizePatchOperation(value) };
+  }
+
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    const type = typeof record.type === 'string' ? record.type : '';
+    const movedTo = typeof record.move_path === 'string' ? record.move_path : undefined;
+    return {
+      operation: normalizePatchOperation(type),
+      ...(movedTo ? { movedTo } : {}),
+    };
+  }
+
+  return { operation: 'update' };
+}
+
+function normalizePatchOperation(value: string): ApplyPatchFileDiff['operation'] {
+  if (value === 'add' || value === 'delete' || value === 'update') {
+    return value;
+  }
+
+  return 'update';
+}
+
+function parseUnifiedDiffLines(diffText: string): DiffLine[] {
+  const diffLines: DiffLine[] = [];
+  let oldLineNum = 1;
+  let newLineNum = 1;
+
+  for (const line of diffText.split(/\r?\n/)) {
+    if (!line) continue;
+    if (line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+
+    if (line.startsWith('@@')) {
+      const match = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+      if (match) {
+        oldLineNum = Number(match[1]);
+        newLineNum = Number(match[2]);
+      }
+      continue;
+    }
+
+    const prefix = line[0];
+    const text = line.slice(1);
+    if (prefix === '+') {
+      diffLines.push({ type: 'insert', text, newLineNum: newLineNum++ });
+    } else if (prefix === '-') {
+      diffLines.push({ type: 'delete', text, oldLineNum: oldLineNum++ });
+    } else if (prefix === ' ') {
+      diffLines.push({ type: 'equal', text, oldLineNum: oldLineNum++, newLineNum: newLineNum++ });
+    }
+  }
+
+  return diffLines;
 }

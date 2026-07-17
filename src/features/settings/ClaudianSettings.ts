@@ -1,25 +1,45 @@
-import type { App } from 'obsidian';
-import { Notice, PluginSettingTab, Setting } from 'obsidian';
+import type { App, Plugin } from 'obsidian';
+import { Notice, Platform, PluginSettingTab, Setting } from 'obsidian';
 
 import {
   getHiddenProviderCommands,
   normalizeHiddenCommandList,
 } from '../../core/providers/commands/hiddenCommands';
 import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
+import { ProviderSettingsCoordinator } from '../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../core/providers/ProviderWorkspaceRegistry';
 import type { ProviderId } from '../../core/providers/types';
 import type { ChatViewPlacement } from '../../core/types/settings';
 import { getAvailableLocales, getLocaleDisplayName, setLocale, t } from '../../i18n/i18n';
 import type { Locale, TranslationKey } from '../../i18n/types';
-import type ClaudianPlugin from '../../main';
+import { renderEnvironmentSettingsSection } from '../../shared/settings/EnvironmentSettingsSection';
 import { formatContextLimit, parseContextLimit, parseEnvironmentVariables } from '../../utils/env';
+import type { FeatureHost } from '../FeatureHost';
 import { buildNavMappingText, parseNavMappings } from './keyboardNavigation';
-import { renderEnvironmentSettingsSection } from './ui/EnvironmentSettingsSection';
 
-type SettingsTabId = 'general' | ProviderId;
+type SettingsTabId = string;
+type ObsidianHotkey = { modifiers: string[]; key: string };
+type ObsidianHotkeyManager = {
+  customKeys?: Record<string, ObsidianHotkey[] | undefined>;
+  defaultKeys?: Record<string, ObsidianHotkey[] | undefined>;
+};
+type ObsidianHotkeyTab = {
+  searchInputEl?: HTMLInputElement;
+  searchComponent?: { inputEl?: HTMLInputElement };
+  updateHotkeyVisibility?: () => void;
+};
+type ObsidianSettingsController = {
+  activeTab?: ObsidianHotkeyTab;
+  open: () => void;
+  openTabById: (id: string) => void;
+};
+type AppWithHotkeyInternals = App & {
+  hotkeyManager?: ObsidianHotkeyManager;
+  setting?: ObsidianSettingsController;
+};
 
-function formatHotkey(hotkey: { modifiers: string[]; key: string }): string {
-  const isMac = navigator.platform.includes('Mac');
+function formatHotkey(hotkey: ObsidianHotkey): string {
+  const isMac = Platform.isMacOS;
   const modMap: Record<string, string> = isMac
     ? { Mod: '⌘', Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Meta: '⌘' }
     : { Mod: 'Ctrl', Ctrl: 'Ctrl', Alt: 'Alt', Shift: 'Shift', Meta: 'Win' };
@@ -31,10 +51,14 @@ function formatHotkey(hotkey: { modifiers: string[]; key: string }): string {
 }
 
 function openHotkeySettings(app: App): void {
-  const setting = (app as any).setting;
+  const setting = (app as AppWithHotkeyInternals).setting;
+  if (!setting) {
+    return;
+  }
+
   setting.open();
   setting.openTabById('hotkeys');
-  setTimeout(() => {
+  window.setTimeout(() => {
     const tab = setting.activeTab;
     if (!tab) {
       return;
@@ -51,12 +75,12 @@ function openHotkeySettings(app: App): void {
 }
 
 function getHotkeyForCommand(app: App, commandId: string): string | null {
-  const hotkeyManager = (app as any).hotkeyManager;
+  const hotkeyManager = (app as AppWithHotkeyInternals).hotkeyManager;
   if (!hotkeyManager) return null;
 
   const customHotkeys = hotkeyManager.customKeys?.[commandId];
   const defaultHotkeys = hotkeyManager.defaultKeys?.[commandId];
-  const hotkeys = customHotkeys?.length > 0 ? customHotkeys : defaultHotkeys;
+  const hotkeys = customHotkeys && customHotkeys.length > 0 ? customHotkeys : defaultHotkeys;
 
   if (!hotkeys || hotkeys.length === 0) return null;
 
@@ -82,10 +106,11 @@ function addHotkeySettingRow(
 }
 
 export class ClaudianSettingTab extends PluginSettingTab {
-  plugin: ClaudianPlugin;
+  plugin: FeatureHost;
   private activeTab: SettingsTabId = 'general';
+  private refreshTitleModelOptions: (() => void) | null = null;
 
-  constructor(app: App, plugin: ClaudianPlugin) {
+  constructor(app: App, plugin: FeatureHost & Plugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -94,6 +119,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass('claudian-settings');
+    this.refreshTitleModelOptions = null;
 
     setLocale(this.plugin.settings.locale as Locale);
 
@@ -109,7 +135,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
 
     for (const id of tabIds) {
       const label = id === 'general'
-        ? t('settings.tabs.general' as TranslationKey)
+        ? t('settings.tabs.general')
         : ProviderRegistry.getProviderDisplayName(id);
       const button = tabBar.createEl('button', {
         cls: `claudian-settings-tab${id === this.activeTab ? ' claudian-settings-tab--active' : ''}`,
@@ -141,7 +167,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
       }
 
       ProviderWorkspaceRegistry.getSettingsTabRenderer(providerId)?.render(content, {
-        plugin: this.plugin,
+        plugin: this.plugin.providerHost,
         renderHiddenProviderCommandSetting: (
           target,
           targetProviderId,
@@ -152,6 +178,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
             view.refreshModelSelector();
           }
         },
+        refreshTitleGenerationModelOptions: () => this.refreshTitleModelOptions?.(),
         renderCustomContextLimits: (target, providerId) => this.renderCustomContextLimits(target, providerId),
       });
     }
@@ -174,8 +201,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
               dropdown.setValue(this.plugin.settings.locale);
               return;
             }
-            this.plugin.settings.locale = locale;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.locale = locale;
+            });
             this.display();
           });
       });
@@ -184,38 +212,17 @@ export class ClaudianSettingTab extends PluginSettingTab {
 
     new Setting(container).setName(t('settings.display')).setHeading();
 
-    new Setting(container)
-      .setName(t('settings.tabBarPosition.name'))
-      .setDesc(t('settings.tabBarPosition.desc'))
-      .addDropdown((dropdown) => {
-        dropdown
-          .addOption('input', t('settings.tabBarPosition.input'))
-          .addOption('header', t('settings.tabBarPosition.header'))
-          .setValue(this.plugin.settings.tabBarPosition ?? 'input')
-          .onChange(async (value) => {
-            this.plugin.settings.tabBarPosition = value as 'input' | 'header';
-            await this.plugin.saveSettings();
-
-            for (const view of this.plugin.getAllViews()) {
-              view.updateLayoutForPosition();
-            }
-          });
-      });
-
     const maxTabsSetting = new Setting(container)
       .setName(t('settings.maxTabs.name'))
       .setDesc(t('settings.maxTabs.desc'));
 
-    const maxTabsWarningEl = container.createDiv({ cls: 'claudian-max-tabs-warning' });
-    maxTabsWarningEl.style.color = 'var(--text-warning)';
-    maxTabsWarningEl.style.fontSize = '0.85em';
-    maxTabsWarningEl.style.marginTop = '-0.5em';
-    maxTabsWarningEl.style.marginBottom = '0.5em';
-    maxTabsWarningEl.style.display = 'none';
+    const maxTabsWarningEl = container.createDiv({
+      cls: 'claudian-max-tabs-warning claudian-setting-validation claudian-setting-validation-warning claudian-hidden',
+    });
     maxTabsWarningEl.setText(t('settings.maxTabs.warning'));
 
     const updateMaxTabsWarning = (value: number): void => {
-      maxTabsWarningEl.style.display = value > 5 ? 'block' : 'none';
+      maxTabsWarningEl.toggleClass('claudian-hidden', value <= 5);
     };
 
     maxTabsSetting.addSlider((slider) => {
@@ -224,8 +231,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.maxTabs ?? 3)
         .setDynamicTooltip()
         .onChange(async (value) => {
-          this.plugin.settings.maxTabs = value;
-          await this.plugin.saveSettings();
+          await this.plugin.mutateSettings((settings) => {
+            settings.maxTabs = value;
+          });
           updateMaxTabsWarning(value);
           for (const view of this.plugin.getAllViews()) {
             view.refreshTabControls();
@@ -244,8 +252,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
           .addOption('main-tab', t('settings.chatViewPlacement.mainTab'))
           .setValue(this.plugin.settings.chatViewPlacement)
           .onChange(async (value) => {
-            this.plugin.settings.chatViewPlacement = value as ChatViewPlacement;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.chatViewPlacement = value as ChatViewPlacement;
+            });
           });
       });
 
@@ -256,8 +265,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.settings.enableAutoScroll ?? true)
           .onChange(async (value) => {
-            this.plugin.settings.enableAutoScroll = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.enableAutoScroll = value;
+            });
           })
       );
 
@@ -268,8 +278,22 @@ export class ClaudianSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.settings.deferMathRenderingDuringStreaming ?? true)
           .onChange(async (value) => {
-            this.plugin.settings.deferMathRenderingDuringStreaming = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.deferMathRenderingDuringStreaming = value;
+            });
+          })
+      );
+
+    new Setting(container)
+      .setName(t('settings.expandFileEditsByDefault.name'))
+      .setDesc(t('settings.expandFileEditsByDefault.desc'))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.expandFileEditsByDefault ?? false)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.expandFileEditsByDefault = value;
+            });
           })
       );
 
@@ -284,8 +308,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.settings.enableAutoTitleGeneration)
           .onChange(async (value) => {
-            this.plugin.settings.enableAutoTitleGeneration = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.enableAutoTitleGeneration = value;
+            });
             this.display();
           })
       );
@@ -295,26 +320,24 @@ export class ClaudianSettingTab extends PluginSettingTab {
         .setName(t('settings.titleModel.name'))
         .setDesc(t('settings.titleModel.desc'))
         .addDropdown((dropdown) => {
-          dropdown.addOption('', t('settings.titleModel.auto'));
+          const refreshOptions = (): void => {
+            dropdown.selectEl.replaceChildren();
+            dropdown.addOption('', t('settings.titleModel.auto'));
 
-          const settingsBag = this.plugin.settings as unknown as Record<string, unknown>;
-          const seenValues = new Set<string>();
-          for (const providerId of ProviderRegistry.getRegisteredProviderIds()) {
-            const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
-            for (const model of uiConfig.getModelOptions(settingsBag)) {
-              if (!seenValues.has(model.value)) {
-                seenValues.add(model.value);
-                dropdown.addOption(model.value, model.label);
-              }
+            const settingsBag = this.plugin.settings as unknown as Record<string, unknown>;
+            for (const model of ProviderRegistry.getTitleGenerationModelOptions(settingsBag)) {
+              dropdown.addOption(model.value, model.label);
             }
-          }
+            dropdown.setValue(this.plugin.settings.titleGenerationModel || '');
+          };
 
-          dropdown
-            .setValue(this.plugin.settings.titleGenerationModel || '')
-            .onChange(async (value) => {
-              this.plugin.settings.titleGenerationModel = value;
-              await this.plugin.saveSettings();
+          this.refreshTitleModelOptions = refreshOptions;
+          refreshOptions();
+          dropdown.onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              ProviderSettingsCoordinator.applyTitleGenerationModelSelection(settings, value);
             });
+          });
         });
     }
 
@@ -330,10 +353,13 @@ export class ClaudianSettingTab extends PluginSettingTab {
           .setPlaceholder(t('settings.userName.name'))
           .setValue(this.plugin.settings.userName)
           .onChange(async (value) => {
-            this.plugin.settings.userName = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.userName = value;
+            });
           });
-        text.inputEl.addEventListener('blur', () => this.restartServiceForPromptChange());
+        text.inputEl.addEventListener('blur', () => {
+          void this.restartServiceForPromptChange();
+        });
       });
 
     new Setting(container)
@@ -344,12 +370,15 @@ export class ClaudianSettingTab extends PluginSettingTab {
           .setPlaceholder(t('settings.systemPrompt.name'))
           .setValue(this.plugin.settings.systemPrompt)
           .onChange(async (value) => {
-            this.plugin.settings.systemPrompt = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.systemPrompt = value;
+            });
           });
         text.inputEl.rows = 6;
         text.inputEl.cols = 50;
-        text.inputEl.addEventListener('blur', () => this.restartServiceForPromptChange());
+        text.inputEl.addEventListener('blur', () => {
+          void this.restartServiceForPromptChange();
+        });
       });
 
     new Setting(container)
@@ -357,14 +386,15 @@ export class ClaudianSettingTab extends PluginSettingTab {
       .setDesc(t('settings.excludedTags.desc'))
       .addTextArea((text) => {
         text
-          .setPlaceholder('system\nprivate\ndraft')
+          .setPlaceholder('System\nprivate\ndraft')
           .setValue(this.plugin.settings.excludedTags.join('\n'))
           .onChange(async (value) => {
-            this.plugin.settings.excludedTags = value
-              .split(/\r?\n/)
-              .map((entry) => entry.trim().replace(/^#/, ''))
-              .filter((entry) => entry.length > 0);
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.excludedTags = value
+                .split(/\r?\n/)
+                .map((entry) => entry.trim().replace(/^#/, ''))
+                .filter((entry) => entry.length > 0);
+            });
           });
         text.inputEl.rows = 4;
         text.inputEl.cols = 30;
@@ -375,14 +405,17 @@ export class ClaudianSettingTab extends PluginSettingTab {
       .setDesc(t('settings.mediaFolder.desc'))
       .addText((text) => {
         text
-          .setPlaceholder('attachments')
+          .setPlaceholder('Attachments')
           .setValue(this.plugin.settings.mediaFolder)
           .onChange(async (value) => {
-            this.plugin.settings.mediaFolder = value.trim();
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.mediaFolder = value.trim();
+            });
           });
         text.inputEl.addClass('claudian-settings-media-input');
-        text.inputEl.addEventListener('blur', () => this.restartServiceForPromptChange());
+        text.inputEl.addEventListener('blur', () => {
+          void this.restartServiceForPromptChange();
+        });
       });
 
     // --- Input ---
@@ -396,8 +429,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.settings.requireCommandOrControlEnterToSend ?? false)
           .onChange(async (value) => {
-            this.plugin.settings.requireCommandOrControlEnterToSend = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.requireCommandOrControlEnterToSend = value;
+            });
           });
       });
 
@@ -424,10 +458,11 @@ export class ClaudianSettingTab extends PluginSettingTab {
             return;
           }
 
-          this.plugin.settings.keyboardNavigation.scrollUpKey = result.settings.scrollUp;
-          this.plugin.settings.keyboardNavigation.scrollDownKey = result.settings.scrollDown;
-          this.plugin.settings.keyboardNavigation.focusInputKey = result.settings.focusInput;
-          await this.plugin.saveSettings();
+          await this.plugin.mutateSettings((settings) => {
+            settings.keyboardNavigation.scrollUpKey = result.settings!.scrollUp;
+            settings.keyboardNavigation.scrollDownKey = result.settings!.scrollDown;
+            settings.keyboardNavigation.focusInputKey = result.settings!.focusInput;
+          });
           pendingValue = buildNavMappingText(this.plugin.settings.keyboardNavigation);
           text.setValue(pendingValue);
         };
@@ -442,7 +477,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
         };
 
         text
-          .setPlaceholder('map w scrollUp\nmap s scrollDown\nmap i focusInput')
+          .setPlaceholder('Map w scrollup\nmap s scrolldown\nmap i focusinput')
           .setValue(pendingValue)
           .onChange((value) => {
             pendingValue = value;
@@ -450,8 +485,8 @@ export class ClaudianSettingTab extends PluginSettingTab {
           });
 
         text.inputEl.rows = 3;
-        text.inputEl.addEventListener('blur', async () => {
-          await commitValue(true);
+        text.inputEl.addEventListener('blur', () => {
+          void commitValue(true);
         });
       });
 
@@ -477,8 +512,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.settings.heartbeatEnabled)
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatEnabled = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatEnabled = value;
+            });
             if (value) {
               this.plugin.heartbeat.start();
             } else {
@@ -496,8 +532,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.heartbeatIntervalMinutes)
           .setDynamicTooltip()
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatIntervalMinutes = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatIntervalMinutes = value;
+            });
             if (this.plugin.settings.heartbeatEnabled) {
               this.plugin.heartbeat.restart();
             }
@@ -513,8 +550,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.heartbeatMaxTurns)
           .setDynamicTooltip()
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatMaxTurns = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatMaxTurns = value;
+            });
           }),
       );
 
@@ -523,36 +561,40 @@ export class ClaudianSettingTab extends PluginSettingTab {
       .setDesc('Model used by the heartbeat (defaults to haiku for low cost).')
       .addText((text) =>
         text
+          // eslint-disable-next-line obsidianmd/ui/sentence-case -- literal model id
           .setPlaceholder('haiku')
           .setValue(this.plugin.settings.heartbeatModel)
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatModel = value.trim() || 'haiku';
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatModel = value.trim() || 'haiku';
+            });
           }),
       );
 
     new Setting(container)
-      .setName('Quiet hours start (HH:MM)')
+      .setName('Quiet hours start (hh:mm)')
       .setDesc('Heartbeat is suppressed between quiet-start and quiet-end (24h format).')
       .addText((text) =>
         text
           .setPlaceholder('22:00')
           .setValue(this.plugin.settings.heartbeatQuietStart)
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatQuietStart = value.trim() || '22:00';
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatQuietStart = value.trim() || '22:00';
+            });
           }),
       );
 
     new Setting(container)
-      .setName('Quiet hours end (HH:MM)')
+      .setName('Quiet hours end (hh:mm)')
       .addText((text) =>
         text
           .setPlaceholder('06:00')
           .setValue(this.plugin.settings.heartbeatQuietEnd)
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatQuietEnd = value.trim() || '06:00';
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatQuietEnd = value.trim() || '06:00';
+            });
           }),
       );
 
@@ -563,8 +605,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.settings.heartbeatPauseOnStreaming)
           .onChange(async (value) => {
-            this.plugin.settings.heartbeatPauseOnStreaming = value;
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.heartbeatPauseOnStreaming = value;
+            });
           }),
       );
 
@@ -572,7 +615,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
 
     renderEnvironmentSettingsSection({
       container,
-      plugin: this.plugin,
+      plugin: this.plugin.providerHost,
       scope: 'shared',
       heading: t('settings.environment'),
       name: 'Shared environment',
@@ -595,11 +638,12 @@ export class ClaudianSettingTab extends PluginSettingTab {
           .setPlaceholder(copy.placeholder)
           .setValue(getHiddenProviderCommands(this.plugin.settings, providerId).join('\n'))
           .onChange(async (value) => {
-            this.plugin.settings.hiddenProviderCommands = {
-              ...this.plugin.settings.hiddenProviderCommands,
-              [providerId]: normalizeHiddenCommandList(value.split(/\r?\n/)),
-            };
-            await this.plugin.saveSettings();
+            await this.plugin.mutateSettings((settings) => {
+              settings.hiddenProviderCommands = {
+                ...settings.hiddenProviderCommands,
+                [providerId]: normalizeHiddenCommandList(value.split(/\r?\n/)),
+              };
+            });
             this.plugin.getView()?.updateHiddenProviderCommands();
           });
         text.inputEl.rows = 4;
@@ -630,58 +674,107 @@ export class ClaudianSettingTab extends PluginSettingTab {
 
     const headerEl = container.createDiv({ cls: 'claudian-context-limits-header' });
     headerEl.createSpan({
-      text: t('settings.customContextLimits.name'),
+      text: t('settings.customModelOverrides.name'),
       cls: 'claudian-context-limits-label',
     });
 
     const descEl = container.createDiv({ cls: 'claudian-context-limits-desc' });
-    descEl.setText(t('settings.customContextLimits.desc'));
+    descEl.setText(t('settings.customModelOverrides.desc'));
 
     const listEl = container.createDiv({ cls: 'claudian-context-limits-list' });
 
     for (const modelId of uniqueModelIds) {
       const currentValue = this.plugin.settings.customContextLimits?.[modelId];
+      const currentAlias = this.plugin.settings.customModelAliases?.[modelId] ?? '';
 
       const itemEl = listEl.createDiv({ cls: 'claudian-context-limits-item' });
       const nameEl = itemEl.createDiv({ cls: 'claudian-context-limits-model' });
       nameEl.setText(modelId);
 
       const inputWrapper = itemEl.createDiv({ cls: 'claudian-context-limits-input-wrapper' });
+      const aliasInputEl = inputWrapper.createEl('input', {
+        type: 'text',
+        placeholder: t('settings.customModelAliases.placeholder'),
+        cls: 'claudian-context-alias-input',
+        value: currentAlias,
+      });
+      aliasInputEl.setAttribute('aria-label', `Alias for ${modelId}`);
+      aliasInputEl.title = 'Custom label shown in the model selector. Leave empty to use the default.';
+
       const inputEl = inputWrapper.createEl('input', {
         type: 'text',
         placeholder: '200k',
         cls: 'claudian-context-limits-input',
         value: currentValue ? formatContextLimit(currentValue) : '',
       });
+      inputEl.setAttribute('aria-label', `Context window for ${modelId}`);
 
-      const validationEl = inputWrapper.createDiv({ cls: 'claudian-context-limit-validation' });
+      const validationEl = inputWrapper.createDiv({ cls: 'claudian-context-limit-validation claudian-hidden' });
 
-      inputEl.addEventListener('input', async () => {
-        const trimmed = inputEl.value.trim();
-
-        if (!this.plugin.settings.customContextLimits) {
-          this.plugin.settings.customContextLimits = {};
+      const saveAlias = async (): Promise<void> => {
+        const existing = this.plugin.settings.customModelAliases[modelId] ?? '';
+        const trimmed = aliasInputEl.value.trim();
+        if (trimmed === existing) {
+          aliasInputEl.value = existing;
+          return;
         }
 
+        await this.plugin.mutateSettings((settings) => {
+          settings.customModelAliases ??= {};
+          if (trimmed) {
+            settings.customModelAliases[modelId] = trimmed;
+          } else {
+            delete settings.customModelAliases[modelId];
+          }
+        });
+        for (const view of this.plugin.getAllViews()) {
+          view.refreshModelSelector();
+        }
+      };
+
+      const saveContextLimit = async (): Promise<void> => {
+        const trimmed = inputEl.value.trim();
+
         if (!trimmed) {
-          delete this.plugin.settings.customContextLimits[modelId];
-          validationEl.style.display = 'none';
+          validationEl.toggleClass('claudian-hidden', true);
           inputEl.classList.remove('claudian-input-error');
         } else {
           const parsed = parseContextLimit(trimmed);
           if (parsed === null) {
             validationEl.setText(t('settings.customContextLimits.invalid'));
-            validationEl.style.display = 'block';
+            validationEl.toggleClass('claudian-hidden', false);
             inputEl.classList.add('claudian-input-error');
             return;
           }
 
-          this.plugin.settings.customContextLimits[modelId] = parsed;
-          validationEl.style.display = 'none';
+          validationEl.toggleClass('claudian-hidden', true);
           inputEl.classList.remove('claudian-input-error');
         }
+        await this.plugin.mutateSettings((settings) => {
+          settings.customContextLimits ??= {};
+          if (!trimmed) {
+            delete settings.customContextLimits[modelId];
+          } else {
+            settings.customContextLimits[modelId] = parseContextLimit(trimmed)!;
+          }
+        });
+      };
 
-        await this.plugin.saveSettings();
+      inputEl.addEventListener('input', () => {
+        void saveContextLimit();
+      });
+      aliasInputEl.addEventListener('blur', () => {
+        void saveAlias();
+      });
+      aliasInputEl.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          aliasInputEl.blur();
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          aliasInputEl.value = this.plugin.settings.customModelAliases?.[modelId] ?? '';
+          aliasInputEl.blur();
+        }
       });
     }
   }
