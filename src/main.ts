@@ -8,6 +8,7 @@ import type { Editor, WorkspaceLeaf } from 'obsidian';
 import { MarkdownView, Notice, Plugin } from 'obsidian';
 
 import { ConversationRepository } from './app/conversations/ConversationRepository';
+import { HeartbeatManager } from './app/heartbeat/HeartbeatManager';
 import { ClaudianProviderHost } from './app/providers/ClaudianProviderHost';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './app/settings/defaultSettings';
 import type { ConditionalSettingsMutation } from './app/settings/SettingsCoordinator';
@@ -57,6 +58,7 @@ function isClaudianView(value: unknown): value is ClaudianView {
 export default class ClaudianPlugin extends Plugin {
   settings!: ClaudianSettings;
   storage!: SharedAppStorage;
+  heartbeat!: HeartbeatManager;
   readonly providerHost = new ClaudianProviderHost(this);
   private settingsCoordinator!: SettingsCoordinator<ClaudianSettings>;
   private conversationRepository!: ConversationRepository;
@@ -65,6 +67,11 @@ export default class ClaudianPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
     await ProviderWorkspaceRegistry.initializeAll(this.providerHost);
+
+    this.heartbeat = new HeartbeatManager(this);
+    if (this.settings.heartbeatEnabled) {
+      this.heartbeat.start();
+    }
 
     this.registerView(
       VIEW_TYPE_CLAUDIAN,
@@ -188,6 +195,7 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.heartbeat?.destroy();
     void this.persistOpenTabStates();
     // Terminate provider runtime processes even if Obsidian quits without
     // calling onClose() — otherwise zombie CLI processes (Claude/Codex)

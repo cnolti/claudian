@@ -4,7 +4,7 @@ import type { SharedAppStorage } from '../core/bootstrap/storage';
 import type { ProviderHost } from '../core/providers/ProviderHost';
 import type { AppTabManagerState, ProviderId } from '../core/providers/types';
 import type { ChatRuntime } from '../core/runtime/ChatRuntime';
-import type { ClaudianSettings, Conversation, ConversationMeta } from '../core/types';
+import type { ClaudianSettings, Conversation, ConversationMeta, HeartbeatHost } from '../core/types';
 import type { TabData, TabId, TabManagerViewHost } from './chat/tabs/types';
 
 export interface FeatureTabManagerHost {
@@ -29,6 +29,8 @@ export interface FeatureHost {
   readonly providerHost: ProviderHost;
   readonly settings: ClaudianSettings;
   readonly storage: SharedAppStorage;
+  /** Heartbeat (fork-only) — app-owned background heartbeat daemon. */
+  readonly heartbeat: HeartbeatHost;
 
   mutateSettings(
     mutation: (settings: ClaudianSettings) => void | Promise<void>,
