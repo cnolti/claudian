@@ -32,6 +32,7 @@ import {
   renderStoredSubagent,
 } from './SubagentRenderer';
 import { renderStoredThinkingBlock } from './ThinkingBlockRenderer';
+import { groupToolBlocks } from './toolCallGrouping';
 import { renderStoredToolCall } from './ToolCallRenderer';
 import { renderStoredWriteEdit } from './WriteEditRenderer';
 
@@ -310,6 +311,8 @@ export class MessageRenderer {
       if (msg.isInterrupt || hadLegacyInterruptIndicator) {
         this.appendInterruptIndicator(contentEl);
       }
+      // Post-process: collapse consecutive tool/thinking blocks into groups.
+      groupToolBlocks(contentEl);
     }
   }
 
