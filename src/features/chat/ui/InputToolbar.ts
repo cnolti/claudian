@@ -586,10 +586,10 @@ export class ExternalContextSelector {
     this.updateDisplay();
     this.renderDropdown();
 
-    // If invalid paths were removed, notify user and save updated list
+    // Silently sync settings when invalid paths are removed — the noisy Notice
+    // fired on every plugin reload when paths pointed to networked volumes that
+    // were transiently unmounted (e.g. SMB shares not yet remounted at login).
     if (invalidPaths.length > 0) {
-      const pathNames = invalidPaths.map(p => this.shortenPath(p)).join(', ');
-      new Notice(`Removed ${invalidPaths.length} invalid external context path(s): ${pathNames}`, 5000);
       this.onPersistenceChangeCallback?.([...this.persistentPaths]);
     }
   }
