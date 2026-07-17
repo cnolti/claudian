@@ -63,8 +63,6 @@ export interface ProviderRegistration {
   settingsReconciler: ProviderSettingsReconciler;
   createRuntime: (options: Omit<CreateChatRuntimeOptions, 'providerId'>) => ChatRuntime;
   createTitleGenerationService: (plugin: ProviderHost) => TitleGenerationService;
-  /** Fork-only: cheap-model narration of the live tool stream while a turn runs. */
-  createStatusNarrationService?: (plugin: ProviderHost) => StatusNarrationService;
   createInstructionRefineService: (plugin: ProviderHost) => InstructionRefineService;
   createInlineEditService: (plugin: ProviderHost) => InlineEditService;
   historyService: ProviderConversationHistoryService;
@@ -565,20 +563,6 @@ export interface TitleGenerationService {
     userMessage: string,
     callback: TitleGenerationCallback
   ): Promise<void>;
-  cancel(): void;
-}
-
-// -- Status narration (fork-only) --
-
-export interface StatusNarrationRequest {
-  userMessage: string;
-  toolEvents: string[];
-  previousNarration: string | null;
-}
-
-export interface StatusNarrationService {
-  /** Returns one short status sentence, or null when unavailable. */
-  narrate(request: StatusNarrationRequest): Promise<string | null>;
   cancel(): void;
 }
 

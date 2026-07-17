@@ -42,8 +42,7 @@ import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
 import { InlinePlanApproval,type PlanApprovalDecision } from '../rendering/InlinePlanApproval';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { groupToolBlocks } from '../rendering/toolCallGrouping';
-import { getToolName, getToolSummary, setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
-import { StatusNarrator } from '../services/StatusNarrator';
+import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { QueuedMessage } from '../state/types';
@@ -146,7 +145,6 @@ export class InputController {
   private sawInitialProviderUserMessage = false;
   private awaitingProviderAssistantStart = false;
   private readonly turnCoordinator: TurnCoordinator<SendMessageOptions>;
-  private readonly statusNarrator: StatusNarrator;
 
   constructor(deps: InputControllerDeps) {
     this.deps = deps;
@@ -154,7 +152,6 @@ export class InputController {
       (options) => this.executeSendMessage(options),
       deps.turnOwner,
     );
-    this.statusNarrator = new StatusNarrator(deps.plugin, () => deps.state.currentContentEl);
   }
 
   private getAgentService(): ChatRuntime | null {
@@ -422,8 +419,6 @@ export class InputController {
       }
     }
 
-    this.statusNarrator.beginTurn(displayContent, agentService.providerId);
-
     try {
       const preparedTurn = agentService.prepareTurn(turnRequest);
       userMsg.content = preparedTurn.persistedContent;
@@ -490,12 +485,6 @@ export class InputController {
           continue;
         }
 
-        if (chunk.type === 'tool_use') {
-          this.statusNarrator.recordToolEvent(
-            `${getToolName(chunk.name, chunk.input)} ${getToolSummary(chunk.name, chunk.input)}`.trim(),
-          );
-        }
-
         await streamController.handleStreamChunk(
           chunk,
           this.activeStreamingAssistantMessage ?? assistantMsg,
@@ -514,9 +503,6 @@ export class InputController {
 
       // ALWAYS clear the timer interval, even on stream invalidation (prevents memory leaks)
       state.clearFlavorTimerInterval();
-      // Remove the ephemeral narrator line and abort in-flight narration
-      // before the message content is finalized and grouped.
-      this.statusNarrator.endTurn();
 
       // Skip remaining cleanup if stream was invalidated (tab closed or conversation switched)
       if (!wasInvalidated && state.streamGeneration === streamGeneration) {

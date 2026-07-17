@@ -345,10 +345,9 @@ describe('groupToolBlocks', () => {
     expect(groups[0].querySelector('.claudian-tool-group-label')?.textContent).toBe('7 tool calls');
   });
 
-  it('ignores transparent elements (narrator line, thinking indicator) for trailing detection', () => {
+  it('ignores the transparent thinking indicator for trailing detection', () => {
     const tools = Array.from({ length: 3 }, () => el('claudian-tool-call'));
     const c = container(...tools);
-    c.appendChild(el('claudian-narrator-line'));
     c.appendChild(el('claudian-thinking'));
 
     // Tools are still the trailing run even with ephemeral UI after them.

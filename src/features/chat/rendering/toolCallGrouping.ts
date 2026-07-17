@@ -5,9 +5,9 @@
  *
  * Chain-breaker approach: groupable elements accumulate into runs; text blocks
  * and chain-breakers (AskUserQuestion, response-footer, compact boundary) close
- * the current run. Runs shorter than MIN_GROUP_SIZE are left alone. Ephemeral
- * elements (narrator status line, thinking indicator) are transparent: they
- * neither join nor break a run.
+ * the current run. Runs shorter than MIN_GROUP_SIZE are left alone. The
+ * ephemeral thinking indicator is transparent: it neither joins nor breaks
+ * a run.
  */
 
 const CHECKMARK_SVG =
@@ -40,8 +40,7 @@ function isChainBreaker(el: Element): boolean {
 
 /** Ephemeral stream UI that neither joins nor breaks a run. */
 function isTransparentElement(el: Element): boolean {
-  return el.classList.contains('claudian-narrator-line')
-    || el.classList.contains('claudian-thinking');
+  return el.classList.contains('claudian-thinking');
 }
 
 function isAlreadyGrouped(el: Element): boolean {
@@ -182,7 +181,7 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   });
 }
 
-/** Nearest preceding sibling that is not transparent (narrator line, indicator). */
+/** Nearest preceding sibling that is not transparent (thinking indicator). */
 function previousRelevantSibling(el: Element): Element | null {
   let prev = el.previousElementSibling;
   while (prev && isTransparentElement(prev)) {
