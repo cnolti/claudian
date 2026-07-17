@@ -18,6 +18,8 @@ const MIN_GROUP_SIZE = 2;
 
 function isGroupableElement(el: Element): boolean {
   if (el.querySelector('.claudian-tool-content-ask')) return false;
+  // Keep live subagent status visible (incl. async "running in background").
+  if (el.querySelector('.status-running')) return false;
   if (el.classList.contains('claudian-tool-call')) return true;
   if (el.classList.contains('claudian-write-edit-block')) return true;
   if (el.classList.contains('claudian-thinking-block')) return true;
@@ -147,18 +149,31 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   });
 }
 
+export interface GroupToolBlocksOptions {
+  /**
+   * Streaming mode: leave the trailing run (the one that reaches the last
+   * child of the container) ungrouped — it is still being appended to.
+   */
+  keepTrailingOpen?: boolean;
+}
+
 /**
  * Post-processes a `.claudian-message-content` element: finds runs of
  * groupable elements (tool calls, thinking, write-edit, subagent lists) and
  * wraps each run of length >= MIN_GROUP_SIZE in a collapsible summary.
  *
- * Safe to call multiple times — already-grouped wrappers are skipped.
+ * Safe to call multiple times — already-grouped wrappers are skipped, so it
+ * can run progressively during streaming and again at end of turn.
  */
-export function groupToolBlocks(contentEl: HTMLElement | null): void {
+export function groupToolBlocks(
+  contentEl: HTMLElement | null,
+  options?: GroupToolBlocksOptions,
+): void {
   if (!contentEl) return;
 
   const children = Array.from(contentEl.children);
   if (children.length < MIN_GROUP_SIZE) return;
+  const lastChild = children[children.length - 1];
 
   interface Run {
     elements: Element[];
@@ -169,7 +184,11 @@ export function groupToolBlocks(contentEl: HTMLElement | null): void {
 
   const closeRun = () => {
     if (currentRun && currentRun.groupableCount >= MIN_GROUP_SIZE) {
-      runs.push(currentRun);
+      const isTrailing =
+        currentRun.elements[currentRun.elements.length - 1] === lastChild;
+      if (!(options?.keepTrailingOpen && isTrailing)) {
+        runs.push(currentRun);
+      }
     }
     currentRun = null;
   };

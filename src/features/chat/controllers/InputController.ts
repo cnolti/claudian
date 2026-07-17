@@ -41,6 +41,7 @@ import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../renderin
 import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
 import { InlinePlanApproval,type PlanApprovalDecision } from '../rendering/InlinePlanApproval';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
+import { groupToolBlocks } from '../rendering/toolCallGrouping';
 import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
@@ -539,11 +540,16 @@ export class InputController {
           }
         }
 
+        const completedContentEl = state.currentContentEl;
         state.currentContentEl = null;
 
         await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
         await streamController.finalizeCurrentTextBlock(finalAssistantMsg);
         this.deps.getSubagentManager().resetStreamingState();
+        // Fork: collapse consecutive tool/thinking blocks now that the message
+        // is fully rendered. resetStreamingState() only runs on tab recycle,
+        // so this finally block is the real end-of-turn hook.
+        groupToolBlocks(completedContentEl);
 
         // Auto-hide completed todo panel on response end
         // Panel reappears only when new TodoWrite tool is called

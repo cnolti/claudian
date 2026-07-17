@@ -692,6 +692,9 @@ export class StreamController {
     if (!state.currentTextEl) {
       state.currentTextEl = state.currentContentEl.createDiv({ cls: 'claudian-text-block' });
       state.currentTextContent = '';
+      // Fork: a text block closes the preceding tool run — collapse it now so
+      // the transcript stays tidy while the stream continues.
+      groupToolBlocks(state.currentContentEl, { keepTrailingOpen: true });
     }
 
     state.currentTextContent += text;
@@ -1496,6 +1499,8 @@ export class StreamController {
     this.hideThinkingIndicator();
     const el = state.currentContentEl.createDiv({ cls: 'claudian-compact-boundary' });
     el.createSpan({ cls: 'claudian-compact-boundary-label', text: 'Conversation compacted' });
+    // Fork: the boundary closes the preceding tool run — collapse it now.
+    groupToolBlocks(state.currentContentEl, { keepTrailingOpen: true });
   }
 
   // ============================================
