@@ -799,7 +799,9 @@ describe('Tab - Service Initialization', () => {
       expect(tab.lifecycleState).toBe('bound_active');
     });
 
-    it('should sync existing conversations with saved external contexts', async () => {
+    it('should sync existing conversations with merged persistent + saved external contexts', async () => {
+      // Fork behavior: persistent paths from settings are merged with the conversation's
+      // saved paths so newly-added persistent paths are immediately effective.
       const mockSyncConversationState = jest.fn();
       const runtimeModule = jest.requireMock('@/providers/claude/runtime/ClaudeChatRuntime') as { ClaudianService: jest.Mock };
       runtimeModule.ClaudianService.mockImplementationOnce(() => createMockClaudianService({
@@ -826,7 +828,10 @@ describe('Tab - Service Initialization', () => {
 
       await initializeTabService(tab, options.plugin, options.mcpManager);
 
-      expect(mockSyncConversationState).toHaveBeenCalledWith(conversation, ['/saved/path']);
+      expect(mockSyncConversationState).toHaveBeenCalledWith(
+        conversation,
+        ['/persistent/path', '/saved/path']
+      );
     });
 
     it('should initialize toolbar config for the tab provider', () => {

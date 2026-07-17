@@ -44,6 +44,7 @@ import { setLocale } from './i18n/i18n';
 import type { Locale } from './i18n/types';
 import { OPENCODE_PLAN_MODE_ID, OPENCODE_SAFE_MODE_ID } from './providers/opencode/modes';
 import { buildCursorContext } from './utils/editor';
+import { mergePersistentExternalContextPaths } from './utils/externalContext';
 import { revealWorkspaceLeaf } from './utils/obsidianCompat';
 import { getVaultPath } from './utils/path';
 
@@ -188,6 +189,17 @@ export default class ClaudianPlugin extends Plugin {
 
   onunload(): void {
     void this.persistOpenTabStates();
+    // Terminate provider runtime processes even if Obsidian quits without
+    // calling onClose() — otherwise zombie CLI processes (Claude/Codex)
+    // accumulate across plugin reload/disable.
+    for (const view of this.getAllViews()) {
+      const tabManager = view.getTabManager();
+      if (!tabManager) continue;
+      for (const tab of tabManager.getAllTabs()) {
+        tab.runtimeSupervisor.cleanup();
+        tab.service = null;
+      }
+    }
   }
 
   private async persistOpenTabStates(): Promise<void> {
@@ -504,7 +516,10 @@ export default class ClaudianPlugin extends Plugin {
       const hasConversationContext = (conversation?.messages.length ?? 0) > 0;
       const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
         ?? (hasConversationContext
-          ? conversation?.externalContextPaths ?? []
+          ? mergePersistentExternalContextPaths(
+              this.settings.persistentExternalContextPaths,
+              conversation?.externalContextPaths
+            )
           : this.settings.persistentExternalContextPaths ?? []);
 
       tab.service.syncConversationState(conversation, externalContextPaths);

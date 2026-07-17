@@ -29,6 +29,7 @@ import type { ChatMessage, ClaudianSettings, Conversation, StreamChunk } from '.
 import { t } from '../../../i18n/i18n';
 import { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
 import { getEnhancedPath } from '../../../utils/env';
+import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
 import { getVaultPath } from '../../../utils/path';
 import type { FeatureHost } from '../../FeatureHost';
 import { BrowserSelectionController } from '../controllers/BrowserSelectionController';
@@ -730,7 +731,10 @@ export async function initializeTabService(
     // The runtime starts on demand when query() is called.
     const hasMessages = conversation ? conversation.messages.length > 0 : false;
     const externalContextPaths = conversation && hasMessages
-      ? conversation.externalContextPaths || []
+      ? mergePersistentExternalContextPaths(
+          plugin.settings.persistentExternalContextPaths,
+          conversation.externalContextPaths
+        )
       : (plugin.settings.persistentExternalContextPaths || []);
     const runtimeConversationState = conversation
       ?? (selectedModel ? { sessionId: null, selectedModel } : null);
@@ -981,7 +985,10 @@ function initializeInputToolbar(
           const hasMessages = updatedConversation.messages.length > 0;
           const externalContextPaths = tab.ui.externalContextSelector?.getExternalContexts()
             ?? (hasMessages
-              ? updatedConversation.externalContextPaths ?? []
+              ? mergePersistentExternalContextPaths(
+                  plugin.settings.persistentExternalContextPaths,
+                  updatedConversation.externalContextPaths
+                )
               : plugin.settings.persistentExternalContextPaths ?? []);
           tab.service.syncConversationState(updatedConversation, externalContextPaths);
         }
@@ -1466,7 +1473,10 @@ export function initializeTabControllers(
         if (tab.service && tab.service.providerId === nextProviderId && conversation) {
           const hasMessages = conversation.messages.length > 0;
           const externalContextPaths = hasMessages
-            ? conversation.externalContextPaths || []
+            ? mergePersistentExternalContextPaths(
+                plugin.settings.persistentExternalContextPaths,
+                conversation.externalContextPaths
+              )
             : (plugin.settings.persistentExternalContextPaths || []);
           tab.service.syncConversationState(conversation, externalContextPaths);
         }

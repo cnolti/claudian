@@ -1936,7 +1936,9 @@ describe('ConversationController - Persistent External Context Paths', () => {
       );
     });
 
-    it('should restore saved paths for conversation with messages (msg>0)', async () => {
+    it('should restore saved paths merged with current persistent paths for conversation with messages (msg>0)', async () => {
+      // Fork behavior: saved paths are merged with current persistentExternalContextPaths
+      // so newly-added persistent paths are immediately effective in existing conversations.
       deps.state.currentConversationId = 'existing-conv';
       deps.plugin.getConversationById = jest.fn().mockResolvedValue({
         id: 'existing-conv',
@@ -1947,11 +1949,15 @@ describe('ConversationController - Persistent External Context Paths', () => {
 
       await controller.loadActive();
 
-      expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith(['/saved/path']);
+      expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith(
+        ['/persistent/path/a', '/persistent/path/b', '/saved/path']
+      );
       expect(mockExternalContextSelector.clearExternalContexts).not.toHaveBeenCalled();
     });
 
-    it('should restore empty paths for conversation with messages but no saved paths', async () => {
+    it('should restore persistent paths for conversation with messages but no saved paths', async () => {
+      // Fork behavior: when conversation has no saved external paths, the current
+      // persistent paths are still applied.
       deps.state.currentConversationId = 'existing-conv';
       deps.plugin.getConversationById = jest.fn().mockResolvedValue({
         id: 'existing-conv',
@@ -1962,7 +1968,9 @@ describe('ConversationController - Persistent External Context Paths', () => {
 
       await controller.loadActive();
 
-      expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith([]);
+      expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith(
+        ['/persistent/path/a', '/persistent/path/b']
+      );
     });
   });
 
@@ -1987,7 +1995,8 @@ describe('ConversationController - Persistent External Context Paths', () => {
       expect(mockExternalContextSelector.setExternalContexts).not.toHaveBeenCalled();
     });
 
-    it('should restore saved paths when switching to conversation with messages', async () => {
+    it('should merge persistent paths with saved paths when switching to conversation with messages', async () => {
+      // Fork behavior: persistent paths are merged into the restored session paths.
       (deps.plugin.switchConversation as jest.Mock).mockResolvedValue({
         id: 'conv-with-messages',
         messages: [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }],
@@ -1998,12 +2007,12 @@ describe('ConversationController - Persistent External Context Paths', () => {
       await controller.switchTo('conv-with-messages');
 
       expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith(
-        ['/saved/path/from/session']
+        ['/persistent/path/a', '/persistent/path/b', '/saved/path/from/session']
       );
       expect(mockExternalContextSelector.clearExternalContexts).not.toHaveBeenCalled();
     });
 
-    it('should restore empty array for conversation with messages but no saved paths', async () => {
+    it('should restore persistent paths for conversation with messages but no saved paths', async () => {
       (deps.plugin.switchConversation as jest.Mock).mockResolvedValue({
         id: 'conv-with-messages',
         messages: [{ id: '1', role: 'user', content: 'test', timestamp: Date.now() }],
@@ -2013,7 +2022,9 @@ describe('ConversationController - Persistent External Context Paths', () => {
 
       await controller.switchTo('conv-with-messages');
 
-      expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith([]);
+      expect(mockExternalContextSelector.setExternalContexts).toHaveBeenCalledWith(
+        ['/persistent/path/a', '/persistent/path/b']
+      );
     });
   });
 
