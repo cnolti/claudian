@@ -69,6 +69,12 @@ class FakeEl {
     }
   }
 
+  get previousElementSibling(): FakeEl | null {
+    if (!this.parentNode) return null;
+    const idx = this.parentNode.children.indexOf(this);
+    return idx > 0 ? this.parentNode.children[idx - 1] : null;
+  }
+
   querySelector(selector: string): FakeEl | null {
     const cls = selector.replace(/^\./, '');
     for (const child of this.children) {
@@ -291,6 +297,81 @@ describe('groupToolBlocks', () => {
     groupToolBlocks(asHtml(c));
 
     const status = groupsOf(c)[0].querySelector('.claudian-tool-group-status');
+    expect(status?.classList.contains('has-errors')).toBe(true);
+  });
+
+  it('caps a long trailing run during streaming, keeping the newest calls visible', () => {
+    const tools = Array.from({ length: 7 }, () => el('claudian-tool-call'));
+    const c = container(...tools);
+
+    groupToolBlocks(asHtml(c), { keepTrailingOpen: true, maxTrailingVisible: 4 });
+
+    const groups = groupsOf(c);
+    expect(groups).toHaveLength(1);
+    // Overflow (7 - 4 = 3) collapses, the newest 4 stay visible.
+    expect(groupContent(groups[0]).children).toEqual(tools.slice(0, 3));
+    for (const t of tools.slice(3)) {
+      expect(c.children).toContain(t);
+    }
+  });
+
+  it('absorbs further overflow into the existing group instead of chaining wrappers', () => {
+    const tools = Array.from({ length: 7 }, () => el('claudian-tool-call'));
+    const c = container(...tools);
+    groupToolBlocks(asHtml(c), { keepTrailingOpen: true, maxTrailingVisible: 4 });
+
+    // Stream continues: three more tool calls arrive.
+    const more = Array.from({ length: 3 }, () => el('claudian-tool-call'));
+    for (const t of more) c.appendChild(t);
+    groupToolBlocks(asHtml(c), { keepTrailingOpen: true, maxTrailingVisible: 4 });
+
+    const groups = groupsOf(c);
+    expect(groups).toHaveLength(1);
+    expect(groupContent(groups[0]).children).toHaveLength(6);
+    const label = groups[0].querySelector('.claudian-tool-group-label');
+    expect(label?.textContent).toBe('6 tool calls');
+  });
+
+  it('final pass absorbs the rest of the run into the streaming group', () => {
+    const tools = Array.from({ length: 7 }, () => el('claudian-tool-call'));
+    const c = container(...tools);
+    groupToolBlocks(asHtml(c), { keepTrailingOpen: true, maxTrailingVisible: 4 });
+
+    groupToolBlocks(asHtml(c));
+
+    const groups = groupsOf(c);
+    expect(groups).toHaveLength(1);
+    expect(groupContent(groups[0]).children).toEqual(tools);
+    expect(groups[0].querySelector('.claudian-tool-group-label')?.textContent).toBe('7 tool calls');
+  });
+
+  it('ignores transparent elements (narrator line, thinking indicator) for trailing detection', () => {
+    const tools = Array.from({ length: 3 }, () => el('claudian-tool-call'));
+    const c = container(...tools);
+    c.appendChild(el('claudian-narrator-line'));
+    c.appendChild(el('claudian-thinking'));
+
+    // Tools are still the trailing run even with ephemeral UI after them.
+    groupToolBlocks(asHtml(c), { keepTrailingOpen: true });
+    expect(groupsOf(c)).toHaveLength(0);
+
+    groupToolBlocks(asHtml(c));
+    expect(groupsOf(c)).toHaveLength(1);
+  });
+
+  it('final pass refreshes group status when errors arrived after grouping', () => {
+    const t1 = el('claudian-tool-call');
+    const t2 = el('claudian-tool-call');
+    const text = el('claudian-text-block');
+    const c = container(t1, t2, text);
+    groupToolBlocks(asHtml(c));
+    const status = groupsOf(c)[0].querySelector('.claudian-tool-group-status');
+    expect(status?.classList.contains('has-errors')).toBe(false);
+
+    // Tool result with error arrives after the progressive grouping pass.
+    t1.appendChild(el('status-error'));
+    groupToolBlocks(asHtml(c));
+
     expect(status?.classList.contains('has-errors')).toBe(true);
   });
 

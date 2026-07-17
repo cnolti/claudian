@@ -140,6 +140,37 @@ describe('StatusNarrator', () => {
     expect(contentEl.children[0].textContent).toBe('Jetzt prüfe ich deinen Kalender');
   });
 
+  it('never issues a second narration while one is in flight (slow requests)', async () => {
+    let resolveFirst: (value: string | null) => void = () => undefined;
+    service.narrate
+      .mockImplementationOnce(
+        () => new Promise<string | null>((resolve) => { resolveFirst = resolve; }),
+      )
+      .mockResolvedValueOnce('Zweite Zeile');
+    const narrator = createNarrator();
+    narrator.beginTurn('Moin', 'claude');
+    narrator.recordToolEvent('Read _TODO.md');
+    await jest.advanceTimersByTimeAsync(500);
+    expect(service.narrate).toHaveBeenCalledTimes(1);
+
+    // Tool events keep arriving while the slow request is in flight — the
+    // throttle window elapses, but no overlapping request may start (narrate()
+    // aborts its predecessor, so overlap would starve every request).
+    narrator.recordToolEvent('Edit _TODO.md');
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(service.narrate).toHaveBeenCalledTimes(1);
+
+    resolveFirst('Erste Zeile');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(contentEl.children[0]?.textContent).toBe('Erste Zeile');
+
+    // The buffered events trigger the follow-up only after the first completes.
+    await jest.advanceTimersByTimeAsync(10_000);
+    expect(service.narrate).toHaveBeenCalledTimes(2);
+    expect(contentEl.children[0]?.textContent).toBe('Zweite Zeile');
+  });
+
   it('endTurn removes the line, cancels the service, and drops late results', async () => {
     let resolveNarration: (value: string | null) => void = () => undefined;
     service.narrate.mockImplementation(

@@ -1,12 +1,13 @@
 /**
  * Tool-call post-processing: groups consecutive tool calls + thinking blocks
- * into collapsible summary wrappers. Runs after a message is fully rendered
- * (post-stream or replay), keeping the interactive code path independent from
- * the new frame-batched StreamController.
+ * into collapsible summary wrappers. Runs progressively during streaming and
+ * again when a message finishes rendering (or is replayed from history).
  *
  * Chain-breaker approach: groupable elements accumulate into runs; text blocks
  * and chain-breakers (AskUserQuestion, response-footer, compact boundary) close
- * the current run. Runs shorter than MIN_GROUP_SIZE are left alone.
+ * the current run. Runs shorter than MIN_GROUP_SIZE are left alone. Ephemeral
+ * elements (narrator status line, thinking indicator) are transparent: they
+ * neither join nor break a run.
  */
 
 const CHECKMARK_SVG =
@@ -15,6 +16,9 @@ const ERROR_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
 
 const MIN_GROUP_SIZE = 2;
+
+/** How many trailing tool calls stay visible while the stream is active. */
+export const STREAMING_TRAILING_VISIBLE = 4;
 
 function isGroupableElement(el: Element): boolean {
   if (el.querySelector('.claudian-tool-content-ask')) return false;
@@ -32,6 +36,12 @@ function isChainBreaker(el: Element): boolean {
   if (el.classList.contains('claudian-response-footer')) return true;
   if (el.classList.contains('claudian-compact-boundary')) return true;
   return false;
+}
+
+/** Ephemeral stream UI that neither joins nor breaks a run. */
+function isTransparentElement(el: Element): boolean {
+  return el.classList.contains('claudian-narrator-line')
+    || el.classList.contains('claudian-thinking');
 }
 
 function isAlreadyGrouped(el: Element): boolean {
@@ -83,9 +93,39 @@ function buildGroupLabel(toolCount: number, thinkingCount: number, thinkingDurat
   return parts.join(' · ');
 }
 
-function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
-  const { toolCount, thinkingCount, thinkingDuration, hasErrors } = countGroupStats(elements);
+/** Recomputes a group wrapper's label and status icon from its content. */
+function refreshGroupSummary(wrapperEl: Element): void {
+  const contentEl = wrapperEl.querySelector('.claudian-tool-group-content');
+  const summaryEl = wrapperEl.querySelector('.claudian-tool-group-summary');
+  const labelEl = wrapperEl.querySelector('.claudian-tool-group-label');
+  const statusEl = wrapperEl.querySelector('.claudian-tool-group-status');
+  if (!contentEl || !summaryEl || !labelEl || !statusEl) return;
+
+  const { toolCount, thinkingCount, thinkingDuration, hasErrors } =
+    countGroupStats(Array.from(contentEl.children));
   const labelText = buildGroupLabel(toolCount, thinkingCount, thinkingDuration);
+  labelEl.textContent = labelText;
+  summaryEl.setAttribute('aria-label', labelText);
+  if (hasErrors) {
+    statusEl.classList.add('has-errors');
+    statusEl.innerHTML = ERROR_SVG;
+  } else {
+    statusEl.classList.remove('has-errors');
+    statusEl.innerHTML = CHECKMARK_SVG;
+  }
+}
+
+/** Moves run elements into an existing adjacent group instead of nesting a new one. */
+function absorbIntoGroup(groupEl: Element, elements: Element[]): void {
+  const contentEl = groupEl.querySelector('.claudian-tool-group-content');
+  if (!contentEl) return;
+  for (const el of elements) {
+    contentEl.appendChild(el);
+  }
+  refreshGroupSummary(groupEl);
+}
+
+function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   // Popout-window safety: create elements in the document that owns the message.
   const doc = parentEl.ownerDocument;
 
@@ -97,7 +137,6 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   summaryEl.setAttribute('tabindex', '0');
   summaryEl.setAttribute('role', 'button');
   summaryEl.setAttribute('aria-expanded', 'false');
-  summaryEl.setAttribute('aria-label', labelText);
 
   const chevron = doc.createElement('span');
   chevron.className = 'claudian-tool-group-chevron';
@@ -105,16 +144,9 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
 
   const labelEl = doc.createElement('span');
   labelEl.className = 'claudian-tool-group-label';
-  labelEl.textContent = labelText;
 
   const statusEl = doc.createElement('span');
   statusEl.className = 'claudian-tool-group-status';
-  if (hasErrors) {
-    statusEl.classList.add('has-errors');
-    statusEl.innerHTML = ERROR_SVG;
-  } else {
-    statusEl.innerHTML = CHECKMARK_SVG;
-  }
 
   summaryEl.appendChild(chevron);
   summaryEl.appendChild(labelEl);
@@ -135,6 +167,7 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   for (const el of elements) {
     contentEl.appendChild(el);
   }
+  refreshGroupSummary(wrapperEl);
 
   summaryEl.addEventListener('click', () => {
     const isExpanded = wrapperEl.classList.toggle('expanded');
@@ -149,18 +182,35 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
   });
 }
 
+/** Nearest preceding sibling that is not transparent (narrator line, indicator). */
+function previousRelevantSibling(el: Element): Element | null {
+  let prev = el.previousElementSibling;
+  while (prev && isTransparentElement(prev)) {
+    prev = prev.previousElementSibling;
+  }
+  return prev;
+}
+
 export interface GroupToolBlocksOptions {
   /**
-   * Streaming mode: leave the trailing run (the one that reaches the last
-   * child of the container) ungrouped — it is still being appended to.
+   * Streaming mode: leave the trailing run (the one still being appended to)
+   * ungrouped so live tool activity stays visible.
    */
   keepTrailingOpen?: boolean;
+  /**
+   * Streaming mode: when the trailing run grows beyond this many elements,
+   * collapse the overflow anyway (into the adjacent group if one exists) and
+   * keep only this many visible. Only meaningful with keepTrailingOpen.
+   */
+  maxTrailingVisible?: number;
 }
 
 /**
  * Post-processes a `.claudian-message-content` element: finds runs of
  * groupable elements (tool calls, thinking, write-edit, subagent lists) and
  * wraps each run of length >= MIN_GROUP_SIZE in a collapsible summary.
+ * Consecutive passes merge into existing adjacent groups instead of creating
+ * chains of wrappers.
  *
  * Safe to call multiple times — already-grouped wrappers are skipped, so it
  * can run progressively during streaming and again at end of turn.
@@ -173,31 +223,50 @@ export function groupToolBlocks(
 
   const children = Array.from(contentEl.children);
   if (children.length < MIN_GROUP_SIZE) return;
-  const lastChild = children[children.length - 1];
+
+  let lastRelevantChild: Element | null = null;
+  for (let i = children.length - 1; i >= 0; i--) {
+    if (!isTransparentElement(children[i])) {
+      lastRelevantChild = children[i];
+      break;
+    }
+  }
 
   interface Run {
     elements: Element[];
-    groupableCount: number;
   }
   const runs: Run[] = [];
   let currentRun: Run | null = null;
 
   const closeRun = () => {
-    if (currentRun && currentRun.groupableCount >= MIN_GROUP_SIZE) {
-      const isTrailing =
-        currentRun.elements[currentRun.elements.length - 1] === lastChild;
-      if (!(options?.keepTrailingOpen && isTrailing)) {
-        runs.push(currentRun);
-      }
-    }
+    if (!currentRun) return;
+    const run = currentRun;
     currentRun = null;
+    if (run.elements.length < MIN_GROUP_SIZE) return;
+
+    const isTrailing = run.elements[run.elements.length - 1] === lastRelevantChild;
+    if (options?.keepTrailingOpen && isTrailing) {
+      // Trailing run stays open — unless it exceeds the visibility cap, in
+      // which case the overflow is collapsed and the newest calls stay visible.
+      const cap = options.maxTrailingVisible;
+      if (cap !== undefined && run.elements.length > cap) {
+        const overflow = run.elements.slice(0, run.elements.length - cap);
+        if (overflow.length >= MIN_GROUP_SIZE || hasAdjacentGroup(overflow[0])) {
+          runs.push({ elements: overflow });
+        }
+      }
+      return;
+    }
+    runs.push(run);
+  };
+
+  const hasAdjacentGroup = (el: Element): boolean => {
+    const prev = previousRelevantSibling(el);
+    return prev !== null && isAlreadyGrouped(prev);
   };
 
   for (const child of children) {
-    // The ephemeral narrator status line is transparent: it neither joins nor
-    // breaks a run (it is re-appended to the end during streaming and removed
-    // at end of turn).
-    if (child.classList.contains('claudian-narrator-line')) {
+    if (isTransparentElement(child)) {
       continue;
     }
     if (isAlreadyGrouped(child)) {
@@ -208,19 +277,32 @@ export function groupToolBlocks(
       closeRun();
     } else if (isGroupableElement(child)) {
       if (!currentRun) {
-        currentRun = { elements: [], groupableCount: 0 };
+        currentRun = { elements: [] };
       }
       currentRun.elements.push(child);
-      currentRun.groupableCount++;
     } else {
       closeRun();
     }
   }
   closeRun();
 
+  if (!options?.keepTrailingOpen) {
+    // Final/replay pass: results may have arrived after a progressive pass
+    // grouped their tool calls — refresh every group's label and status.
+    for (const child of children) {
+      if (isAlreadyGrouped(child)) refreshGroupSummary(child);
+    }
+  }
+
   if (runs.length === 0) return;
 
   for (let r = runs.length - 1; r >= 0; r--) {
-    createGroupWrapper(contentEl, runs[r].elements);
+    const run = runs[r];
+    const prev = previousRelevantSibling(run.elements[0]);
+    if (prev && isAlreadyGrouped(prev)) {
+      absorbIntoGroup(prev, run.elements);
+    } else {
+      createGroupWrapper(contentEl, run.elements);
+    }
   }
 }

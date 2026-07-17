@@ -9,6 +9,7 @@ Rules:
 - Use the same language as the user's message.
 - Present tense, first person, as the assistant ("Ich schaue gerade in deinen Kalender …").
 - Ground the sentence in the tool activity. Never invent results, findings, or conclusions — you only know what is being looked at, not what was found.
+- NEVER claim that something failed, is unreachable, or should be retried. You cannot see outcomes — only which tools are being used. Describe the activity, nothing else.
 - If the previous status line still fits, vary the wording instead of repeating it.`;
 
 const MAX_USER_MESSAGE_CHARS = 300;

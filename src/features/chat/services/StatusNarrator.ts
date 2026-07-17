@@ -2,7 +2,7 @@ import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import type { ProviderId, StatusNarrationService } from '../../../core/providers/types';
 import type { FeatureHost } from '../../FeatureHost';
 
-const FIRST_NARRATION_DELAY_MS = 1200;
+const FIRST_NARRATION_DELAY_MS = 500;
 const MIN_NARRATION_INTERVAL_MS = 8000;
 const MAX_TOOL_EVENTS = 12;
 
@@ -23,6 +23,7 @@ export class StatusNarrator {
   private lastNarrationAt = 0;
   private timer: number | null = null;
   private active = false;
+  private narrating = false;
   private userMessage = '';
   private generation = 0;
 
@@ -76,7 +77,10 @@ export class StatusNarrator {
   }
 
   private scheduleNarration(): void {
-    if (this.timer !== null) return;
+    // A narration request can take several seconds (CLI cold start). Never
+    // schedule while one is in flight — narrate() aborts the previous request,
+    // so overlapping calls would starve each other and nothing ever renders.
+    if (this.timer !== null || this.narrating) return;
     const wait = this.lastNarrationAt === 0
       ? FIRST_NARRATION_DELAY_MS
       : Math.max(0, MIN_NARRATION_INTERVAL_MS - (Date.now() - this.lastNarrationAt));
@@ -87,17 +91,23 @@ export class StatusNarrator {
   }
 
   private async runNarration(): Promise<void> {
-    if (!this.active || !this.service || this.pendingEvents === 0) return;
+    if (!this.active || !this.service || this.pendingEvents === 0 || this.narrating) return;
     const generation = this.generation;
     this.pendingEvents = 0;
     // Stamp before the request so the throttle window covers request latency.
     this.lastNarrationAt = Date.now();
+    this.narrating = true;
 
-    const text = await this.service.narrate({
-      userMessage: this.userMessage,
-      toolEvents: [...this.toolEvents],
-      previousNarration: this.lastNarration,
-    });
+    let text: string | null;
+    try {
+      text = await this.service.narrate({
+        userMessage: this.userMessage,
+        toolEvents: [...this.toolEvents],
+        previousNarration: this.lastNarration,
+      });
+    } finally {
+      this.narrating = false;
+    }
 
     if (!this.active || generation !== this.generation) return;
     if (text) {

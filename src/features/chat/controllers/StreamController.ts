@@ -48,7 +48,7 @@ import {
   createThinkingBlock,
   finalizeThinkingBlock,
 } from '../rendering/ThinkingBlockRenderer';
-import { groupToolBlocks } from '../rendering/toolCallGrouping';
+import { groupToolBlocks, STREAMING_TRAILING_VISIBLE } from '../rendering/toolCallGrouping';
 import {
   getToolName,
   getToolSummary,
@@ -407,6 +407,13 @@ export class StreamController {
     }
 
     state.pendingTools.clear();
+
+    // Fork: keep long uninterrupted tool runs tidy while streaming — collapse
+    // everything but the newest few calls into the (growing) group above.
+    groupToolBlocks(state.currentContentEl, {
+      keepTrailingOpen: true,
+      maxTrailingVisible: STREAMING_TRAILING_VISIBLE,
+    });
   }
 
   /**
