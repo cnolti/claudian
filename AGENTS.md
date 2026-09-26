@@ -35,3 +35,16 @@ npm run typecheck && npm run lint && npm run test && npm run build && npm run ch
 
 - Keep non-obvious constraints at their narrowest common scope, with one authoritative home and explicit exceptions. Remove implementation inventories, generic advice, inherited duplicates, and retired decisions.
 - Each guide has a sibling `CLAUDE.md` containing only `@AGENTS.md`.
+
+## Fork notes (cnolti)
+
+This is the `cnolti/claudian` fork of `YishenTu/claudian`, re-ported onto upstream 2.3.4. Fork-only surface:
+
+- **Heartbeat**: background vault daemon. Contract in `src/core/types/heartbeat.ts`; scheduling/state in `src/app/heartbeat/` behind a narrow `HeartbeatManagerHost` (no `main` import); the Claude turn runs provider-owned in `src/providers/claude/heartbeat/`; `main.ts` wires both and exposes `FeatureHost.heartbeat`. UI: `features/chat/ui/HeartbeatStatusControl.ts` (nav row) and `features/settings/HeartbeatSettingsSection.ts`; `heartbeat*` settings keys.
+- **Tool-call grouping**: `features/chat/rendering/toolCallGrouping.ts` collapses runs of at least 2 consecutive tool/thinking blocks. While streaming, `StreamController` caps the trailing run at `STREAMING_TRAILING_VISIBLE` (after pending-tool flushes and after every tool result); `InputController` groups a finished assistant message when the next one starts; `MessageRenderer.finalizeResponse` and replay run the final pass before upstream's "Worked for" collapse. Running tools/subagents never group.
+- **Branding/deploy**: manifest id stays `claudian` (upstream uses `realclaudian`); `npm run deploy` bumps the `-fork.N` version, builds, copies to the vault (`OBSIDIAN_VAULT` in `.env.local`), commits, and pushes to all non-upstream remotes (`--skip-bump`, `--skip-git`).
+- **Test locale**: `scripts/run-jest.js` pins `en_US.UTF-8` so `toLocaleString` assertions pass on German hosts.
+
+Retired with 2.3.4 because upstream now covers them: external-context merging (upstream removed external context, #1283) and the onunload runtime cleanup (`executionLifecycleRegistry.dispose()`).
+
+When merging upstream again, re-port this surface onto a fresh upstream base instead of conflict-merging, then land it on `main` via `merge -s ours` plus `git read-tree -u --reset <port-branch>`.
