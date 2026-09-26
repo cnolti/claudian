@@ -1,4 +1,4 @@
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 import { setIcon } from 'obsidian';
 
 import type { ToolCallInfo } from '@/core/types';
@@ -6,9 +6,7 @@ import {
   getToolLabel,
   getToolName,
   getToolSummary,
-  isBlockedToolResult,
   renderStoredToolCall,
-  renderTodoWriteResult,
   renderToolCall,
   setToolIcon,
   updateToolCallResult,
@@ -36,48 +34,6 @@ describe('ToolCallRenderer', () => {
   });
 
   describe('renderToolCall', () => {
-    it('should store element in toolCallElements map', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({ id: 'test-id' });
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
-
-      expect(toolCallElements.get('test-id')).toBe(toolEl);
-    });
-
-    it('should set data-tool-id on element', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({ id: 'my-tool-id' });
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
-
-      expect(toolEl.dataset.toolId).toBe('my-tool-id');
-    });
-
-    it('should set correct ARIA attributes for accessibility', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall();
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
-
-      const header = (toolEl as any)._children[0];
-      expect(header.getAttribute('role')).toBe('button');
-      expect(header.getAttribute('tabindex')).toBe('0');
-    });
-
-    it('should track isExpanded on toolCall object', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall();
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      renderToolCall(parentEl, toolCall, toolCallElements);
-
-      expect(toolCall.isExpanded).toBe(false);
-    });
-
     it('should start expanded when requested', () => {
       const parentEl = createMockEl();
       const toolCall = createToolCall();
@@ -91,6 +47,69 @@ describe('ToolCallRenderer', () => {
       expect(toolEl.hasClass('expanded')).toBe(true);
       expect(content?.hasClass('claudian-hidden')).toBe(false);
       expect(header?.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    it('builds Bash-specific classes, icon, command content, and toggle state', () => {
+      const parentEl = createMockEl();
+      const toolCall = createToolCall({
+        name: 'Bash',
+        input: { command: 'npm test' },
+      });
+      const toolEl = renderToolCall(parentEl, toolCall, new Map());
+      const header = toolEl.querySelector('.claudian-tool-header');
+      const content = toolEl.querySelector('.claudian-tool-content');
+
+      expect(toolEl.hasClass('claudian-tool-call-bash')).toBe(true);
+      expect(toolEl.querySelector('.claudian-tool-bash-command')?.textContent).toBe('$ npm test');
+      expect(setIcon).toHaveBeenCalledWith(expect.anything(), 'terminal');
+
+      (header as HTMLElement | null)?.click();
+      expect(toolCall.isExpanded).toBe(true);
+      expect(content?.hasClass('claudian-hidden')).toBe(false);
+    });
+
+    it('builds TodoWrite preview, content, icon, and toggle handlers', () => {
+      const parentEl = createMockEl();
+      const toolCall = createToolCall({
+        name: 'TodoWrite',
+        input: {
+          todos: [{ content: 'Task', status: 'in_progress', activeForm: 'Working' }],
+        },
+      });
+      const toolEl = renderToolCall(parentEl, toolCall, new Map());
+      const header = toolEl.querySelector('.claudian-tool-header');
+      const currentTask = toolEl.querySelector('.claudian-tool-current');
+      const status = toolEl.querySelector('.claudian-tool-status');
+      const content = toolEl.querySelector('.claudian-tool-content');
+
+      expect(currentTask?.textContent).toBe('Working');
+      expect(content?.hasClass('claudian-tool-content-todo')).toBe(true);
+      expect(setIcon).toHaveBeenCalledWith(expect.anything(), 'list-checks');
+
+      (header as HTMLElement | null)?.click();
+      expect(toolCall.isExpanded).toBe(true);
+      expect(currentTask?.hasClass('claudian-hidden')).toBe(true);
+      expect(status?.hasClass('claudian-hidden')).toBe(true);
+    });
+
+    it('builds AskUserQuestion content and renders resolved answers through its dedicated updater', () => {
+      const parentEl = createMockEl();
+      const toolCall = createToolCall({
+        name: 'AskUserQuestion',
+        input: { questions: [{ id: 'color', question: 'Color?' }] },
+        resolvedAnswers: { color: 'Blue' },
+      });
+      const toolCallElements = new Map<string, HTMLElement>();
+      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
+      const content = toolEl.querySelector('.claudian-tool-content');
+
+      expect(content?.hasClass('claudian-tool-content-ask')).toBe(true);
+      expect(setIcon).toHaveBeenCalledWith(expect.anything(), 'help-circle');
+
+      toolCall.status = 'completed';
+      toolCall.result = 'answered';
+      updateToolCallResult(toolCall.id, toolCall, toolCallElements);
+      expect(toolEl.querySelector('.claudian-ask-review-a-text')?.textContent).toBe('Blue');
     });
   });
 
@@ -180,6 +199,12 @@ describe('ToolCallRenderer', () => {
       const toolCallElements = new Map<string, HTMLElement>();
 
       const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
+      expect(toolCallElements.get('tool-1')).toBe(toolEl);
+      expect(toolEl.dataset.toolId).toBe('tool-1');
+      const header = toolEl.querySelector('.claudian-tool-header');
+      expect(header?.getAttribute('role')).toBe('button');
+      expect(header?.getAttribute('tabindex')).toBe('0');
+      expect(toolCall.isExpanded).toBe(false);
 
       // Update with completed result
       toolCall.status = 'completed';
@@ -350,7 +375,6 @@ describe('ToolCallRenderer', () => {
       expect(getToolName('EnterPlanMode', {})).toBe('Entering plan mode');
       expect(getToolName('ExitPlanMode', {})).toBe('Plan complete');
     });
-
   });
 
   describe('getToolSummary', () => {
@@ -539,6 +563,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
       const lines = Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(line => line.textContent);
 
       expect(lines).toContain('Query: obsidian plugin API');
@@ -559,6 +584,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
       const links = toolEl.querySelectorAll('.claudian-tool-link');
       const lines = Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(line => line.textContent);
 
@@ -589,6 +615,13 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      const header = toolEl.querySelector('.claudian-tool-header');
+      const content = toolEl.querySelector('.claudian-tool-content');
+      expect(toolEl.hasClass('expanded')).toBe(false);
+      expect(content?.hasClass('claudian-hidden')).toBe(true);
+      expect(header?.getAttribute('aria-expanded')).toBe('false');
+
+      (header as HTMLElement).click();
       const headers = Array.from(toolEl.querySelectorAll('.claudian-tool-patch-header')).map(el => el.textContent);
       const statusEl = toolEl.querySelector('.claudian-tool-status');
       const diffTexts = Array.from(toolEl.querySelectorAll('.claudian-diff-text')).map(el => el.textContent);
@@ -601,33 +634,6 @@ describe('ToolCallRenderer', () => {
       expect(setIcon).not.toHaveBeenCalledWith(expect.anything(), 'check');
       expect(diffTexts).toContain("import { Plugin } from 'obsidian';");
       expect(diffTexts).toContain("import { Plugin, Notice } from 'obsidian';");
-    });
-
-    it('renders stored apply_patch collapsed by default', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({
-        name: 'apply_patch',
-        status: 'completed',
-        input: {
-          patch: [
-            '*** Begin Patch',
-            '*** Update File: src/main.ts',
-            '@@',
-            '-old',
-            '+new',
-            '*** End Patch',
-          ].join('\n'),
-        },
-        result: 'Applied patch',
-      });
-
-      const toolEl = renderStoredToolCall(parentEl, toolCall);
-      const header = toolEl.querySelector('.claudian-tool-header');
-      const content = toolEl.querySelector('.claudian-tool-content');
-
-      expect(toolEl.hasClass('expanded')).toBe(false);
-      expect(content?.hasClass('claudian-hidden')).toBe(true);
-      expect(header?.getAttribute('aria-expanded')).toBe('false');
     });
 
     it('renders stored apply_patch expanded when requested', () => {
@@ -675,6 +681,7 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
       const headers = Array.from(toolEl.querySelectorAll('.claudian-tool-patch-header')).map(el => el.textContent);
       const statusEl = toolEl.querySelector('.claudian-tool-status');
       const diffTexts = Array.from(toolEl.querySelectorAll('.claudian-diff-text')).map(el => el.textContent);
@@ -793,64 +800,11 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
       const lines = Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(el => el.textContent);
 
       expect(lines).toContain('src/main.ts');
       expect(lines).not.toContain('update: src/main.ts');
-    });
-  });
-
-  describe('isBlockedToolResult', () => {
-    it.each([
-      'Path is outside the vault',
-      'Access Denied for this file',
-      'User denied the action',
-      'Requires approval from user',
-    ])('should detect blocked result: %s', (result) => {
-      expect(isBlockedToolResult(result)).toBe(true);
-    });
-
-    it('should detect "deny" only when isError is true', () => {
-      expect(isBlockedToolResult('deny permission', true)).toBe(true);
-      expect(isBlockedToolResult('deny permission', false)).toBe(false);
-      expect(isBlockedToolResult('deny permission')).toBe(false);
-    });
-
-    it('should return false for normal results', () => {
-      expect(isBlockedToolResult('File content here')).toBe(false);
-    });
-
-    it('extracts text from structured content blocks before blocked detection', () => {
-      expect(isBlockedToolResult([
-        { type: 'text', text: 'Requires approval from user' },
-      ])).toBe(true);
-    });
-  });
-
-  describe('renderTodoWriteResult', () => {
-    it('should render todo items', () => {
-      const container = createMockEl();
-      const input = {
-        todos: [
-          { status: 'completed', content: 'Task 1', activeForm: 'Task 1' },
-          { status: 'pending', content: 'Task 2', activeForm: 'Task 2' },
-        ],
-      };
-      renderTodoWriteResult(container as unknown as HTMLElement, input);
-      expect(container.hasClass('claudian-todo-panel-content')).toBe(true);
-      expect(container.hasClass('claudian-todo-list-container')).toBe(true);
-    });
-
-    it('should show fallback text when no todos array', () => {
-      const container = createMockEl();
-      renderTodoWriteResult(container as unknown as HTMLElement, {});
-      expect(container._children[0].textContent).toBe('Tasks updated');
-    });
-
-    it('should show fallback text for non-array todos', () => {
-      const container = createMockEl();
-      renderTodoWriteResult(container as unknown as HTMLElement, { todos: 'invalid' });
-      expect(container._children[0].textContent).toBe('Tasks updated');
     });
   });
 
@@ -882,6 +836,23 @@ describe('ToolCallRenderer', () => {
       expect(statusEl?.hasClass('status-completed')).toBe(true);
     });
 
+    it('should mark an explicit empty todo snapshot as completed', () => {
+      const parentEl = createMockEl();
+      const toolCall = createToolCall({
+        id: 'todo-empty',
+        name: 'TodoWrite',
+        input: { todos: [] },
+        status: 'completed',
+      });
+      const toolCallElements = new Map<string, HTMLElement>();
+
+      renderToolCall(parentEl, toolCall, toolCallElements);
+      updateToolCallResult('todo-empty', toolCall, toolCallElements);
+
+      const statusEl = parentEl.querySelector('.claudian-tool-status');
+      expect(statusEl?.hasClass('status-completed')).toBe(true);
+    });
+
     it('should do nothing for non-existent tool id', () => {
       const toolCallElements = new Map<string, HTMLElement>();
       updateToolCallResult('nonexistent', createToolCall(), toolCallElements);
@@ -890,20 +861,33 @@ describe('ToolCallRenderer', () => {
   });
 
   describe('renderStoredToolCall for TodoWrite', () => {
-    it('should render stored TodoWrite with status', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({
-        name: 'TodoWrite',
-        status: 'completed',
+    it.each([
+      {
+        label: 'todo items',
         input: {
           todos: [
-            { status: 'completed', content: 'Task 1', activeForm: 'Done' },
+            { status: 'completed', content: 'Task 1', activeForm: 'Task 1' },
+            { status: 'pending', content: 'Task 2', activeForm: 'Task 2' },
           ],
         },
-      });
+        expectedTasks: ['Task 1', 'Task 2'],
+        expectedFallback: null,
+      },
+      { label: 'missing todos', input: {}, expectedTasks: [], expectedFallback: 'Tasks updated' },
+      { label: 'invalid todos', input: { todos: 'invalid' }, expectedTasks: [], expectedFallback: 'Tasks updated' },
+    ])('renders $label through the stored tool boundary', ({ input, expectedTasks, expectedFallback }) => {
+      const toolEl = renderStoredToolCall(createMockEl(), createToolCall({
+        name: 'TodoWrite',
+        status: 'completed',
+        input,
+      }));
+      const content = toolEl.querySelector('.claudian-tool-content');
 
-      const toolEl = renderStoredToolCall(parentEl, toolCall);
       expect(toolEl).toBeDefined();
+      expect(content?.hasClass('claudian-todo-list-container')).toBe(true);
+      expect(Array.from(content!.querySelectorAll('.claudian-todo-text'), el => el.textContent))
+        .toEqual(expectedTasks);
+      expect(content?.querySelector('.claudian-tool-result-item')?.textContent ?? null).toBe(expectedFallback);
     });
   });
 });

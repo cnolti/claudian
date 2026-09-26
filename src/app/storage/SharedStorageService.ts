@@ -1,12 +1,13 @@
-import type { Plugin } from 'obsidian';
-import { Notice } from 'obsidian';
+import { Notice, type Plugin } from 'obsidian';
 
-import { SESSIONS_PATH, SessionStorage } from '../../core/bootstrap/SessionStorage';
+import { ConversationPersistenceStore } from '../../core/bootstrap/ConversationPersistenceStore';
+import { migrateSessionSidecars } from '../../core/bootstrap/migrateSessionSidecars';
+import { SessionStorage } from '../../core/bootstrap/SessionStorage';
 import type { SharedAppStorage } from '../../core/bootstrap/storage';
-import { CLAUDIAN_STORAGE_PATH } from '../../core/bootstrap/StoragePaths';
 import { normalizeTabManagerState } from '../../core/bootstrap/tabManagerState';
 import type { AppTabManagerState } from '../../core/providers/types';
 import { VaultFileAdapter } from '../../core/storage/VaultFileAdapter';
+import { getHostnameKey } from '../../utils/env';
 import { ClaudianSettingsStorage, type StoredClaudianSettings } from '../settings/ClaudianSettingsStorage';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -16,6 +17,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export class SharedStorageService implements SharedAppStorage {
   readonly claudianSettings: ClaudianSettingsStorage;
   readonly sessions: SessionStorage;
+  readonly conversationPersistence: ConversationPersistenceStore;
 
   private adapter: VaultFileAdapter;
   private plugin: Plugin;
@@ -23,29 +25,24 @@ export class SharedStorageService implements SharedAppStorage {
   constructor(plugin: Plugin) {
     this.plugin = plugin;
     this.adapter = new VaultFileAdapter(plugin.app);
+    const deviceKey = getHostnameKey();
     this.claudianSettings = new ClaudianSettingsStorage(this.adapter);
-    this.sessions = new SessionStorage(this.adapter);
+    this.sessions = new SessionStorage(this.adapter, deviceKey);
+    this.conversationPersistence = new ConversationPersistenceStore(this.adapter, deviceKey);
   }
 
   async initialize(): Promise<{ claudian: Record<string, unknown> }> {
-    await this.ensureDirectories();
+    try {
+      await migrateSessionSidecars(this.adapter);
+    } catch {
+      new Notice('Failed to clean up obsolete session files; will retry next launch');
+    }
     const claudian = await this.claudianSettings.load();
     return { claudian };
   }
 
   async saveClaudianSettings(settings: Record<string, unknown>): Promise<void> {
     await this.claudianSettings.save(settings as StoredClaudianSettings);
-  }
-
-  async setTabManagerState(state: AppTabManagerState): Promise<void> {
-    try {
-      const loaded: unknown = await this.plugin.loadData();
-      const data = isRecord(loaded) ? loaded : {};
-      data.tabManagerState = state;
-      await this.plugin.saveData(data);
-    } catch {
-      new Notice('Failed to save tab layout');
-    }
   }
 
   async getTabManagerState(): Promise<AppTabManagerState | null> {
@@ -61,13 +58,16 @@ export class SharedStorageService implements SharedAppStorage {
     }
   }
 
+  async clearTabManagerState(): Promise<void> {
+    const loaded: unknown = await this.plugin.loadData();
+    if (!isRecord(loaded) || !('tabManagerState' in loaded)) return;
+
+    const data = { ...loaded };
+    delete data.tabManagerState;
+    await this.plugin.saveData(data);
+  }
+
   getAdapter(): VaultFileAdapter {
     return this.adapter;
   }
-
-  private async ensureDirectories(): Promise<void> {
-    await this.adapter.ensureFolder(CLAUDIAN_STORAGE_PATH);
-    await this.adapter.ensureFolder(SESSIONS_PATH);
-  }
-
 }

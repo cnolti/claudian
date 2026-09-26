@@ -14,9 +14,6 @@ export const TOOL_READ = 'Read' as const;
 export const TOOL_READ_MCP_RESOURCE = 'ReadMcpResource' as const;
 export const TOOL_SKILL = 'Skill' as const;
 export const TOOL_SUBAGENT = 'Agent' as const;
-export const TOOL_SUBAGENT_LEGACY = 'Task' as const;
-// Kept as an alias while the internal codebase is still named around "Task".
-export const TOOL_TASK = TOOL_SUBAGENT;
 export const TOOL_TODO_WRITE = 'TodoWrite' as const;
 export const TOOL_TOOL_SEARCH = 'ToolSearch' as const;
 export const TOOL_WEB_FETCH = 'WebFetch' as const;
@@ -49,70 +46,11 @@ export function isAgentLifecycleTool(name: string): boolean {
   return (AGENT_LIFECYCLE_TOOLS as readonly string[]).includes(name);
 }
 
-/** Tools that should be hidden from rendering when a provider subagent block is shown. */
-export const SUBAGENT_HIDDEN_TOOLS = [
-  TOOL_WAIT,
-  TOOL_WAIT_AGENT,
-  TOOL_CLOSE_AGENT,
-] as const;
-
-export function isSubagentSpawnTool(name: string): boolean {
-  return name === TOOL_SPAWN_AGENT;
-}
-
-export function isSubagentHiddenTool(name: string): boolean {
-  return (SUBAGENT_HIDDEN_TOOLS as readonly string[]).includes(name);
-}
-
-// These tools resolve via dedicated callbacks (not content-based), so their
-// tool_result should never be marked "blocked" based on result text.
-export const TOOLS_SKIP_BLOCKED_DETECTION = [
-  TOOL_ENTER_PLAN_MODE,
-  TOOL_EXIT_PLAN_MODE,
-  TOOL_ASK_USER_QUESTION,
-] as const;
-
-export const SUBAGENT_TOOL_NAMES = [
-  TOOL_SUBAGENT,
-  TOOL_SUBAGENT_LEGACY,
-] as const;
-export type SubagentToolName = (typeof SUBAGENT_TOOL_NAMES)[number];
-
-export function skipsBlockedDetection(name: string): boolean {
-  return (TOOLS_SKIP_BLOCKED_DETECTION as readonly string[]).includes(name);
-}
-
-export function isSubagentToolName(name: string): name is SubagentToolName {
-  return (SUBAGENT_TOOL_NAMES as readonly string[]).includes(name);
-}
-
 export const EDIT_TOOLS = [TOOL_WRITE, TOOL_EDIT, TOOL_NOTEBOOK_EDIT] as const;
 export type EditToolName = (typeof EDIT_TOOLS)[number];
 
 export const WRITE_EDIT_TOOLS = [TOOL_WRITE, TOOL_EDIT] as const;
 export type WriteEditToolName = (typeof WRITE_EDIT_TOOLS)[number];
-
-export const BASH_TOOLS = [TOOL_BASH, TOOL_BASH_OUTPUT, TOOL_KILL_SHELL] as const;
-export type BashToolName = (typeof BASH_TOOLS)[number];
-
-export const FILE_TOOLS = [
-  TOOL_READ,
-  TOOL_WRITE,
-  TOOL_EDIT,
-  TOOL_GLOB,
-  TOOL_GREP,
-  TOOL_LS,
-  TOOL_NOTEBOOK_EDIT,
-  TOOL_BASH,
-] as const;
-export type FileToolName = (typeof FILE_TOOLS)[number];
-
-export const MCP_TOOLS = [
-  TOOL_LIST_MCP_RESOURCES,
-  TOOL_READ_MCP_RESOURCE,
-  TOOL_MCP,
-] as const;
-export type McpToolName = (typeof MCP_TOOLS)[number];
 
 export const READ_ONLY_TOOLS = [
   TOOL_READ,
@@ -130,18 +68,6 @@ export function isEditTool(toolName: string): toolName is EditToolName {
 
 export function isWriteEditTool(toolName: string): toolName is WriteEditToolName {
   return (WRITE_EDIT_TOOLS as readonly string[]).includes(toolName);
-}
-
-export function isFileTool(toolName: string): toolName is FileToolName {
-  return (FILE_TOOLS as readonly string[]).includes(toolName);
-}
-
-export function isBashTool(toolName: string): toolName is BashToolName {
-  return (BASH_TOOLS as readonly string[]).includes(toolName);
-}
-
-export function isMcpTool(toolName: string): toolName is McpToolName {
-  return (MCP_TOOLS as readonly string[]).includes(toolName);
 }
 
 export function isReadOnlyTool(toolName: string): toolName is ReadOnlyToolName {

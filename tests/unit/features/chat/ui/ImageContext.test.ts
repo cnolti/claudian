@@ -1,4 +1,5 @@
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
+import { testDate } from '@test/helpers/testClock';
 import { Notice } from 'obsidian';
 
 import type { ImageAttachment } from '@/core/types';
@@ -24,7 +25,7 @@ beforeAll(() => {
 
 function createMockCallbacks() {
   return {
-    onImagesChanged: jest.fn(),
+    onUserImagesChanged: jest.fn(),
   };
 }
 
@@ -74,41 +75,6 @@ describe('ImageContextManager', () => {
     });
   });
 
-  describe('getAttachedImages', () => {
-    it('should return empty array when no images attached', () => {
-      expect(manager.getAttachedImages()).toEqual([]);
-    });
-
-    it('should return all attached images after setImages', () => {
-      const images = [
-        createImageAttachment({ id: 'img-1', name: 'a.png' }),
-        createImageAttachment({ id: 'img-2', name: 'b.jpg' }),
-      ];
-      manager.setImages(images);
-
-      const result = manager.getAttachedImages();
-      expect(result).toHaveLength(2);
-      expect(result[0].id).toBe('img-1');
-      expect(result[1].id).toBe('img-2');
-    });
-  });
-
-  describe('hasImages', () => {
-    it('should return false when no images', () => {
-      expect(manager.hasImages()).toBe(false);
-    });
-
-    it('should return true after setting images', () => {
-      manager.setImages([createImageAttachment()]);
-      expect(manager.hasImages()).toBe(true);
-    });
-
-    it('should return false after clearing images', () => {
-      manager.setImages([createImageAttachment()]);
-      manager.clearImages();
-      expect(manager.hasImages()).toBe(false);
-    });
-  });
 
   describe('clearImages', () => {
     it('should remove all images', () => {
@@ -118,17 +84,11 @@ describe('ImageContextManager', () => {
       ]);
       expect(manager.hasImages()).toBe(true);
 
+      expect(container.querySelector('.claudian-context-row').hasClass('has-content')).toBe(true);
       manager.clearImages();
       expect(manager.hasImages()).toBe(false);
       expect(manager.getAttachedImages()).toEqual([]);
-    });
-
-    it('should invoke onImagesChanged callback', () => {
-      manager.setImages([createImageAttachment()]);
-      callbacks.onImagesChanged.mockClear();
-
-      manager.clearImages();
-      expect(callbacks.onImagesChanged).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('.claudian-context-row').hasClass('has-content')).toBe(false);
     });
   });
 
@@ -146,11 +106,6 @@ describe('ImageContextManager', () => {
       expect(result).toHaveLength(2);
       expect(result[0].id).toBe('new-1');
       expect(result[1].id).toBe('new-2');
-    });
-
-    it('should invoke onImagesChanged callback', () => {
-      manager.setImages([createImageAttachment()]);
-      expect(callbacks.onImagesChanged).toHaveBeenCalledTimes(1);
     });
 
     it('should handle empty array', () => {
@@ -175,17 +130,6 @@ describe('ImageContextManager', () => {
   });
 
   describe('constructor with previewContainerEl', () => {
-    it('should use previewContainerEl when provided', () => {
-      const previewContainer = createMockEl();
-      const { container: c } = createContainerWithInputWrapper();
-      const input = createMockTextArea();
-      const cb = createMockCallbacks();
-
-      const mgr = new ImageContextManager(c, input, cb, previewContainer);
-      expect(mgr).toBeDefined();
-      const trayEl = previewContainer.querySelector('.claudian-context-row');
-      expect(trayEl).not.toBeNull();
-    });
 
     it('should preserve existing preview container content', () => {
       const previewContainer = createMockEl();
@@ -206,35 +150,14 @@ describe('ImageContextManager', () => {
 // We access privates through any cast, matching the project's pattern.
 describe('ImageContextManager - Private Helpers', () => {
   let manager: any;
+  let callbacks: ReturnType<typeof createMockCallbacks>;
 
   beforeEach(() => {
     jest.clearAllMocks();
     const { container } = createContainerWithInputWrapper();
     const inputEl = createMockTextArea();
-    const callbacks = createMockCallbacks();
+    callbacks = createMockCallbacks();
     manager = new ImageContextManager(container, inputEl, callbacks);
-  });
-
-  describe('formatSize', () => {
-    it('should format bytes', () => {
-      expect(manager['formatSize'](500)).toBe('500 B');
-    });
-
-    it('should format kilobytes', () => {
-      expect(manager['formatSize'](2048)).toBe('2.0 KB');
-    });
-
-    it('should format megabytes', () => {
-      expect(manager['formatSize'](5 * 1024 * 1024)).toBe('5.0 MB');
-    });
-
-    it('should format fractional KB', () => {
-      expect(manager['formatSize'](1536)).toBe('1.5 KB');
-    });
-
-    it('should format 0 bytes', () => {
-      expect(manager['formatSize'](0)).toBe('0 B');
-    });
   });
 
   describe('getMediaType', () => {
@@ -289,19 +212,6 @@ describe('ImageContextManager - Private Helpers', () => {
     it('should return false for image type but unsupported extension', () => {
       const file = { type: 'image/bmp', name: 'test.bmp' } as File;
       expect(manager['isImageFile'](file)).toBe(false);
-    });
-  });
-
-  describe('generateId', () => {
-    it('should generate unique IDs', () => {
-      const id1 = manager['generateId']();
-      const id2 = manager['generateId']();
-      expect(id1).not.toBe(id2);
-    });
-
-    it('should start with img- prefix', () => {
-      const id = manager['generateId']();
-      expect(id.startsWith('img-')).toBe(true);
     });
   });
 
@@ -363,30 +273,40 @@ describe('ImageContextManager - Private Helpers', () => {
     });
 
     it('should add valid image file and invoke callback', async () => {
-      const mockBuffer = new ArrayBuffer(4);
       const file = {
         name: 'test.png',
         type: 'image/png',
-        size: 1024,
-        arrayBuffer: jest.fn().mockResolvedValue(mockBuffer),
+        size: 5,
+        arrayBuffer: jest.fn().mockResolvedValue(new TextEncoder().encode('hello').buffer),
       } as unknown as File;
+      const now = jest.spyOn(Date, 'now').mockReturnValue(testDate().getTime());
 
-      const callbacks = createMockCallbacks();
-      const { container } = createContainerWithInputWrapper();
-      const inputEl = createMockTextArea();
-      const mgr: any = new ImageContextManager(container, inputEl, callbacks);
+      try {
+        const result = await manager['addImageFromFile'](file, 'paste');
+        expect(result).toBe(true);
+        expect(manager.hasImages()).toBe(true);
+        expect(callbacks.onUserImagesChanged).toHaveBeenCalledTimes(1);
 
-      const result = await mgr['addImageFromFile'](file, 'paste');
-      expect(result).toBe(true);
-      expect(mgr.hasImages()).toBe(true);
-      expect(callbacks.onImagesChanged).toHaveBeenCalled();
+        const images = manager.getAttachedImages();
+        expect(images).toHaveLength(1);
+        expect(images[0]).toEqual({
+          id: expect.stringMatching(/^img-/),
+          name: 'test.png',
+          mediaType: 'image/png',
+          data: 'aGVsbG8=',
+          size: 5,
+          source: 'paste',
+        });
 
-      const images = mgr.getAttachedImages();
-      expect(images).toHaveLength(1);
-      expect(images[0].name).toBe('test.png');
-      expect(images[0].mediaType).toBe('image/png');
-      expect(images[0].size).toBe(1024);
-      expect(images[0].source).toBe('paste');
+        expect(await manager['addImageFromFile'](file, 'paste')).toBe(true);
+        const repeatedImages = manager.getAttachedImages();
+        expect(repeatedImages).toHaveLength(2);
+        expect(repeatedImages[1].id).toMatch(/^img-/);
+        expect(repeatedImages[1].id).not.toBe(images[0].id);
+        expect(callbacks.onUserImagesChanged).toHaveBeenCalledTimes(2);
+      } finally {
+        now.mockRestore();
+      }
     });
 
     it('should handle arrayBuffer failure gracefully', async () => {
@@ -552,10 +472,6 @@ describe('ImageContextManager - Private Helpers', () => {
   });
 
   describe('Paste handler', () => {
-    it('setupPasteHandler should register paste event on inputEl', () => {
-      const input = manager['inputEl'];
-      expect(input.getEventListenerCount('paste')).toBe(1);
-    });
 
     it('paste handler should process image items', async () => {
       const addImageSpy = jest.spyOn(manager as any, 'addImageFromFile').mockResolvedValue(true);
@@ -621,25 +537,113 @@ describe('ImageContextManager - Private Helpers', () => {
       expect(addImageSpy).not.toHaveBeenCalled();
       addImageSpy.mockRestore();
     });
+
+    it('does not attach a pasted image after destruction begins', async () => {
+      let resolveBuffer!: (value: ArrayBuffer) => void;
+      const arrayBuffer = new Promise<ArrayBuffer>((resolve) => {
+        resolveBuffer = resolve;
+      });
+      const mockFile = {
+        name: 'pasted.png',
+        type: 'image/png',
+        size: 1024,
+        arrayBuffer: jest.fn(() => arrayBuffer),
+      };
+      const pasteEvent = {
+        type: 'paste',
+        preventDefault: jest.fn(),
+        clipboardData: {
+          items: {
+            length: 1,
+            0: {
+              type: 'image/png',
+              getAsFile: () => mockFile,
+            },
+          },
+        },
+      };
+
+      manager['inputEl'].dispatchEvent(pasteEvent);
+      expect(mockFile.arrayBuffer).toHaveBeenCalledTimes(1);
+      manager.destroy();
+      resolveBuffer(new ArrayBuffer(4));
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await Promise.resolve();
+      }
+
+      expect(manager.getAttachedImages()).toEqual([]);
+      expect(callbacks.onUserImagesChanged).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('destroy', () => {
+    it('unregisters paste and drag/drop listeners', () => {
+      const inputWrapper = manager['containerEl'].querySelector('.claudian-input-wrapper');
+      const inputEl = manager['inputEl'];
+
+      expect(inputEl.getEventListenerCount('paste')).toBe(1);
+      expect(inputWrapper.getEventListenerCount('dragenter')).toBe(1);
+      expect(inputWrapper.getEventListenerCount('dragover')).toBe(1);
+      expect(inputWrapper.getEventListenerCount('dragleave')).toBe(1);
+      expect(inputWrapper.getEventListenerCount('drop')).toBe(1);
+
+      manager.destroy();
+
+      expect(inputEl.getEventListenerCount('paste')).toBe(0);
+      expect(inputWrapper.getEventListenerCount('dragenter')).toBe(0);
+      expect(inputWrapper.getEventListenerCount('dragover')).toBe(0);
+      expect(inputWrapper.getEventListenerCount('dragleave')).toBe(0);
+      expect(inputWrapper.getEventListenerCount('drop')).toBe(0);
+    });
   });
 
   describe('Image context rendering', () => {
-    it('updateImagePreview should hide preview when no images', () => {
-      manager['updateImagePreview']();
-      expect(manager['contextTray']['containerEl'].hasClass('has-content')).toBe(false);
+
+    it('opens an image preview from the rendered attachment control and closes it on destroy', () => {
+      const overlayEl = createMockEl();
+      const removeOverlay = jest.spyOn(overlayEl, 'remove');
+      const mockBody = { createDiv: jest.fn().mockReturnValue(overlayEl) };
+      const originalDocument = globalThis.document;
+      (globalThis as any).document = {
+        activeElement: null,
+        body: mockBody,
+        addEventListener: jest.fn(),
+        removeEventListener: jest.fn(),
+      };
+
+      try {
+        manager.setImages([createImageAttachment({ name: 'photo.png' })]);
+        const previewButton = manager['contextTray']['containerEl']
+          .querySelector('.claudian-context-chip-main');
+
+        expect(previewButton.tagName).toBe('BUTTON');
+        previewButton.click();
+        expect(mockBody.createDiv).toHaveBeenCalledWith({
+          cls: 'claudian-image-modal-overlay',
+        });
+
+        manager.destroy();
+        expect(removeOverlay).toHaveBeenCalledTimes(1);
+      } finally {
+        (globalThis as any).document = originalDocument;
+      }
     });
 
-    it('updateImagePreview should show preview when images exist', () => {
-      manager.setImages([createImageAttachment()]);
-      expect(manager['contextTray']['containerEl'].hasClass('has-content')).toBe(true);
-    });
-
-    it('renders a compact image pill without a thumbnail preview', () => {
-      manager.setImages([createImageAttachment({ id: 'img-1', name: 'photo.png', size: 2048 })]);
+    it.each([
+      [500, '500 B'],
+      [2048, '2.0 KB'],
+      [5 * 1024 * 1024, '5.0 MB'],
+      [1536, '1.5 KB'],
+      [0, '0 B'],
+    ])('renders a compact image pill with size %s and no thumbnail', (size, expectedSize) => {
+      manager.setImages([createImageAttachment({ id: 'img-1', name: 'photo.png', size })]);
 
       const trayEl = manager['contextTray']['containerEl'];
+      expect(trayEl.hasClass('has-content')).toBe(true);
       const chipEl = trayEl.querySelector('.claudian-context-chip--image');
       expect(chipEl).not.toBeNull();
+      expect(chipEl.querySelector('.claudian-context-chip-main').getAttribute('title'))
+        .toBe(`photo.png · ${expectedSize}`);
 
       const thumbEl = chipEl.querySelector('.claudian-context-chip-thumbnail');
       expect(thumbEl).toBeNull();
@@ -675,8 +679,6 @@ describe('ImageContextManager - Private Helpers', () => {
       ]);
       expect(mgr.getAttachedImages()).toHaveLength(2);
 
-      cb.onImagesChanged.mockClear();
-
       const trayEl = mgr['contextTray']['containerEl'];
       const firstChip = trayEl.querySelector('.claudian-context-chip--image');
       const removeEl = firstChip.querySelector('.claudian-context-chip-remove');
@@ -684,82 +686,8 @@ describe('ImageContextManager - Private Helpers', () => {
 
       expect(mgr.getAttachedImages()).toHaveLength(1);
       expect(mgr.getAttachedImages()[0].id).toBe('img-2');
-      expect(cb.onImagesChanged).toHaveBeenCalled();
+      expect(cb.onUserImagesChanged).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe('showFullImage', () => {
-    let origDocument: typeof globalThis.document;
-    let overlayEl: any;
-    let mockBody: any;
-    let addEventSpy: jest.Mock;
-    let removeEventSpy: jest.Mock;
-
-    beforeEach(() => {
-      overlayEl = createMockEl();
-      addEventSpy = jest.fn();
-      removeEventSpy = jest.fn();
-      mockBody = { createDiv: jest.fn().mockReturnValue(overlayEl) };
-      origDocument = globalThis.document;
-      (globalThis as any).document = {
-        body: mockBody,
-        addEventListener: addEventSpy,
-        removeEventListener: removeEventSpy,
-        createElementNS: jest.fn(() => mockSvgElement()),
-      };
-    });
-
-    afterEach(() => {
-      (globalThis as any).document = origDocument;
-    });
-
-    it('should create modal overlay with image', () => {
-      const image = createImageAttachment({ name: 'test.png', mediaType: 'image/png', data: 'abc123' });
-      manager['showFullImage'](image);
-
-      expect(mockBody.createDiv).toHaveBeenCalledWith({ cls: 'claudian-image-modal-overlay' });
-    });
-
-    it('should register Escape key handler and close button', () => {
-      const image = createImageAttachment();
-      manager['showFullImage'](image);
-
-      expect(addEventSpy).toHaveBeenCalledWith('keydown', expect.any(Function));
-
-      const escHandler = addEventSpy.mock.calls[0][1];
-      escHandler({ key: 'Escape' });
-
-      expect(removeEventSpy).toHaveBeenCalledWith('keydown', escHandler);
-    });
-
-    it('should close modal when clicking on overlay background', () => {
-      const image = createImageAttachment();
-      manager['showFullImage'](image);
-
-      const clickHandler = overlayEl._eventListeners.get('click')?.[0];
-      expect(clickHandler).toBeDefined();
-
-      clickHandler({ target: overlayEl });
-
-      expect(removeEventSpy).toHaveBeenCalled();
-    });
-  });
-
-  describe('fileToBase64', () => {
-    it('should convert file to base64 string', async () => {
-      const textEncoder = new TextEncoder();
-      const bytes = textEncoder.encode('hello');
-      const mockBuffer = bytes.buffer;
-      const file = {
-        arrayBuffer: jest.fn().mockResolvedValue(mockBuffer),
-      } as unknown as File;
-
-      const result = await manager['fileToBase64'](file);
-      expect(typeof result).toBe('string');
-      expect(result.length).toBeGreaterThan(0);
-      // Verify it's valid base64
-      const decoded = Buffer.from(result, 'base64').toString();
-      expect(decoded).toBe('hello');
-    });
-  });
 });

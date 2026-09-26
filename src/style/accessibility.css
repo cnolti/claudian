@@ -3,6 +3,7 @@
 /* outline + offset + border-radius */
 .claudian-tool-header:focus-visible,
 .claudian-thinking-header:focus-visible,
+.claudian-citations-header:focus-visible,
 .claudian-subagent-header:focus-visible,
 .claudian-input-nav-btn:focus-visible,
 .claudian-model-btn:focus-visible,
@@ -19,11 +20,6 @@
 .claudian-context-chip-remove:focus-visible,
 .claudian-context-more:focus-visible,
 .claudian-image-modal-close:focus-visible,
-.claudian-approved-remove-btn:focus-visible,
-.claudian-save-env-btn:focus-visible,
-.claudian-restore-snippet-btn:focus-visible,
-.claudian-edit-snippet-btn:focus-visible,
-.claudian-delete-snippet-btn:focus-visible,
 .claudian-cancel-btn:focus-visible,
 .claudian-save-btn:focus-visible,
 .claudian-code-lang-label:focus-visible {
@@ -37,7 +33,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .claudian-inline-spinner {
+  .claudian-inline-spinner,
+  .claudian-session-group-header--attention .claudian-session-group-label,
+  .claudian-history-item--attention .claudian-history-item-title {
     animation: none;
   }
 }

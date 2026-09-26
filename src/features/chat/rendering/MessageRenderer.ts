@@ -1,32 +1,47 @@
 import type { App, Component } from 'obsidian';
 import { MarkdownRenderer, Menu, Notice, setIcon } from 'obsidian';
 
-import { DEFAULT_CHAT_PROVIDER_ID, type ProviderCapabilities } from '../../../core/providers/types';
-import type { ChatRewindMode } from '../../../core/runtime/types';
+import type { ChatRewindMode } from '../../../core/execution';
 import {
-  isSubagentToolName,
+  DEFAULT_CHAT_PROVIDER_ID,
+  type ProviderCapabilities,
+  type ProviderSubagentLifecycleAdapter,
+} from '../../../core/providers/types';
+import {
   isWriteEditTool,
-  TOOL_AGENT_OUTPUT,
   TOOL_APPLY_PATCH,
   TOOL_WRITE_STDIN,
 } from '../../../core/tools/toolNames';
 import { extractToolResultContent } from '../../../core/tools/toolResultContent';
-import type { ChatMessage, ImageAttachment, SubagentInfo, ToolCallInfo } from '../../../core/types';
+import type {
+  ChatMessage,
+  CitationGroup,
+  ImageAttachment,
+  SubagentInfo,
+  ToolCallInfo,
+} from '../../../core/types';
 import { t } from '../../../i18n/i18n';
+import { enhanceRenderedCodeFence } from '../../../shared/components/CopyableCodeFence';
 import { extractUserDisplayContent } from '../../../utils/context';
-import { formatDurationMmSs } from '../../../utils/date';
 import { processFileLinks, registerFileLinkHandler } from '../../../utils/fileLink';
-import { replaceImageEmbedsWithHtml } from '../../../utils/imageEmbed';
+import { replaceImageEmbedsWithHTML } from '../../../utils/imageEmbed';
 import { stripLegacyInterruptIndicator } from '../../../utils/interrupt';
-import { escapeRawHtmlTags } from '../../../utils/markdownHtml';
+import { escapeRawHTMLTags } from '../../../utils/markdownHTML';
 import {
   escapeMathDelimitersForStreaming,
   normalizeLatexMathDelimiters,
 } from '../../../utils/markdownMath';
-import type { FeatureHost } from '../../FeatureHost';
+import type { ChatFeatureHost } from '../ChatFeatureHost';
 import { findRewindContext } from '../rewind';
+import { ImagePreviewModal } from '../ui/ImagePreviewModal';
 import { formatConversationDirectoryTitle } from '../utils/conversationDirectoryTitle';
-import { resolveSubagentLifecycleAdapter } from './subagentLifecycleResolution';
+import { renderCitationGroup as renderCitationBlock } from './CitationRenderer';
+import {
+  prepareDisplayOnlyCodeFences,
+  restoreDisplayOnlyCodeFences,
+} from './DisplayOnlyCodeFences';
+import { renderMermaidDiagrams } from './MermaidRenderer';
+import { resolveSubagentAdapter } from './subagentAdapterResolution';
 import {
   renderStoredAsyncSubagent,
   renderStoredSubagent,
@@ -34,10 +49,12 @@ import {
 import { renderStoredThinkingBlock } from './ThinkingBlockRenderer';
 import { groupToolBlocks } from './toolCallGrouping';
 import { renderStoredToolCall } from './ToolCallRenderer';
+import { createWelcomeElement } from './WelcomeRenderer';
 import { renderStoredWriteEdit } from './WriteEditRenderer';
 
 export interface RenderContentOptions {
   deferMath?: boolean;
+  deferDiagrams?: boolean;
 }
 
 export type RenderContentFn = (
@@ -53,17 +70,22 @@ function runRendererAction(action: () => Promise<void>): void {
 }
 
 export class MessageRenderer {
+  private static nextHistoryId = 0;
   private app: App;
-  private plugin: FeatureHost;
+  private plugin: ChatFeatureHost;
   private component: Component;
   private messagesEl: HTMLElement;
   private rewindCallback?: (messageId: string, mode?: ChatRewindMode) => Promise<void>;
   private getCapabilities: () => ProviderCapabilities;
   private forkCallback?: (messageId: string) => Promise<void>;
   private liveMessageEls = new Map<string, HTMLElement>();
+  private removeFileLinkHandler: () => void;
+  private readonly imagePreviewModal = new ImagePreviewModal();
+  private isDisposed = false;
+  private readonly contentRenders = new WeakMap<HTMLElement, object>();
 
   constructor(
-    plugin: FeatureHost,
+    plugin: ChatFeatureHost,
     component: Component,
     messagesEl: HTMLElement,
     rewindCallback?: (messageId: string, mode?: ChatRewindMode) => Promise<void>,
@@ -78,41 +100,68 @@ export class MessageRenderer {
     this.forkCallback = forkCallback;
     this.getCapabilities = getCapabilities ?? (() => ({
       providerId: DEFAULT_CHAT_PROVIDER_ID,
-      supportsPersistentRuntime: false,
       supportsNativeHistory: false,
-      supportsPlanMode: false,
+      supportsEphemeralSessions: false,
       supportsRewind: false,
       supportsFork: false,
       supportsProviderCommands: false,
       supportsImageAttachments: false,
-      supportsInstructionMode: false,
-      supportsMcpTools: false,
       supportsTurnSteer: false,
       reasoningControl: 'none' as const,
     }));
 
     // Register delegated click handler for file links
-    registerFileLinkHandler(this.app, this.messagesEl, this.component);
+    this.removeFileLinkHandler = registerFileLinkHandler(this.app, this.messagesEl);
   }
 
-  /** Sets the messages container element. */
-  setMessagesEl(el: HTMLElement): void {
-    this.messagesEl = el;
+  dispose(): void {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    this.imagePreviewModal.close();
+    this.removeFileLinkHandler();
+    this.removeFileLinkHandler = () => {};
+    this.liveMessageEls.clear();
   }
 
-  private getSubagentLifecycleAdapter(toolName?: string) {
-    return resolveSubagentLifecycleAdapter(this.getCapabilities().providerId, toolName);
+  private getSubagentAdapter(toolName?: string) {
+    return resolveSubagentAdapter(this.getCapabilities().providerId, toolName);
   }
 
-  private shouldExpandFileEditsByDefault(): boolean {
+  #shouldExpandFileEditsByDefault(): boolean {
     return this.plugin.settings?.expandFileEditsByDefault === true;
   }
 
-  private getUserMessageTextToShow(msg: ChatMessage): string {
+  #getUserMessageTextToShow(msg: ChatMessage): string {
     return msg.displayContent ?? extractUserDisplayContent(msg.content) ?? msg.content;
   }
 
-  private applyTocTitle(msgEl: HTMLElement, text: string): void {
+  refreshMessageTimestamps(): void {
+    for (const msgEl of this.messagesEl.querySelectorAll<HTMLElement>('[data-message-timestamp]')) {
+      this.#appendMessageTimestamp(msgEl, Number(msgEl.getAttribute('data-message-timestamp')));
+    }
+  }
+
+  #appendMessageTimestamp(msgEl: HTMLElement, timestampMs: number | undefined): void {
+    if (timestampMs === undefined) return;
+    msgEl.setAttribute('data-message-timestamp', String(timestampMs));
+    const toolbar = this.#getOrCreateActionsToolbar(msgEl);
+    toolbar.querySelector<HTMLElement>('.claudian-message-timestamp')?.remove();
+    if (this.plugin.settings?.showMessageTimestamps !== true) {
+      return;
+    }
+
+    const timestampEl = toolbar.createDiv({ cls: 'claudian-message-timestamp' });
+    const timestamp = new Date(timestampMs);
+    const label = timestamp.toLocaleTimeString(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    });
+    timestampEl.setText(label);
+    timestampEl.setAttribute('aria-label', timestamp.toLocaleString(undefined, { hourCycle: 'h23' }));
+  }
+
+  #applyTocTitle(msgEl: HTMLElement, text: string): void {
     const tocTitle = formatConversationDirectoryTitle(text);
     if (tocTitle) {
       msgEl.setAttribute('data-toc-title', tocTitle);
@@ -130,14 +179,20 @@ export class MessageRenderer {
    * Returns the message element for content updates.
    */
   addMessage(msg: ChatMessage): HTMLElement {
+    if (this.getCapabilities().forkMode === 'full-session') {
+      this.messagesEl.querySelectorAll('.claudian-message-fork-btn').forEach(button => button.remove());
+    }
     // Render images above message bubble for user messages
     if (msg.role === 'user' && msg.images && msg.images.length > 0) {
-      this.renderMessageImages(this.messagesEl, msg.images);
+      const imagesEl = this.renderMessageImages(this.messagesEl, msg.images);
+      if (!this.#getUserMessageTextToShow(msg)) {
+        this.#appendMessageTimestamp(imagesEl, msg.timestamp);
+      }
     }
 
     // Skip empty bubble for image-only messages
     if (msg.role === 'user') {
-      const textToShow = this.getUserMessageTextToShow(msg);
+      const textToShow = this.#getUserMessageTextToShow(msg);
       if (!textToShow) {
         this.scrollToBottom();
         const lastChild = this.messagesEl.lastElementChild as HTMLElement;
@@ -156,57 +211,21 @@ export class MessageRenderer {
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 
     if (msg.role === 'user') {
-      const textToShow = this.getUserMessageTextToShow(msg);
+      const textToShow = this.#getUserMessageTextToShow(msg);
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderContent(textEl, textToShow);
-        this.addUserCopyButton(msgEl, textToShow);
-        this.applyTocTitle(msgEl, textToShow);
+        this.#addUserCopyButton(msgEl, textToShow);
+        this.#applyTocTitle(msgEl, textToShow);
       }
       if (this.rewindCallback || this.forkCallback) {
         this.liveMessageEls.set(msg.id, msgEl);
       }
     }
 
+    this.#appendMessageTimestamp(msgEl, msg.role === 'user' ? msg.timestamp : msg.completedAt);
     this.scrollToBottom();
     return msgEl;
-  }
-
-  updateLiveUserMessage(msg: ChatMessage): void {
-    if (msg.role !== 'user') {
-      return;
-    }
-
-    const msgEl = this.liveMessageEls.get(msg.id)
-      ?? this.messagesEl.querySelector<HTMLElement>(`[data-message-id="${msg.id}"]`);
-    if (!msgEl) {
-      return;
-    }
-
-    const contentEl = msgEl.querySelector<HTMLElement>('.claudian-message-content');
-    if (!contentEl) {
-      return;
-    }
-
-    contentEl.empty();
-
-    const textToShow = this.getUserMessageTextToShow(msg);
-    if (textToShow) {
-      const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
-      void this.renderContent(textEl, textToShow);
-      this.applyTocTitle(msgEl, textToShow);
-    } else {
-      msgEl.removeAttribute('data-toc-title');
-    }
-
-    const toolbar = msgEl.querySelector<HTMLElement>('.claudian-user-msg-actions');
-    if (toolbar) {
-      toolbar.querySelectorAll('.claudian-user-msg-copy-btn').forEach((el) => el.remove());
-    }
-
-    if (textToShow) {
-      this.addUserCopyButton(msgEl, textToShow);
-    }
   }
 
   removeMessage(messageId: string): void {
@@ -238,8 +257,7 @@ export class MessageRenderer {
     this.liveMessageEls.clear();
 
     // Recreate welcome element after clearing
-    const newWelcomeEl = this.messagesEl.createDiv({ cls: 'claudian-welcome' });
-    newWelcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: getGreeting() });
+    const newWelcomeEl = createWelcomeElement(this.messagesEl, getGreeting());
 
     for (let i = 0; i < messages.length; i++) {
       this.renderStoredMessage(messages[i], messages, i);
@@ -253,8 +271,8 @@ export class MessageRenderer {
     // Bare interrupt marker: user-role interrupts (Claude bracket markers) always render
     // as a standalone indicator. Assistant-role interrupts (Codex partial responses)
     // only use the bare marker when there's no content to preserve.
-    if (msg.isInterrupt && (msg.role === 'user' || !this.hasVisibleContent(msg))) {
-      this.renderInterruptMessage();
+    if (msg.isInterrupt && (msg.role === 'user' || !this.#hasVisibleContent(msg))) {
+      this.#renderInterruptMessage();
       return;
     }
 
@@ -266,17 +284,20 @@ export class MessageRenderer {
 
     // Render images above bubble for user messages
     if (msg.role === 'user' && msg.images && msg.images.length > 0) {
-      this.renderMessageImages(this.messagesEl, msg.images);
+      const imagesEl = this.renderMessageImages(this.messagesEl, msg.images);
+      if (!this.#getUserMessageTextToShow(msg)) {
+        this.#appendMessageTimestamp(imagesEl, msg.timestamp);
+      }
     }
 
     // Skip empty bubble for image-only messages
     if (msg.role === 'user') {
-      const textToShow = this.getUserMessageTextToShow(msg);
+      const textToShow = this.#getUserMessageTextToShow(msg);
       if (!textToShow) {
         return;
       }
     }
-    if (msg.role === 'assistant' && !this.hasVisibleContent(msg)) {
+    if (msg.role === 'assistant' && !this.#hasVisibleContent(msg)) {
       return;
     }
 
@@ -291,62 +312,173 @@ export class MessageRenderer {
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
 
     if (msg.role === 'user') {
-      const textToShow = this.getUserMessageTextToShow(msg);
+      const textToShow = this.#getUserMessageTextToShow(msg);
       if (textToShow) {
         const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
         void this.renderContent(textEl, textToShow);
-        this.addUserCopyButton(msgEl, textToShow);
-        this.applyTocTitle(msgEl, textToShow);
+        this.#addUserCopyButton(msgEl, textToShow);
+        this.#applyTocTitle(msgEl, textToShow);
       }
       if (msg.userMessageId) {
-        if (this.rewindCallback && this.isRewindEligible(allMessages, index)) {
-          this.addRewindButton(msgEl, msg.id);
-        }
-        if (this.forkCallback && this.isForkEligible(allMessages, index)) {
-          this.addForkButton(msgEl, msg.id);
+        if (this.rewindCallback && this.#isRewindEligible(allMessages, index)) {
+          this.#addRewindButton(msgEl, msg.id);
         }
       }
     } else if (msg.role === 'assistant') {
-      const hadLegacyInterruptIndicator = this.renderAssistantContent(msg, contentEl);
+      const hadLegacyInterruptIndicator = this.#renderAssistantContent(msg, contentEl);
       if (msg.isInterrupt || hadLegacyInterruptIndicator) {
         this.appendInterruptIndicator(contentEl);
       }
-      // Post-process: collapse consecutive tool/thinking blocks into groups.
+      // Fork: replayed messages get the same tool-call groups as live ones.
       groupToolBlocks(contentEl);
+    }
+
+    this.#appendMessageTimestamp(msgEl, msg.role === 'user' ? msg.timestamp : msg.completedAt);
+    const next = index === undefined ? undefined : allMessages?.[index + 1];
+    if (msg.role === 'assistant' && (msg.durationSeconds !== undefined || next?.role !== 'assistant'
+      || msg.contentBlocks?.some(block => block.type === 'task_notification'))) {
+      this.finalizeResponse(msg, allMessages ?? [msg], !next?.isInterrupt);
     }
   }
 
-  private hasVisibleContent(msg: ChatMessage): boolean {
+  /** Reparents completed output without replacing live tool or Markdown elements. */
+  finalizeResponse(msg: ChatMessage, messages: ChatMessage[], collapse = true): void {
+    const msgEl = this.messagesEl.querySelector<HTMLElement>(`[data-message-id="${msg.id}"]`);
+    const contentEl = msgEl?.querySelector<HTMLElement>('.claudian-message-content');
+    if (!msgEl || !contentEl || msgEl.querySelector('.claudian-work')) return;
+    // Fork: final grouping pass before completed work collapses into history.
+    groupToolBlocks(contentEl);
+
+    const blocks = msg.contentBlocks?.length
+      ? msg.contentBlocks
+      : [{ type: 'text' as const, content: msg.content }];
+    let finalStart = blocks.length;
+    while (finalStart > 0 && ['text', 'citations'].includes(blocks[finalStart - 1].type)) finalStart--;
+    const finalAnswer = stripLegacyInterruptIndicator(blocks.slice(finalStart)
+      .flatMap(block => block.type === 'text' ? [block.content] : []).join('\n\n'));
+    const finalText = finalAnswer.content;
+    const canCollapse = collapse && !msg.isInterrupt && !finalAnswer.interrupted && finalText.trim().length > 0
+      && !blocks.some(block => block.type === 'context_compacted');
+
+    const notificationIndex = blocks.findIndex(block => block.type === 'task_notification');
+    const previous = messages[messages.indexOf(msg) - 1];
+    const precedingNotificationHistory = notificationIndex === -1
+      && msg.isAutomaticResponse === true && isStandaloneTaskNotification(previous)
+      ? this.messagesEl.querySelector<HTMLElement>(
+        `[data-message-id="${previous.id}"] .claudian-task-notification .claudian-work-history`,
+      )
+      : null;
+    const automaticNotification = msg.isAutomaticResponse === true
+      && (notificationIndex !== -1 || precedingNotificationHistory !== null);
+    if (automaticNotification && canCollapse) {
+      let history: HTMLElement | null = precedingNotificationHistory;
+      for (const child of Array.from(contentEl.children) as HTMLElement[]) {
+        if (child.classList.contains('claudian-task-notification')) {
+          history = child.querySelector<HTMLElement>('.claudian-work-history');
+        } else if (history && !child.classList.contains('claudian-text-block')
+          && !child.classList.contains('claudian-citations')) {
+          history.appendChild(child);
+        }
+      }
+    }
+    if (canCollapse && !automaticNotification) {
+      const end = messages.indexOf(msg);
+      let start = end;
+      while (start > 0 && messages[start - 1].role === 'assistant'
+        && messages[start - 1].durationSeconds === undefined
+        && !messages[start - 1].isInterrupt
+        && !messages[start - 1].contentBlocks?.some(block => block.type === 'task_notification')
+        && !messages[start - 1].contentBlocks?.some(block => block.type === 'context_compacted')) start--;
+      const earlierEls = messages.slice(start, end).flatMap(message => {
+        const el = this.messagesEl.querySelector<HTMLElement>(`[data-message-id="${message.id}"]`);
+        return el ? [el] : [];
+      });
+      const children = (Array.from(contentEl.children) as HTMLElement[])
+        .filter(child => !child.classList.contains('claudian-task-notification'));
+      const textEls = children.filter(child => child.classList.contains('claudian-text-block')
+        || child.classList.contains('claudian-citations'));
+      const finalBlockCount = blocks.slice(finalStart).filter(block => block.type === 'citations'
+        || (block.type === 'text' && stripLegacyInterruptIndicator(block.content).content.trim())).length;
+      const answerEls = new Set(notificationIndex === -1 ? textEls.slice(-finalBlockCount) : textEls);
+      // Fallback tool calls can follow the answer in the DOM without belonging to the answer.
+      const workEls = children.filter(child => !answerEls.has(child));
+      if (earlierEls.length || workEls.length || msg.durationSeconds !== undefined) {
+        const seconds = Math.max(0, Math.floor(msg.durationSeconds ?? 0));
+        const duration = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+        const wrapper = contentEl.createDiv({ cls: 'claudian-work' });
+        contentEl.insertBefore(wrapper, children[0] ?? contentEl.firstChild);
+        const historyId = `claudian-work-history-${MessageRenderer.nextHistoryId++}`;
+        const label = msg.durationSeconds === undefined ? 'Worked' : `Worked for ${duration}`;
+        const header = wrapper.createEl('button', {
+          cls: 'claudian-work-header',
+          text: label,
+          attr: { type: 'button', 'aria-label': label, 'aria-expanded': 'false', 'aria-controls': historyId },
+        });
+        const history = wrapper.createDiv({ cls: 'claudian-work-history', attr: { id: historyId } });
+        history.hidden = true;
+        header.addEventListener('click', () => {
+          history.hidden = !history.hidden;
+          header.setAttribute('aria-expanded', String(!history.hidden));
+        });
+        for (const el of [...earlierEls, ...workEls]) history.appendChild(el);
+      }
+    }
+
+    // The response toolbar copies the final answer, leaving per-block copy inside history.
+    const toolbar = this.#getOrCreateActionsToolbar(msgEl);
+    toolbar.empty();
+    for (const child of Array.from(contentEl.children)) {
+      if (child.classList.contains('claudian-text-block')) {
+        child.querySelector('.claudian-text-copy-btn')?.remove();
+      }
+    }
+    const copyText = canCollapse ? finalText : stripLegacyInterruptIndicator(
+      blocks.filter(block => block.type === 'text').map(block => block.content).join('\n\n') || msg.content,
+    ).content;
+    if (copyText.trim()) this.addTextCopyButton(toolbar, copyText);
+    if (this.forkCallback && msg.assistantMessageId
+      && (this.getCapabilities().forkMode !== 'full-session' || messages.at(-1)?.id === msg.id)) {
+      this.#addForkButton(msgEl, msg.id);
+    }
+    const stats = msg.turnStats;
+    if (msg.role === 'assistant' && !msg.isInterrupt && stats && this.getCapabilities().supportsResponseThroughput) {
+      const rate = (stats.outputTokens / (stats.durationMs / 1000)).toFixed(1);
+      // Obsidian renders aria-label as its tooltip; a title would duplicate it.
+      toolbar.createSpan({
+        cls: 'claudian-response-throughput', text: `${rate} tok/s`,
+        attr: { 'aria-label': `${stats.outputTokens.toLocaleString()} tokens · ${formatTurnDuration(stats.durationMs)}` },
+      });
+    }
+    this.#appendMessageTimestamp(msgEl, msg.role === 'user' ? msg.timestamp : msg.completedAt);
+  }
+
+  #hasVisibleContent(msg: ChatMessage): boolean {
     if (msg.content && msg.content.trim().length > 0) return true;
     if (msg.contentBlocks && msg.contentBlocks.length > 0) {
       for (const block of msg.contentBlocks) {
         if (block.type === 'thinking' && block.content.trim().length > 0) return true;
         if (block.type === 'text' && block.content.trim().length > 0) return true;
+        if (block.type === 'citations' && block.citations.entries.length > 0) return true;
         if (block.type === 'context_compacted') return true;
+        if (block.type === 'task_notification') return true;
         if (block.type === 'subagent') return true;
         if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
-          if (toolCall && this.shouldRenderToolCall(toolCall)) return true;
+          if (toolCall && this.#shouldRenderToolCall(toolCall, msg)) return true;
         }
       }
     }
-    if (msg.toolCalls?.some(toolCall => this.shouldRenderToolCall(toolCall))) return true;
+    if (msg.toolCalls?.some(toolCall => this.#shouldRenderToolCall(toolCall, msg))) return true;
     return false;
   }
 
-  private isRewindEligible(allMessages?: ChatMessage[], index?: number): boolean {
+  #isRewindEligible(allMessages?: ChatMessage[], index?: number): boolean {
     if (!allMessages || index === undefined) return false;
     const ctx = findRewindContext(allMessages, index);
     return ctx.hasResponse;
   }
 
-  private isForkEligible(allMessages?: ChatMessage[], index?: number): boolean {
-    if (!allMessages || index === undefined) return false;
-    const ctx = findRewindContext(allMessages, index);
-    return !!ctx.prevAssistantUuid && ctx.hasResponse;
-  }
-
-  private renderInterruptMessage(): void {
+  #renderInterruptMessage(): void {
     const msgEl = this.messagesEl.createDiv({ cls: 'claudian-message claudian-message-assistant' });
     const contentEl = msgEl.createDiv({ cls: 'claudian-message-content', attr: { dir: 'auto' } });
     this.appendInterruptIndicator(contentEl);
@@ -362,10 +494,27 @@ export class MessageRenderer {
     });
   }
 
+  renderTaskNotification(contentEl: HTMLElement, content: string): void {
+    const wrapper = contentEl.createDiv({ cls: 'claudian-task-notification' });
+    const historyId = `claudian-task-notification-${MessageRenderer.nextHistoryId++}`;
+    const header = wrapper.createEl('button', {
+      cls: 'claudian-work-header',
+      text: 'Task notification',
+      attr: { type: 'button', 'aria-expanded': 'false', 'aria-controls': historyId },
+    });
+    const history = wrapper.createDiv({ cls: 'claudian-work-history', attr: { id: historyId } });
+    history.hidden = true;
+    void this.renderContent(history.createDiv(), content);
+    header.addEventListener('click', () => {
+      history.hidden = !history.hidden;
+      header.setAttribute('aria-expanded', String(!history.hidden));
+    });
+  }
+
   /**
    * Renders assistant message content (content blocks or fallback).
    */
-  private renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): boolean {
+  #renderAssistantContent(msg: ChatMessage, contentEl: HTMLElement): boolean {
     let hadLegacyInterruptIndicator = false;
 
     if (msg.contentBlocks && msg.contentBlocks.length > 0) {
@@ -388,22 +537,29 @@ export class MessageRenderer {
           const textEl = contentEl.createDiv({ cls: 'claudian-text-block' });
           void this.renderContent(textEl, normalized.content);
           this.addTextCopyButton(textEl, normalized.content);
+        } else if (block.type === 'citations') {
+          this.renderCitationGroup(contentEl, block.citations);
         } else if (block.type === 'tool_use') {
           const toolCall = msg.toolCalls?.find(tc => tc.id === block.toolId);
           if (toolCall) {
             this.renderToolCall(contentEl, toolCall, msg);
             renderedToolIds.add(toolCall.id);
           }
+        } else if (block.type === 'task_notification') {
+          this.renderTaskNotification(contentEl, block.content);
         } else if (block.type === 'context_compacted') {
           const boundaryEl = contentEl.createDiv({ cls: 'claudian-compact-boundary' });
           boundaryEl.createSpan({ cls: 'claudian-compact-boundary-label', text: 'Conversation compacted' });
         } else if (block.type === 'subagent') {
-          const taskToolCall = msg.toolCalls?.find(
-            tc => tc.id === block.subagentId && isSubagentToolName(tc.name)
-          );
+          const taskToolCall = msg.toolCalls?.find((toolCall) => {
+            if (toolCall.id !== block.subagentId) return false;
+            const adapter = this.getSubagentAdapter(toolCall.name);
+            return adapter?.protocol === 'managed-agent'
+              && adapter.isSpawnTool(toolCall.name);
+          });
           if (!taskToolCall) continue;
 
-          this.renderTaskSubagent(contentEl, taskToolCall, block.mode);
+          this.#renderTaskSubagent(contentEl, taskToolCall, block.mode);
           renderedToolIds.add(taskToolCall.id);
         }
       }
@@ -434,18 +590,11 @@ export class MessageRenderer {
       }
     }
 
-    // Render response duration footer (skip when message contains a compaction boundary)
-    const hasCompactBoundary = msg.contentBlocks?.some(b => b.type === 'context_compacted');
-    if (msg.durationSeconds && msg.durationSeconds > 0 && !hasCompactBoundary) {
-      const flavorWord = msg.durationFlavorWord || 'Baked';
-      const footerEl = contentEl.createDiv({ cls: 'claudian-response-footer' });
-      footerEl.createSpan({
-        text: `* ${flavorWord} for ${formatDurationMmSs(msg.durationSeconds)}`,
-        cls: 'claudian-baked-duration',
-      });
-    }
-
     return hadLegacyInterruptIndicator;
+  }
+
+  renderCitationGroup(parentEl: HTMLElement, citations: CitationGroup): HTMLElement {
+    return renderCitationBlock(parentEl, citations);
   }
 
   /**
@@ -453,45 +602,76 @@ export class MessageRenderer {
    * and Codex collab agent lifecycle tools.
    */
   private renderToolCall(contentEl: HTMLElement, toolCall: ToolCallInfo, msg?: ChatMessage): void {
-    if (!this.shouldRenderToolCall(toolCall)) return;
-    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(toolCall.name);
+    if (!this.#shouldRenderToolCall(toolCall, msg)) return;
+    const subagentAdapter = this.getSubagentAdapter(toolCall.name);
 
     if (isWriteEditTool(toolCall.name)) {
       renderStoredWriteEdit(contentEl, toolCall, {
-        initiallyExpanded: this.shouldExpandFileEditsByDefault(),
+        initiallyExpanded: this.#shouldExpandFileEditsByDefault(),
       });
-    } else if (isSubagentToolName(toolCall.name)) {
-      this.renderTaskSubagent(contentEl, toolCall);
-    } else if (subagentLifecycleAdapter?.isSpawnTool(toolCall.name) && msg) {
-      this.renderProviderLifecycleSubagent(contentEl, toolCall, msg);
+    } else if (
+      subagentAdapter?.protocol === 'managed-agent'
+      && subagentAdapter.isSpawnTool(toolCall.name)
+    ) {
+      this.#renderTaskSubagent(contentEl, toolCall);
+    } else if (
+      subagentAdapter?.protocol === 'lifecycle'
+      && subagentAdapter.isSpawnTool(toolCall.name)
+      && msg
+    ) {
+      this.#renderProviderLifecycleSubagent(contentEl, toolCall, msg);
     } else {
       renderStoredToolCall(contentEl, toolCall, {
-        initiallyExpanded: toolCall.name === TOOL_APPLY_PATCH && this.shouldExpandFileEditsByDefault(),
+        initiallyExpanded: toolCall.name === TOOL_APPLY_PATCH && this.#shouldExpandFileEditsByDefault(),
       });
     }
   }
 
-  private shouldRenderToolCall(toolCall: ToolCallInfo): boolean {
-    if (toolCall.name === TOOL_AGENT_OUTPUT) return false;
-    if (toolCall.name === TOOL_WRITE_STDIN && this.isSilentWriteStdinTool(toolCall)) return false;
+  #shouldRenderToolCall(toolCall: ToolCallInfo, msg?: ChatMessage): boolean {
+    if (toolCall.name === TOOL_WRITE_STDIN && this.#isSilentWriteStdinTool(toolCall)) return false;
     if (toolCall.name === 'custom_tool_call_output') return false;
 
-    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(toolCall.name);
-    if (subagentLifecycleAdapter?.isHiddenTool(toolCall.name)) return false;
+    const subagentAdapter = this.getSubagentAdapter(toolCall.name);
+    if (
+      subagentAdapter?.protocol === 'managed-agent'
+      && subagentAdapter.isOutputTool(toolCall.name)
+    ) return false;
+    if (
+      subagentAdapter?.protocol === 'lifecycle'
+      && subagentAdapter.isHiddenTool(toolCall.name)
+      && msg
+      && this.#isFullyOwnedProviderSubagentTool(toolCall, msg, subagentAdapter)
+    ) return false;
 
     return true;
   }
 
-  private isSilentWriteStdinTool(toolCall: ToolCallInfo): boolean {
+  #isFullyOwnedProviderSubagentTool(
+    toolCall: ToolCallInfo,
+    msg: ChatMessage,
+    adapter: ProviderSubagentLifecycleAdapter,
+  ): boolean {
+    const agentIdToSpawnId = new Map<string, string>();
+    for (const sibling of msg.toolCalls ?? []) {
+      if (!adapter.isSpawnTool(sibling.name)) continue;
+      const spawnResult = adapter.extractSpawnResult(sibling.result, sibling);
+      const agentId = spawnResult.agentId
+        ?? adapter.buildSubagentInfo(sibling, msg.toolCalls ?? []).agentId;
+      if (agentId) agentIdToSpawnId.set(agentId, sibling.id);
+    }
+    return adapter.isToolCallFullyOwned(toolCall, agentIdToSpawnId);
+  }
+
+  #isSilentWriteStdinTool(toolCall: ToolCallInfo): boolean {
     return typeof toolCall.input.chars !== 'string' || toolCall.input.chars.length === 0;
   }
 
-  private renderTaskSubagent(
+  #renderTaskSubagent(
     contentEl: HTMLElement,
     toolCall: ToolCallInfo,
     modeHint?: 'sync' | 'async'
   ): void {
-    const subagentInfo = this.resolveTaskSubagent(toolCall, modeHint);
+    const subagentInfo = this.#resolveTaskSubagent(toolCall, modeHint);
     if (subagentInfo.mode === 'async') {
       renderStoredAsyncSubagent(contentEl, subagentInfo);
       return;
@@ -503,25 +683,29 @@ export class MessageRenderer {
    * Consolidates provider lifecycle tools (spawn + wait/close)
    * into a single subagent block with prompt and result.
    */
-  private renderProviderLifecycleSubagent(
+  #renderProviderLifecycleSubagent(
     contentEl: HTMLElement,
     spawnToolCall: ToolCallInfo,
     msg: ChatMessage,
   ): void {
-    const subagentLifecycleAdapter = this.getSubagentLifecycleAdapter(spawnToolCall.name);
-    if (!subagentLifecycleAdapter) {
+    const subagentAdapter = this.getSubagentAdapter(spawnToolCall.name);
+    if (!subagentAdapter || subagentAdapter.protocol !== 'lifecycle') {
       renderStoredToolCall(contentEl, spawnToolCall);
       return;
     }
 
-    const subagentInfo = subagentLifecycleAdapter.buildSubagentInfo(
+    const subagentInfo = subagentAdapter.buildSubagentInfo(
       spawnToolCall,
       msg.toolCalls ?? [],
     );
+    if (subagentInfo.mode === 'async') {
+      renderStoredAsyncSubagent(contentEl, subagentInfo);
+      return;
+    }
     renderStoredSubagent(contentEl, subagentInfo);
   }
 
-  private resolveTaskSubagent(toolCall: ToolCallInfo, modeHint?: 'sync' | 'async'): SubagentInfo {
+  #resolveTaskSubagent(toolCall: ToolCallInfo, modeHint?: 'sync' | 'async'): SubagentInfo {
     if (toolCall.subagent) {
       if (!modeHint || toolCall.subagent.mode === modeHint) {
         return toolCall.subagent;
@@ -541,14 +725,14 @@ export class MessageRenderer {
         id: toolCall.id,
         description,
         prompt,
-        status: this.mapToolStatusToSubagentStatus(toolCall.status),
+        status: this.#mapToolStatusToSubagentStatus(toolCall.status),
         toolCalls: [],
         isExpanded: false,
         result: toolCall.result,
       };
     }
 
-    const asyncStatus = this.inferAsyncStatusFromTaskTool(toolCall);
+    const asyncStatus = this.#inferAsyncStatusFromTaskTool(toolCall);
     return {
       id: toolCall.id,
       description,
@@ -562,7 +746,7 @@ export class MessageRenderer {
     };
   }
 
-  private mapToolStatusToSubagentStatus(
+  #mapToolStatusToSubagentStatus(
     status: ToolCallInfo['status']
   ): 'completed' | 'error' | 'running' {
     switch (status) {
@@ -576,7 +760,7 @@ export class MessageRenderer {
     }
   }
 
-  private inferAsyncStatusFromTaskTool(toolCall: ToolCallInfo): 'running' | 'completed' | 'error' {
+  #inferAsyncStatusFromTaskTool(toolCall: ToolCallInfo): 'running' | 'completed' | 'error' {
     if (toolCall.status === 'error' || toolCall.status === 'blocked') return 'error';
     if (toolCall.status === 'running') return 'running';
 
@@ -602,11 +786,17 @@ export class MessageRenderer {
   /**
    * Renders image attachments above a message.
    */
-  renderMessageImages(containerEl: HTMLElement, images: ImageAttachment[]): void {
+  renderMessageImages(containerEl: HTMLElement, images: ImageAttachment[]): HTMLElement {
     const imagesEl = containerEl.createDiv({ cls: 'claudian-message-images' });
 
     for (const image of images) {
-      const imageWrapper = imagesEl.createDiv({ cls: 'claudian-message-image' });
+      const imageWrapper = imagesEl.createEl('button', {
+        cls: 'claudian-message-image',
+        attr: {
+          'aria-label': `Preview ${image.name}`,
+          type: 'button',
+        },
+      });
       const imgEl = imageWrapper.createEl('img', {
         attr: {
           alt: image.name,
@@ -615,49 +805,21 @@ export class MessageRenderer {
 
       void this.setImageSrc(imgEl, image);
 
-      // Click to view full size
-      imgEl.addEventListener('click', () => {
+      imageWrapper.addEventListener('click', () => {
         void this.showFullImage(image);
       });
     }
+    return imagesEl;
   }
 
   /**
    * Shows full-size image in modal overlay.
    */
   showFullImage(image: ImageAttachment): void {
-    const dataUri = `data:${image.mediaType};base64,${image.data}`;
+    if (this.isDisposed) return;
 
     const ownerDocument = this.messagesEl.ownerDocument ?? window.document;
-    const overlay = ownerDocument.body.createDiv({ cls: 'claudian-image-modal-overlay' });
-    const modal = overlay.createDiv({ cls: 'claudian-image-modal' });
-
-    modal.createEl('img', {
-      attr: {
-        src: dataUri,
-        alt: image.name,
-      },
-    });
-
-    const closeBtn = modal.createDiv({ cls: 'claudian-image-modal-close' });
-    closeBtn.setText('\u00D7');
-
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        close();
-      }
-    };
-
-    const close = () => {
-      ownerDocument.removeEventListener('keydown', handleEsc);
-      overlay.remove();
-    };
-
-    closeBtn.addEventListener('click', close);
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) close();
-    });
-    ownerDocument.addEventListener('keydown', handleEsc);
+    this.imagePreviewModal.open(ownerDocument, image);
   }
 
   /**
@@ -680,6 +842,9 @@ export class MessageRenderer {
     markdown: string,
     options?: RenderContentOptions
   ): Promise<void> {
+    const renderToken = {};
+    this.contentRenders.set(el, renderToken);
+    const isCurrent = () => !this.isDisposed && this.contentRenders.get(el) === renderToken;
     el.empty();
 
     try {
@@ -690,9 +855,10 @@ export class MessageRenderer {
       // Escape user-authored HTML first so placeholders like <meta-name> render
       // as plain text. Trusted plugin markup (image embeds) is injected only
       // after this step, otherwise it would be escaped too.
-      const safeMarkdown = escapeRawHtmlTags(renderMarkdown);
-      const processedMarkdown = replaceImageEmbedsWithHtml(
-        safeMarkdown,
+      const safeMarkdown = escapeRawHTMLTags(renderMarkdown);
+      const displayOnlyCodeFences = prepareDisplayOnlyCodeFences(safeMarkdown);
+      const processedMarkdown = replaceImageEmbedsWithHTML(
+        displayOnlyCodeFences.markdown,
         this.app,
         { mediaFolder: this.plugin.settings.mediaFolder }
       );
@@ -703,51 +869,14 @@ export class MessageRenderer {
         '',
         this.component
       );
+      await restoreDisplayOnlyCodeFences(el, displayOnlyCodeFences.fences);
 
-      // Wrap pre elements and move buttons outside scroll area
-      el.querySelectorAll('pre').forEach((pre) => {
-        // Skip if already wrapped
-        if (pre.parentElement?.classList.contains('claudian-code-wrapper')) return;
-
-        // Create wrapper
-        const wrapper = createEl('div', { cls: 'claudian-code-wrapper' });
-        pre.parentElement?.insertBefore(wrapper, pre);
-        wrapper.appendChild(pre);
-
-        // Check for language class and add label
-        const code = pre.querySelector('code[class*="language-"]');
-        if (code) {
-          const match = code.className.match(/language-(\w+)/);
-          if (match) {
-            wrapper.classList.add('has-language');
-            const label = createEl('span', {
-              cls: 'claudian-code-lang-label',
-              text: match[1],
-            });
-            wrapper.appendChild(label);
-            label.addEventListener('click', () => {
-              runRendererAction(async () => {
-                const originalLabel = match[1];
-                if (!originalLabel) return;
-
-                try {
-                  await navigator.clipboard.writeText(code.textContent || '');
-                  label.setText('Copied!');
-                  window.setTimeout(() => label.setText(originalLabel), 1500);
-                } catch {
-                  // Clipboard API may fail in non-secure contexts
-                }
-              });
-            });
-          }
-        }
-
-        // Move Obsidian's copy button outside pre into wrapper
-        const copyBtn = pre.querySelector('.copy-code-button');
-        if (copyBtn) {
-          wrapper.appendChild(copyBtn);
-        }
-      });
+      if (!isCurrent()) return;
+      el.querySelectorAll('pre').forEach(enhanceRenderedCodeFence);
+      if (!options?.deferDiagrams
+        && displayOnlyCodeFences.fences.some(fence => fence.originalLanguage.toLowerCase() === 'mermaid')) {
+        await renderMermaidDiagrams(el, isCurrent);
+      }
 
       // Process wikilinks only when the source can contain them; the DOM pass is expensive.
       if (processedMarkdown.includes('[[')) {
@@ -772,7 +901,13 @@ export class MessageRenderer {
    * @param markdown The original markdown content to copy
    */
   addTextCopyButton(textEl: HTMLElement, markdown: string): void {
-    const copyBtn = textEl.createSpan({ cls: 'claudian-text-copy-btn' });
+    const copyBtn = textEl.createEl('button', {
+      cls: 'claudian-text-copy-btn',
+      attr: {
+        'aria-label': 'Copy message',
+        type: 'button',
+      },
+    });
     setIcon(copyBtn, 'copy');
 
     let feedbackTimeout: number | null = null;
@@ -809,47 +944,27 @@ export class MessageRenderer {
   }
 
   refreshActionButtons(msg: ChatMessage, allMessages?: ChatMessage[], index?: number): void {
-    if (!msg.userMessageId) return;
-    const canRewind = this.isRewindEligible(allMessages, index);
-    const canFork = this.isForkEligible(allMessages, index);
-    if (!canRewind && !canFork) return;
+    if (!msg.userMessageId || !this.#isRewindEligible(allMessages, index)) return;
     const msgEl = this.liveMessageEls.get(msg.id);
     if (!msgEl) return;
-
-    if (canRewind && this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn')) {
-      this.addRewindButton(msgEl, msg.id);
+    if (this.rewindCallback && !msgEl.querySelector('.claudian-message-rewind-btn')) {
+      this.#addRewindButton(msgEl, msg.id);
     }
-    if (canFork && this.forkCallback && !msgEl.querySelector('.claudian-message-fork-btn')) {
-      this.addForkButton(msgEl, msg.id);
-    }
-    this.cleanupLiveMessageEl(msg.id, msgEl, { canRewind, canFork });
+    this.liveMessageEls.delete(msg.id);
   }
 
-  private cleanupLiveMessageEl(
-    msgId: string,
-    msgEl: HTMLElement,
-    expectedActions: { canRewind: boolean; canFork: boolean },
-  ): void {
-    const needsRewind = expectedActions.canRewind
-      && this.rewindCallback
-      && !msgEl.querySelector('.claudian-message-rewind-btn');
-    const needsFork = expectedActions.canFork
-      && this.forkCallback
-      && !msgEl.querySelector('.claudian-message-fork-btn');
-    if (!needsRewind && !needsFork) {
-      this.liveMessageEls.delete(msgId);
-    }
-  }
-
-  private getOrCreateActionsToolbar(msgEl: HTMLElement): HTMLElement {
-    const existing = msgEl.querySelector<HTMLElement>('.claudian-user-msg-actions');
+  #getOrCreateActionsToolbar(msgEl: HTMLElement): HTMLElement {
+    const existing = Array.from(msgEl.children).find(child => child.classList.contains('claudian-user-msg-actions')) as HTMLElement | undefined;
     if (existing) return existing;
-    return msgEl.createDiv({ cls: 'claudian-user-msg-actions' });
+    return msgEl.createDiv({ cls: 'claudian-user-msg-actions claudian-message-actions' });
   }
 
-  private addUserCopyButton(msgEl: HTMLElement, content: string): void {
-    const toolbar = this.getOrCreateActionsToolbar(msgEl);
-    const copyBtn = toolbar.createSpan({ cls: 'claudian-user-msg-copy-btn' });
+  #addUserCopyButton(msgEl: HTMLElement, content: string): void {
+    const toolbar = this.#getOrCreateActionsToolbar(msgEl);
+    const copyBtn = toolbar.createEl('button', {
+      cls: 'claudian-user-msg-copy-btn',
+      attr: { type: 'button' },
+    });
     setIcon(copyBtn, 'copy');
     copyBtn.setAttribute('aria-label', 'Copy message');
 
@@ -877,27 +992,39 @@ export class MessageRenderer {
     });
   }
 
-  private addRewindButton(msgEl: HTMLElement, messageId: string): void {
+  #addRewindButton(msgEl: HTMLElement, messageId: string): void {
     if (!this.getCapabilities().supportsRewind) return;
-    const toolbar = this.getOrCreateActionsToolbar(msgEl);
-    const btn = toolbar.createSpan({ cls: 'claudian-message-rewind-btn' });
+    const toolbar = this.#getOrCreateActionsToolbar(msgEl);
+    const btn = toolbar.createEl('button', {
+      cls: 'claudian-message-rewind-btn',
+      attr: { type: 'button' },
+    });
     if (toolbar.firstChild !== btn) toolbar.insertBefore(btn, toolbar.firstChild);
     setIcon(btn, 'rotate-ccw');
     btn.setAttribute('aria-label', t('chat.rewind.ariaLabel'));
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      this.showRewindMenu(e, messageId);
+      this.#showRewindMenu(e, messageId, btn);
     });
   }
 
-  private showRewindMenu(event: MouseEvent, messageId: string): void {
+  #showRewindMenu(
+    event: MouseEvent,
+    messageId: string,
+    anchor: HTMLButtonElement,
+  ): void {
     const menu = new Menu();
-    this.addRewindMenuItem(menu, messageId, 'conversation');
-    this.addRewindMenuItem(menu, messageId, 'code-and-conversation');
-    menu.showAtMouseEvent(event);
+    this.#addRewindMenuItem(menu, messageId, 'conversation');
+    this.#addRewindMenuItem(menu, messageId, 'code-and-conversation');
+    if (event.detail > 0) {
+      menu.showAtMouseEvent(event);
+      return;
+    }
+    const rect = anchor.getBoundingClientRect();
+    menu.showAtPosition({ x: rect.left, y: rect.bottom }, anchor.ownerDocument);
   }
 
-  private addRewindMenuItem(menu: Menu, messageId: string, mode: ChatRewindMode): void {
+  #addRewindMenuItem(menu: Menu, messageId: string, mode: ChatRewindMode): void {
     menu.addItem((item) => {
       item
         .setTitle(
@@ -918,11 +1045,13 @@ export class MessageRenderer {
     });
   }
 
-  private addForkButton(msgEl: HTMLElement, messageId: string): void {
+  #addForkButton(msgEl: HTMLElement, messageId: string): void {
     if (!this.getCapabilities().supportsFork) return;
-    const toolbar = this.getOrCreateActionsToolbar(msgEl);
-    const btn = toolbar.createSpan({ cls: 'claudian-message-fork-btn' });
-    if (toolbar.firstChild !== btn) toolbar.insertBefore(btn, toolbar.firstChild);
+    const toolbar = this.#getOrCreateActionsToolbar(msgEl);
+    const btn = toolbar.createEl('button', {
+      cls: 'claudian-message-fork-btn',
+      attr: { type: 'button' },
+    });
     setIcon(btn, 'git-fork');
     btn.setAttribute('aria-label', t('chat.fork.ariaLabel'));
     btn.addEventListener('click', (e) => {
@@ -957,4 +1086,18 @@ export class MessageRenderer {
     }
   }
 
+}
+
+/** Live session notifications are separate from the automatic response they precede. */
+export function isStandaloneTaskNotification(message: ChatMessage | undefined): message is ChatMessage {
+  return message?.role === 'assistant' && message.isAutomaticResponse === true
+    && Boolean(message.contentBlocks?.length)
+    && message.contentBlocks?.every(block => block.type === 'task_notification') === true;
+}
+
+/** Rounds to tenths before splitting so 119.96s reads "2m 0s", not "1m 60s". */
+function formatTurnDuration(durationMs: number): string {
+  const tenths = Math.round(durationMs / 100);
+  const seconds = `${(tenths % 600) / 10}s`;
+  return tenths < 600 ? seconds : `${Math.floor(tenths / 600)}m ${seconds}`;
 }

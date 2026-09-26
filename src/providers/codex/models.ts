@@ -1,6 +1,5 @@
 import {
   DEFAULT_REASONING_VALUE,
-  resolvePreferredReasoningDefault,
 } from '../../core/providers/reasoning';
 import { toCodexRuntimeModelId } from './modelSelection';
 import { formatCodexModelLabel } from './types/models';
@@ -28,8 +27,17 @@ export interface CodexDiscoveredModel {
   isDefault: boolean;
 }
 
+export const CODEX_FALLBACK_REASONING_EFFORT_VALUES = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+
 const DEFAULT_INPUT_MODALITIES: Array<'text' | 'image'> = ['text', 'image'];
-const EXCLUDED_REASONING_EFFORTS = new Set(['ultra']);
+const ULTRA_REASONING_EFFORT = 'ultra';
+export const CODEX_DEFAULT_SERVICE_TIER = 'default';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -57,7 +65,7 @@ function normalizeReasoningEfforts(value: unknown): CodexReasoningEffortOption[]
     }
 
     const effort = normalizeNonEmptyString(entry.value ?? entry.reasoningEffort);
-    if (!effort || EXCLUDED_REASONING_EFFORTS.has(effort.toLowerCase()) || seen.has(effort)) {
+    if (!effort || seen.has(effort)) {
       continue;
     }
 
@@ -134,23 +142,12 @@ export function normalizeCodexDiscoveredModels(value: unknown): CodexDiscoveredM
     }
 
     const supportedReasoningEfforts = normalizeReasoningEfforts(entry.supportedReasoningEfforts);
-    let defaultReasoningEffort = normalizeNonEmptyString(entry.defaultReasoningEffort);
+    const defaultReasoningEffort = normalizeNonEmptyString(entry.defaultReasoningEffort);
     if (
       !defaultReasoningEffort
       || !supportedReasoningEfforts.some(option => option.value === defaultReasoningEffort)
     ) {
-      if (
-        defaultReasoningEffort
-        && EXCLUDED_REASONING_EFFORTS.has(defaultReasoningEffort.toLowerCase())
-        && supportedReasoningEfforts.length > 0
-      ) {
-        defaultReasoningEffort = resolvePreferredReasoningDefault(
-          supportedReasoningEfforts.map(option => option.value),
-          supportedReasoningEfforts[0].value,
-        );
-      } else {
-        continue;
-      }
+      continue;
     }
 
     const serviceTiers = normalizeServiceTiers(entry.serviceTiers);
@@ -199,15 +196,78 @@ export function getCodexModelsInPickerOrder(
 
 export function getCodexDefaultReasoningEffort(
   model: CodexDiscoveredModel,
-): string {
-  return resolvePreferredReasoningDefault(
-    model.supportedReasoningEfforts.map(option => option.value),
-    model.defaultReasoningEffort || DEFAULT_REASONING_VALUE,
-  );
+  enableUltraEffort: boolean,
+): string | null {
+  const supportedReasoningEfforts = getCodexReasoningEffortOptions(model, enableUltraEffort);
+  const supportedValues = supportedReasoningEfforts.map(option => option.value);
+  if (supportedValues.length === 0) {
+    return null;
+  }
+  return DEFAULT_REASONING_VALUE;
+}
+
+export function getCodexReasoningEffortOptions(
+  model: CodexDiscoveredModel,
+  enableUltraEffort: boolean,
+): CodexReasoningEffortOption[] {
+  return enableUltraEffort
+    ? model.supportedReasoningEfforts
+    : model.supportedReasoningEfforts.filter(
+      option => option.value.toLowerCase() !== ULTRA_REASONING_EFFORT,
+    );
+}
+
+export function isCodexModelAvailable(
+  model: CodexDiscoveredModel,
+  enableUltraEffort: boolean,
+): boolean {
+  return getCodexReasoningEffortOptions(model, enableUltraEffort).length > 0;
+}
+
+export function resolveCodexReasoningEffort(
+  model: CodexDiscoveredModel | null,
+  enableUltraEffort: boolean,
+  requestedEffort: string | null,
+): string | null {
+  if (!model) {
+    const fallbackValues: readonly string[] = CODEX_FALLBACK_REASONING_EFFORT_VALUES;
+    return requestedEffort && fallbackValues.includes(requestedEffort)
+      ? requestedEffort
+      : DEFAULT_REASONING_VALUE;
+  }
+
+  const supportedValues = getCodexReasoningEffortOptions(model, enableUltraEffort)
+    .map(option => option.value);
+  if (requestedEffort && supportedValues.includes(requestedEffort)) {
+    return requestedEffort;
+  }
+  return getCodexDefaultReasoningEffort(model, enableUltraEffort);
 }
 
 export function getCodexFastServiceTier(
   model: CodexDiscoveredModel,
 ): CodexModelServiceTier | null {
   return model.serviceTiers.find(tier => tier.name.trim().toLowerCase() === 'fast') ?? null;
+}
+
+export function resolveCodexModelServiceTier(
+  model: CodexDiscoveredModel | null,
+  selectedServiceTier: unknown,
+): string | null {
+  if (!model) {
+    return null;
+  }
+  // "default" is an explicit Standard selection, distinct from the catalog default.
+  if (selectedServiceTier === CODEX_DEFAULT_SERVICE_TIER) {
+    return CODEX_DEFAULT_SERVICE_TIER;
+  }
+  if (typeof selectedServiceTier === 'string') {
+    if (model.serviceTiers.some(tier => tier.id === selectedServiceTier)) {
+      return selectedServiceTier;
+    }
+    if (selectedServiceTier === 'fast') {
+      return getCodexFastServiceTier(model)?.id ?? null;
+    }
+  }
+  return model.defaultServiceTier;
 }

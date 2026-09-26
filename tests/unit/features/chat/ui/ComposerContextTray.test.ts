@@ -1,4 +1,4 @@
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 
 import { ComposerContextTray } from '@/features/chat/ui/ComposerContextTray';
 
@@ -7,6 +7,40 @@ jest.mock('obsidian', () => ({
 }));
 
 describe('ComposerContextTray', () => {
+  it('updates the removable styling state when linked content becomes locked', () => {
+    const containerEl = createMockEl();
+    const tray = new ComposerContextTray(containerEl as unknown as HTMLElement);
+    const item = { id: 'linked-content', kind: 'content' as const, label: 'Draft.md' };
+
+    tray.setItems('linked-content', [{ ...item, onRemove: jest.fn() }]);
+    expect(containerEl.querySelector('.claudian-context-chip')?.hasClass('claudian-context-chip--removable')).toBe(true);
+
+    tray.setItems('linked-content', [item]);
+    expect(containerEl.querySelector('.claudian-context-chip')?.hasClass('claudian-context-chip--removable')).toBe(false);
+    tray.destroy();
+  });
+
+  it('releases its observer when construction fails after observation starts', () => {
+    const containerEl = createMockEl();
+    const disconnect = jest.fn();
+    const ResizeObserverConstructor = class {
+      observe(): void {}
+      disconnect(): void {
+        disconnect();
+      }
+    };
+    containerEl.ownerDocument.defaultView.ResizeObserver = ResizeObserverConstructor;
+    const initializationError = new Error('Context tray render failed');
+
+    expect(() => new ComposerContextTray(
+      containerEl as unknown as HTMLElement,
+      { onDidChange: () => { throw initializationError; } },
+    )).toThrow(initializationError);
+
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(containerEl.children).toHaveLength(0);
+  });
+
   it('owns empty-state visibility and renders slots in semantic order', () => {
     const containerEl = createMockEl();
     const tray = new ComposerContextTray(containerEl as unknown as HTMLElement);
@@ -26,9 +60,9 @@ describe('ComposerContextTray', () => {
       icon: 'text-select',
       onRemove: jest.fn(),
     }]);
-    tray.setItems('current-note', [{
-      id: 'current-note',
-      kind: 'note',
+    tray.setItems('linked-content', [{
+      id: 'linked-content',
+      kind: 'content',
       label: 'Draft.md',
       icon: 'file-text',
       onRemove: jest.fn(),
@@ -36,7 +70,7 @@ describe('ComposerContextTray', () => {
 
     expect(containerEl.hasClass('has-content')).toBe(true);
     expect(containerEl.querySelectorAll('.claudian-context-chip').map((item: any) => item.dataset.contextSlot)).toEqual([
-      'current-note',
+      'linked-content',
       'editor-selection',
       'images',
     ]);
@@ -48,9 +82,9 @@ describe('ComposerContextTray', () => {
     const onRemove = jest.fn();
     const tray = new ComposerContextTray(containerEl as unknown as HTMLElement);
 
-    tray.setItems('current-note', [{
-      id: 'current-note',
-      kind: 'note',
+    tray.setItems('editor-selection', [{
+      id: 'editor-selection',
+      kind: 'selection',
       label: 'Architecture.md',
       icon: 'file-text',
       title: 'notes/Architecture.md',
@@ -106,9 +140,9 @@ describe('ComposerContextTray', () => {
     const containerEl = createMockEl();
     const tray = new ComposerContextTray(containerEl as unknown as HTMLElement);
 
-    tray.setItems('current-note', [{
+    tray.setItems('linked-content', [{
       id: 'note',
-      kind: 'note',
+      kind: 'content',
       label: 'Note.md',
       onRemove: jest.fn(),
     }]);

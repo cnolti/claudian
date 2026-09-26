@@ -1,4 +1,6 @@
 import type { Conversation } from '../types';
+import type { StoredChatModelSelection } from '../types/settings';
+import { findAvailableModelOption } from './models/modelOptions';
 import { toProviderRuntimeModelId } from './modelSelection';
 import { ProviderRegistry } from './ProviderRegistry';
 import { ProviderSettingsCoordinator } from './ProviderSettingsCoordinator';
@@ -8,28 +10,113 @@ export type ConversationModelSource = 'selected' | 'usage' | 'default';
 
 export interface ConversationModelResolution {
   model: string;
+  /** Durable replacement required before readers may use it instead of `model`. */
+  modelToPersist?: string;
   source: ConversationModelSource;
   shouldPersist: boolean;
+}
+
+export function getConversationModelPersistenceTarget(
+  resolution: ConversationModelResolution,
+): string {
+  return resolution.modelToPersist ?? resolution.model;
+}
+
+export type NewConversationModelSource =
+  | 'last-selected'
+  | 'provider-default'
+  | 'provider-fallback';
+
+export interface NewConversationModelResolution extends StoredChatModelSelection {
+  source: NewConversationModelSource;
 }
 
 function trimModel(model: unknown): string {
   return typeof model === 'string' ? model.trim() : '';
 }
 
-function findModelOption(
+export function findProviderModelOption(
   providerId: ProviderId,
   model: string,
   settings: Record<string, unknown>,
 ): string | null {
-  const runtimeModel = toProviderRuntimeModelId(providerId, model);
-  const option = ProviderRegistry
-    .getChatUIConfig(providerId)
-    .getModelOptions(settings)
-    .find(candidate =>
-      candidate.value === model
-      || toProviderRuntimeModelId(providerId, candidate.value) === runtimeModel
+  return findAvailableModelOption(providerId, ProviderRegistry.getChatUIConfig(providerId), model, settings);
+}
+
+export function resolveProviderDefaultModel(
+  providerId: ProviderId,
+  settings: Record<string, unknown>,
+): string | null {
+  const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
+  const options = uiConfig.getModelOptions(settings);
+  if (options.length === 0) {
+    return null;
+  }
+
+  const preferred = trimModel(uiConfig.getDefaultModel?.(settings));
+  if (preferred) {
+    const preferredRuntimeModel = toProviderRuntimeModelId(providerId, preferred);
+    const option = options.find(candidate => (
+      candidate.value === preferred
+      || toProviderRuntimeModelId(providerId, candidate.value) === preferredRuntimeModel
+    ));
+    if (option) {
+      return option.value;
+    }
+  }
+
+  return options[0]?.value ?? null;
+}
+
+function readStoredChatModelSelection(value: unknown): StoredChatModelSelection | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const providerId = trimModel(candidate.providerId);
+  const model = trimModel(candidate.model);
+  return providerId && model ? { providerId, model } : null;
+}
+
+export function resolveNewConversationModel(
+  settings: Record<string, unknown>,
+): NewConversationModelResolution | null {
+  const registeredProviderIds = new Set(ProviderRegistry.getRegisteredProviderIds());
+  const lastSelected = readStoredChatModelSelection(settings.lastSelectedChatModel);
+  if (
+    lastSelected
+    && registeredProviderIds.has(lastSelected.providerId)
+    && ProviderRegistry.isEnabled(lastSelected.providerId, settings)
+  ) {
+    const selectedModel = findProviderModelOption(
+      lastSelected.providerId,
+      lastSelected.model,
+      settings,
     );
-  return option?.value ?? null;
+    if (selectedModel) {
+      return {
+        providerId: lastSelected.providerId,
+        model: selectedModel,
+        source: 'last-selected',
+      };
+    }
+
+    return { ...lastSelected, source: 'last-selected' };
+  }
+
+  for (const providerId of ProviderRegistry.getBlankTabProviderIds(settings)) {
+    const providerDefault = resolveProviderDefaultModel(providerId, settings);
+    if (providerDefault) {
+      return {
+        providerId,
+        model: providerDefault,
+        source: 'provider-fallback',
+      };
+    }
+  }
+
+  return null;
 }
 
 export function normalizeProviderModelSelection(
@@ -52,7 +139,7 @@ export function normalizeProviderModelSelection(
     model: rawModel,
   };
 
-  const rawOption = findModelOption(providerId, rawModel, rawSettings);
+  const rawOption = findProviderModelOption(providerId, rawModel, rawSettings);
   if (rawOption) {
     return rawOption;
   }
@@ -69,7 +156,7 @@ export function normalizeProviderModelSelection(
     ...baseSettings,
     model: normalizedModel,
   };
-  const normalizedOption = findModelOption(providerId, normalizedModel, normalizedSettings);
+  const normalizedOption = findProviderModelOption(providerId, normalizedModel, normalizedSettings);
   if (normalizedOption) {
     return normalizedOption;
   }
@@ -84,41 +171,52 @@ export function resolveConversationModel(
   providerId: ProviderId,
   conversation?: Conversation | null,
 ): ConversationModelResolution {
-  const selectedModel = normalizeProviderModelSelection(
-    providerId,
-    settings,
-    conversation?.selectedModel,
-  );
+  const rawSelectedModel = trimModel(conversation?.selectedModel);
+  const modelOptions = ProviderRegistry.getChatUIConfig(providerId).getModelOptions(settings);
+  const selectedModel = rawSelectedModel
+    ? findProviderModelOption(providerId, rawSelectedModel, settings)
+    : null;
   if (selectedModel) {
     return {
       model: selectedModel,
       source: 'selected',
-      shouldPersist: selectedModel !== conversation?.selectedModel,
+      shouldPersist: selectedModel !== rawSelectedModel,
     };
   }
 
-  const usageModel = normalizeProviderModelSelection(
-    providerId,
-    settings,
-    conversation?.usage?.model,
-  );
-  if (usageModel) {
-    return {
-      model: usageModel,
-      source: 'usage',
-      shouldPersist: true,
-    };
+  if (rawSelectedModel) {
+    return { model: rawSelectedModel, source: 'selected', shouldPersist: false };
   }
 
-  const providerSettings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
-    settings,
-    providerId,
-  );
-  const defaultModel = normalizeProviderModelSelection(
-    providerId,
-    settings,
-    providerSettings.model,
-  ) ?? trimModel(providerSettings.model);
+  const rawUsageModel = trimModel(conversation?.usage?.model);
+  if (rawUsageModel) {
+    const usageModel = findProviderModelOption(providerId, rawUsageModel, settings)
+      ?? (modelOptions.length === 0
+        ? normalizeProviderModelSelection(providerId, settings, rawUsageModel)
+        : null);
+    if (usageModel) {
+      return {
+        model: usageModel,
+        source: 'usage',
+        shouldPersist: true,
+      };
+    }
+
+    const usageFallback = resolveProviderDefaultModel(providerId, settings);
+    if (usageFallback) {
+      return {
+        model: usageFallback,
+        source: 'usage',
+        shouldPersist: true,
+      };
+    }
+  }
+
+  const providerDefault = resolveProviderDefaultModel(providerId, settings);
+  const providerSettings = providerDefault
+    ? null
+    : ProviderSettingsCoordinator.getProviderSettingsSnapshot(settings, providerId);
+  const defaultModel = providerDefault ?? trimModel(providerSettings?.model);
 
   return {
     model: defaultModel,
@@ -136,7 +234,8 @@ export function getProviderSettingsSnapshotWithModel<T extends Record<string, un
     settings,
     providerId,
   );
-  const normalizedModel = normalizeProviderModelSelection(providerId, snapshot, model);
+  const normalizedModel = normalizeProviderModelSelection(providerId, snapshot, model)
+    ?? trimModel(model);
   if (normalizedModel) {
     ProviderSettingsCoordinator.projectModelSelection(snapshot, providerId, normalizedModel);
   }

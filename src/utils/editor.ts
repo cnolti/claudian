@@ -7,6 +7,8 @@
 import type { EditorView } from '@codemirror/view';
 import type { Editor } from 'obsidian';
 
+import { escapePromptXMLAttribute, formatPromptXMLCdata } from './promptXML';
+
 /**
  * Gets the CodeMirror EditorView from an Obsidian Editor.
  * Obsidian's Editor type doesn't expose the internal `.cm` property.
@@ -32,7 +34,11 @@ export interface EditorSelectionContext {
   startLine?: number; // 1-indexed starting line number
 }
 
-export function findNearestNonEmptyLine(
+export interface EditorContextFormatOptions {
+  includeCursorLine?: boolean;
+}
+
+function findNearestNonEmptyLine(
   getLine: (line: number) => string,
   lineCount: number,
   startLine: number,
@@ -75,12 +81,17 @@ export function buildCursorContext(
   return { beforeCursor: contextBefore, afterCursor: contextAfter, isInbetween, line, column };
 }
 
-export function formatEditorContext(context: EditorSelectionContext): string {
+export function formatEditorContext(
+  context: EditorSelectionContext,
+  options: EditorContextFormatOptions = {},
+): string {
   if (context.mode === 'selection' && context.selectedText) {
     const lineAttr = context.startLine && context.lineCount
       ? ` lines="${context.startLine}-${context.startLine + context.lineCount - 1}"`
       : '';
-    return `<editor_selection path="${context.notePath}"${lineAttr}>\n${context.selectedText}\n</editor_selection>`;
+    return `<editor_selection path="${escapePromptXMLAttribute(context.notePath)}"${lineAttr}>\n${formatPromptXMLCdata(
+      context.selectedText,
+    )}\n</editor_selection>`;
   } else if (context.mode === 'cursor' && context.cursorContext) {
     const ctx = context.cursorContext;
     let content: string;
@@ -93,7 +104,10 @@ export function formatEditorContext(context: EditorSelectionContext): string {
     } else {
       content = `${ctx.beforeCursor}|${ctx.afterCursor} #inline`;
     }
-    return `<editor_cursor path="${context.notePath}">\n${content}\n</editor_cursor>`;
+    const lineAttr = options.includeCursorLine ? ` line="${ctx.line + 1}"` : '';
+    return `<editor_cursor path="${escapePromptXMLAttribute(context.notePath)}"${lineAttr}>\n${formatPromptXMLCdata(
+      content,
+    )}\n</editor_cursor>`;
   }
   return '';
 }

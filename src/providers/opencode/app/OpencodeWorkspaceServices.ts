@@ -1,22 +1,23 @@
 import type { ProviderCommandCatalog } from '../../../core/providers/commands/ProviderCommandCatalog';
+import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
   ProviderTabWarmupPolicy,
   ProviderWorkspaceRegistration,
   ProviderWorkspaceServices,
 } from '../../../core/providers/types';
-import type { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
-import { OpencodeAgentMentionProvider } from '../agents/OpencodeAgentMentionProvider';
 import { OpencodeCommandCatalog } from '../commands/OpencodeCommandCatalog';
-import { OpencodeCliResolver } from '../runtime/OpencodeCliResolver';
-import { OpencodeAgentStorage } from '../storage/OpencodeAgentStorage';
-import { opencodeSettingsTabRenderer } from '../ui/OpencodeSettingsTab';
-import { OpencodeRuntimeCommandLoader } from './OpencodeRuntimeCommandLoader';
+import { OpencodeServerService } from '../http/OpencodeServerService';
+import { OpencodeMetadataService } from '../metadata/OpencodeMetadataService';
+import { OpencodeCLIResolver } from '../runtime/OpencodeCLIResolver';
+import { createOpencodeModels } from '../runtime/OpencodeModels';
+import { createOpencodeSettingsTabRenderer } from '../ui/OpencodeSettingsTab';
+import { OpencodeCommandLoader } from './OpencodeCommandLoader';
 
 export interface OpencodeWorkspaceServices extends ProviderWorkspaceServices {
-  agentStorage: OpencodeAgentStorage;
-  agentMentionProvider: OpencodeAgentMentionProvider;
   commandCatalog: ProviderCommandCatalog;
+  metadataService: OpencodeMetadataService;
+  serverService: OpencodeServerService;
 }
 
 const opencodeTabWarmupPolicy: ProviderTabWarmupPolicy = {
@@ -26,30 +27,46 @@ const opencodeTabWarmupPolicy: ProviderTabWarmupPolicy = {
 };
 
 export async function createOpencodeWorkspaceServices(
-  vaultAdapter: VaultFileAdapter,
+  plugin: ProviderHost,
 ): Promise<OpencodeWorkspaceServices> {
-  const agentStorage = new OpencodeAgentStorage(vaultAdapter);
-  const agentMentionProvider = new OpencodeAgentMentionProvider(agentStorage);
-  await agentMentionProvider.loadAgents();
+  const commandCatalog = new OpencodeCommandCatalog();
+  const serverService = new OpencodeServerService();
+  const unregister = plugin.executionLifecycleRegistry.registerTransitionHook('opencode', {
+    beforeTransition: () => serverService.beginTransition(),
+    afterTransition: () => serverService.endTransition(),
+  });
+  const metadataService = new OpencodeMetadataService(plugin, { commandCatalog, serverService });
 
+  const modelCatalog = createOpencodeModels(plugin, metadataService);
+  const unregisterModels = plugin.executionLifecycleRegistry.registerTransitionHook('opencode', { beforeTransition: () => modelCatalog.beginTransition(), afterTransition: () => modelCatalog.endTransition() });
+  const cliResolver = new OpencodeCLIResolver();
   return {
-    agentStorage,
-    agentMentionProvider,
-    commandCatalog: new OpencodeCommandCatalog(),
-    cliResolver: new OpencodeCliResolver(),
-    runtimeCommandLoader: new OpencodeRuntimeCommandLoader(),
-    settingsTabRenderer: opencodeSettingsTabRenderer,
+    commandCatalog,
+    modelCatalog,
+    cliResolver,
+    metadataService,
+    serverService,
+    commandLoader: new OpencodeCommandLoader(metadataService),
+    settingsTabRenderer: createOpencodeSettingsTabRenderer({ cliResolver, metadataService, modelCatalog }),
     tabWarmupPolicy: opencodeTabWarmupPolicy,
-    refreshAgentMentions: async () => {
-      await agentMentionProvider.loadAgents();
+    dispose: async () => {
+      unregister();
+      unregisterModels();
+      await Promise.all([metadataService.dispose(), serverService.dispose(), modelCatalog.dispose()]);
     },
   };
 }
 
 export const opencodeWorkspaceRegistration: ProviderWorkspaceRegistration<OpencodeWorkspaceServices> = {
-  initialize: async ({ vaultAdapter }) => createOpencodeWorkspaceServices(vaultAdapter),
+  initialize: async ({ plugin }) => (
+    createOpencodeWorkspaceServices(plugin)
+  ),
 };
 
 export function maybeGetOpencodeWorkspaceServices(): OpencodeWorkspaceServices | null {
   return ProviderWorkspaceRegistry.getServices('opencode') as OpencodeWorkspaceServices | null;
+}
+
+export function getOpencodeWorkspaceServices(): OpencodeWorkspaceServices {
+  return ProviderWorkspaceRegistry.requireServices('opencode') as OpencodeWorkspaceServices;
 }

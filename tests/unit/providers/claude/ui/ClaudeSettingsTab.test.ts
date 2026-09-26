@@ -1,24 +1,38 @@
+/** @jest-environment jsdom */
+
+import { createMockEl } from '@test/helpers/MockElement';
+import { applyTextInput } from '@test/helpers/settingsControls';
+import { fireEvent, waitFor, within } from '@testing-library/dom';
 import * as fs from 'fs';
+import { axe } from 'jest-axe';
+import { setImmediate } from 'timers';
 
 import { DEFAULT_CLAUDE_PROVIDER_SETTINGS } from '@/providers/claude/settings';
-import { claudeSettingsTabRenderer } from '@/providers/claude/ui/ClaudeSettingsTab';
+import { createClaudeSettingsTabRenderer } from '@/providers/claude/ui/ClaudeSettingsTab';
+
+Object.assign(globalThis, { setImmediate });
 
 const mockRenderEnvironmentSettingsSection = jest.fn();
 const mockSaveSettings = jest.fn().mockResolvedValue(undefined);
+const mockSlashCommandSettings = jest.fn();
+const mockCLIResolverReset = jest.fn();
+const mockModelCatalogRefresh = jest.fn().mockResolvedValue({ changed: true });
+const mockVaultCommandRepository = {};
+const mockModelCatalog = { refresh: mockModelCatalogRefresh, markStale: jest.fn() };
+const mockRenderModelPicker = jest.fn((..._args: unknown[]) => ({ refresh: jest.fn(), dispose: jest.fn() }));
 
 jest.mock('fs');
 jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
   ProviderSettingsCoordinator: {
-    reconcileTitleGenerationModelSelection: jest.fn((settings: Record<string, unknown>) => {
-      const titleGenerationModel = settings.titleGenerationModel;
-      const customModels = (
-        settings.providerConfigs as { claude?: { customModels?: string } } | undefined
-      )?.claude?.customModels ?? '';
-      if (titleGenerationModel === 'claude-opus-4-6' && customModels !== 'claude-opus-4-6') {
-        settings.titleGenerationModel = '';
-        return true;
-      }
-      return false;
+    canApplyProviderEnablement: jest.fn(() => true),
+    applyProviderEnablement: jest.fn((
+      settings: Record<string, unknown>,
+      providerId: string,
+      enabled: boolean,
+    ) => {
+      const providerConfigs = settings.providerConfigs as Record<string, { enabled: boolean }>;
+      providerConfigs[providerId].enabled = enabled;
+      return true;
     }),
   },
 }));
@@ -29,7 +43,6 @@ jest.mock('obsidian', () => {
     public desc = '';
     public heading = false;
     public textComponents: MockTextComponent[] = [];
-    public textAreaComponents: MockTextAreaComponent[] = [];
     public dropdownComponents: MockDropdownComponent[] = [];
     public toggleComponents: MockToggleComponent[] = [];
 
@@ -47,6 +60,10 @@ jest.mock('obsidian', () => {
       return this;
     }
 
+    setClass(_className: string): this {
+      return this;
+    }
+
     setHeading() {
       this.heading = true;
       return this;
@@ -55,13 +72,6 @@ jest.mock('obsidian', () => {
     addText(callback: (text: MockTextComponent) => void) {
       const component = createTextComponent();
       this.textComponents.push(component);
-      callback(component);
-      return this;
-    }
-
-    addTextArea(callback: (text: MockTextAreaComponent) => void) {
-      const component = createTextAreaComponent();
-      this.textAreaComponents.push(component);
       callback(component);
       return this;
     }
@@ -90,37 +100,34 @@ jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
 
-jest.mock('@/shared/settings/McpSettingsManager', () => ({
-  McpSettingsManager: jest.fn(),
-}));
-
-jest.mock('@/providers/claude/app/ClaudeWorkspaceServices', () => ({
-  getClaudeWorkspaceServices: jest.fn(() => ({
+function createSettingsRenderer() {
+  return createClaudeSettingsTabRenderer({
     cliResolver: {
-      reset: jest.fn(),
+      reset: mockCLIResolverReset,
     },
-    commandCatalog: {},
-    agentManager: {},
-    agentStorage: {},
-    mcpStorage: {},
-    pluginManager: {},
-  })),
-}));
+    vaultCommandRepository: mockVaultCommandRepository,
+    modelCatalog: mockModelCatalog,
+  } as unknown as Parameters<typeof createClaudeSettingsTabRenderer>[0]);
+}
 
-jest.mock('@/providers/claude/ui/AgentSettings', () => ({
-  AgentSettings: jest.fn(),
-}));
-
-jest.mock('@/providers/claude/ui/PluginSettingsManager', () => ({
-  PluginSettingsManager: jest.fn(),
+jest.mock('@/shared/settings/ProviderModelsSection', () => ({
+  renderProviderModelsSection: (...args: unknown[]) => mockRenderModelPicker(...args),
 }));
 
 jest.mock('@/providers/claude/ui/SlashCommandSettings', () => ({
-  SlashCommandSettings: jest.fn(),
+  SlashCommandSettings: class MockSlashCommandSettings {
+    constructor(...args: unknown[]) {
+      mockSlashCommandSettings(...args);
+    }
+  },
 }));
 
 jest.mock('@/i18n/i18n', () => ({
-  t: (key: string) => key,
+  t: (key: string) => ({
+    'settings.claude.responseStyle.name': 'Response style',
+    'settings.claude.responseStyle.default': 'Default',
+    'settings.claude.responseStyle.concise': 'Concise',
+  } as Record<string, string>)[key] ?? key,
 }));
 
 jest.mock('@/utils/env', () => {
@@ -132,6 +139,7 @@ jest.mock('@/utils/env', () => {
 });
 
 interface MockInputEl {
+  [key: string]: unknown;
   rows: number;
   cols: number;
   value: string;
@@ -152,11 +160,8 @@ interface MockTextComponent {
   inputEl: MockInputEl;
 }
 
-interface MockTextAreaComponent extends MockTextComponent {
-  trigger: (event: string) => Promise<void>;
-}
-
 interface MockDropdownComponent {
+  selectEl: HTMLSelectElement;
   value: string;
   options: Array<{ value: string; label: string }>;
   onChangeCallback: ((value: string) => Promise<void> | void) | null;
@@ -177,7 +182,6 @@ const createdSettings: Array<{
   desc: string;
   heading: boolean;
   textComponents: MockTextComponent[];
-  textAreaComponents: MockTextAreaComponent[];
   dropdownComponents: MockDropdownComponent[];
   toggleComponents: MockToggleComponent[];
 }> = [];
@@ -185,6 +189,7 @@ const createdSettings: Array<{
 function createInputEl(): MockInputEl & { _listeners: Map<string, Array<() => void>> } {
   const listeners = new Map<string, Array<() => void>>();
   return {
+    ...createMockEl('input'),
     rows: 0,
     cols: 0,
     value: '',
@@ -224,33 +229,25 @@ function createTextComponent(): MockTextComponent {
   return component;
 }
 
-function createTextAreaComponent(): MockTextAreaComponent {
-  const component = createTextComponent() as MockTextAreaComponent;
-  component.trigger = async (event: string) => {
-    const handlers = (component.inputEl as ReturnType<typeof createInputEl>)._listeners.get(event) ?? [];
-    for (const handler of handlers) {
-      handler();
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  };
-  return component;
-}
-
 function createDropdownComponent(): MockDropdownComponent {
   const component = {} as MockDropdownComponent;
+  component.selectEl = document.createElement('select');
   component.value = '';
   component.options = [];
   component.onChangeCallback = null;
   component.addOption = jest.fn((value: string, label: string) => {
     component.options.push({ value, label });
+    component.selectEl.add(new Option(label, value));
     return component;
   });
   component.setValue = jest.fn((value: string) => {
     component.value = value;
+    component.selectEl.value = value;
     return component;
   });
   component.onChange = jest.fn((callback: (value: string) => Promise<void> | void) => {
     component.onChangeCallback = callback;
+    component.selectEl.addEventListener('change', () => { void callback(component.selectEl.value); });
     return component;
   });
 
@@ -276,6 +273,7 @@ function createToggleComponent(): MockToggleComponent {
 function createElement(): any {
   const classes = new Set<string>();
   const element: any = {
+    ...createMockEl('div'),
     value: '',
     style: {},
     dataset: {},
@@ -341,20 +339,17 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
       providerConfigs: {
         claude: {
           ...DEFAULT_CLAUDE_PROVIDER_SETTINGS,
-          customModels: 'claude-opus-4-6',
-          lastModel: 'sonnet',
+          discoveredModels: [{ value: 'opus', label: 'Opus', description: '' }, { value: 'claude-opus-4-6', label: 'Opus 4.6', description: '' }],
+          visibleModels: ['opus', 'claude-opus-4-6'],
         },
       },
       ...overrides,
     },
     saveSettings: mockSaveSettings,
-    normalizeModelVariantSettings: jest.fn(() => false),
-    recycleProviderRuntimes: jest.fn().mockResolvedValue(undefined),
-    getView: jest.fn(() => ({
-      getTabManager: jest.fn(() => ({
-        broadcastToAllTabs: jest.fn().mockResolvedValue(undefined),
-      })),
-    })),
+    runProviderExecutionTransition: jest.fn(async (
+      _providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => mutation()),
     app: {
       vault: {
         adapter: {
@@ -367,14 +362,22 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
     await mutation(plugin.settings);
     await plugin.saveSettings();
   });
+  plugin.applyProviderRuntimeSettings = jest.fn(async (
+    providerIds: string[],
+    mutation: (settings: any) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ) => plugin.runProviderExecutionTransition(providerIds, async () => {
+    await plugin.mutateSettings(mutation);
+    await onApplied?.();
+  }));
   return plugin;
 }
 
 function createContext(plugin: any) {
   return {
     plugin,
-    refreshModelSelectors: jest.fn(),
-    refreshTitleGenerationModelOptions: jest.fn(),
+    notifyProviderModelOptionsChanged: jest.fn(),
+    renderAgentSkillSettings: jest.fn(),
     renderHiddenProviderCommandSetting: jest.fn(),
     renderCustomContextLimits: jest.fn(),
   };
@@ -399,51 +402,267 @@ describe('ClaudeSettingsTab', () => {
     mockedStatSync.mockReturnValue({ isFile: () => true } as fs.Stats);
   });
 
-  it('uses the current npm package wrapper path as the CLI placeholder', () => {
+  it.each([false, true])('clears legacy CLI configuration when restoring automatic detection (host override: %s)', async (hasHostOverride) => {
+    const config = {
+      cliPath: '/legacy/claude',
+      cliPathsByHost: { 'other-host': '/keep/claude', ...(hasHostOverride ? { 'host-a': '/host/claude' } : {}) },
+    };
     const plugin = createPlugin();
+    Object.assign(plugin.settings.providerConfigs.claude, config);
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
+    const input = findSetting('settings.cliPath.name').textComponents[0];
+    expect(input.value).toBe(hasHostOverride ? '/host/claude' : '/legacy/claude');
+    await applyTextInput(input, '');
+    expect(plugin.settings.providerConfigs.claude.cliPath).toBe('');
+    expect(plugin.settings.providerConfigs.claude.cliPathsByHost).toEqual({ 'other-host': '/keep/claude' });
+  });
+
+  it('persists response styles through an accessible native selector', async () => {
+    const plugin = createPlugin();
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
+    const subtree = document.createElement('main');
+    subtree.appendChild(findSetting('Response style').dropdownComponents[0].selectEl);
+    const select = within(subtree).getByRole('combobox', { name: 'Response style' }) as HTMLSelectElement;
+    expect(select.value).toBe('Default');
+    for (const value of ['Concise', 'Default']) {
+      const option = within(select).getByRole('option', { name: value }) as HTMLOptionElement;
+      fireEvent.change(select, { target: { value: option.value } });
+      await waitFor(() => expect(plugin.settings.providerConfigs.claude.responseStyle).toBe(value));
+    }
+    expect(await axe(subtree)).toHaveNoViolations();
+  });
+
+  it('persists Claude enablement inside its execution transition and refreshes model options', async () => {
+    let transitionActive = false;
+    const plugin = createPlugin();
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      expect(providerIds).toEqual(['claude']);
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: any) => void | Promise<void>,
+    ) => {
+      expect(transitionActive).toBe(true);
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
     const context = createContext(plugin);
 
-    claudeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
+    const toggle = findSetting('settings.providerEnablement.name').toggleComponents[0];
+    await toggle.onChangeCallback?.(false);
 
-    const cliPathSetting = findSetting('settings.cliPath.name');
-    const cliPathInput = cliPathSetting.textComponents[0];
+    expect(plugin.settings.providerConfigs.claude.enabled).toBe(false);
+    expect(mockModelCatalog.markStale).not.toHaveBeenCalled();
+    expect(mockModelCatalogRefresh).not.toHaveBeenCalled();
+    await toggle.onChangeCallback?.(true);
+    expect(plugin.settings.providerConfigs.claude.enabled).toBe(true);
+    expect(mockModelCatalogRefresh).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('claude');
+  });
 
+  it('warns when disabling Claude would leave no enabled provider', async () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const container = createContainer();
+    const coordinator = jest.requireMock('@/core/providers/ProviderSettingsCoordinator')
+      .ProviderSettingsCoordinator;
+    coordinator.canApplyProviderEnablement.mockImplementationOnce(() => false);
+
+    createSettingsRenderer().render(container, context);
+    const warningCallIndex = container.createDiv.mock.calls.findIndex(
+      ([options]: [{ text?: string }?]) => options?.text
+        === 'settings.providerEnablement.lastProviderWarning',
+    );
+    const warningEl = container.createDiv.mock.results[warningCallIndex]?.value;
+    const toggle = findSetting('settings.providerEnablement.name').toggleComponents[0];
+
+    await toggle.onChangeCallback?.(false);
+
+    expect(warningCallIndex).toBeGreaterThanOrEqual(0);
+    expect(warningEl.toggleClass).toHaveBeenLastCalledWith('claudian-hidden', false);
+    expect(plugin.settings.providerConfigs.claude.enabled).toBe(true);
+    expect(plugin.runProviderExecutionTransition).not.toHaveBeenCalled();
+    expect(coordinator.applyProviderEnablement).not.toHaveBeenCalled();
+    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
+
+    await toggle.onChangeCallback?.(true);
+  });
+
+  it('persists and applies a CLI path inside the Claude execution transition', async () => {
+    mockedExistsSync.mockImplementation((filePath: fs.PathLike) => (
+      String(filePath) === '/custom/claude'
+    ));
+    let transitionActive = false;
+    const plugin = createPlugin();
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => {
+      expect(providerIds).toEqual(['claude']);
+      transitionActive = true;
+      try {
+        return await mutation();
+      } finally {
+        transitionActive = false;
+      }
+    });
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: any) => void | Promise<void>,
+    ) => {
+      expect(transitionActive).toBe(true);
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
+    mockCLIResolverReset.mockImplementation(() => {
+      expect(transitionActive).toBe(true);
+    });
+
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
+    await applyTextInput(findSetting('settings.cliPath.name')
+      .textComponents[0], '/custom/claude');
+
+    expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
+      ['claude'],
+      expect.any(Function),
+    );
+    expect(plugin.applyProviderRuntimeSettings).toHaveBeenCalledWith(
+      ['claude'],
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(plugin.settings.providerConfigs.claude.cliPathsByHost).toEqual({
+      'host-a': '/custom/claude',
+    });
+    expect(mockCLIResolverReset).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists a CLI path pasted with surrounding quotes', async () => {
+    mockedExistsSync.mockImplementation((filePath: fs.PathLike) => (
+      String(filePath) === '/custom dir/claude'
+    ));
+    const plugin = createPlugin();
+    plugin.mutateSettings.mockImplementation(async (
+      mutation: (settings: any) => void | Promise<void>,
+    ) => {
+      await mutation(plugin.settings);
+      await plugin.saveSettings();
+    });
+    plugin.runProviderExecutionTransition.mockImplementation(async (
+      _providerIds: string[],
+      mutation: () => Promise<unknown>,
+    ) => mutation());
+    mockCLIResolverReset.mockImplementation(() => undefined);
+
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
+    await applyTextInput(findSetting('settings.cliPath.name')
+      .textComponents[0], '"/custom dir/claude"');
+
+    expect(plugin.settings.providerConfigs.claude.cliPathsByHost).toEqual({
+      'host-a': '"/custom dir/claude"',
+    });
+  });
+
+  it('renders the default Claude settings layout and model controls', () => {
+    const plugin = createPlugin();
+    const context = createContext(plugin);
+    const container = createContainer();
+    createSettingsRenderer().render(container, context);
+
+    const cliPathInput = findSetting('settings.cliPath.name').textComponents[0];
     expect(cliPathInput.placeholder).toContain('cli-wrapper.cjs');
     expect(cliPathInput.placeholder).not.toContain('cli.js');
+    const names = createdSettings.map(setting => setting.name);
+    expect(names).not.toContain('settings.enableOpus1M.name');
+    expect(names).not.toContain('settings.enableSonnet1M.name');
+    expect(names).not.toContain('Default model');
+    expect(names).not.toContain('settings.customModels.name');
+    const headings = createdSettings.filter(setting => setting.heading).map(setting => setting.name);
+    expect(headings).toEqual(expect.arrayContaining(['settings.models', 'settings.safety']));
+    expect(headings.indexOf('settings.models')).toBeLessThan(headings.indexOf('settings.safety'));
+    expect(mockRenderModelPicker).toHaveBeenCalledWith(
+      container, 'claude', 'Claude', mockModelCatalog, expect.any(Function),
+    );
   });
 
-  it('does not render obsolete Opus and Sonnet 1M toggles', () => {
+  it('shows the shared no-model warning and updates it after selection and discovery', async () => {
+    const plugin = createPlugin();
+    plugin.settings.providerConfigs.claude.visibleModels = [];
+    function domElement(tag = 'div', info: any = {}): any {
+      const element = document.createElement(tag);
+      if (info.cls) element.className = info.cls;
+      if (info.text) element.textContent = info.text;
+      for (const [name, value] of Object.entries(info.attr ?? {})) element.setAttribute(name, String(value));
+      return Object.assign(element, {
+        createDiv: (options: any) => element.appendChild(domElement('div', options)),
+        createSpan: (options: any) => element.appendChild(domElement('span', options)),
+        appendText: (value: string) => element.append(value),
+        createEl: (name: string, options: any) => element.appendChild(domElement(name, options)),
+        empty: () => element.replaceChildren(),
+        toggleClass: (name: string, value: boolean) => element.classList.toggle(name, value),
+      });
+    }
+    const container = domElement();
+    createSettingsRenderer().render(container, createContext(plugin));
+    const warning = within(container).getByText('settings.providerEnablement.noModelsWarning');
+    expect(warning.classList.contains('claudian-hidden')).toBe(false);
+    const onUpdate = mockRenderModelPicker.mock.calls[0][4] as () => void;
+    plugin.settings.providerConfigs.claude.visibleModels = ['opus'];
+    onUpdate();
+    expect(warning.classList.contains('claudian-hidden')).toBe(true);
+    plugin.settings.providerConfigs.claude.discoveredModels = [];
+    onUpdate();
+    expect(warning.classList.contains('claudian-hidden')).toBe(false);
+    await findSetting('settings.providerEnablement.name').toggleComponents[0].onChangeCallback?.(false);
+    expect(warning.classList.contains('claudian-hidden')).toBe(true);
+    const warningRegion = document.createElement('main');
+    warningRegion.append(warning);
+    expect(await axe(warningRegion)).toHaveNoViolations();
+  });
+
+  it('keeps Claude CRUD on its explicit vault repository without the shared manager', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
 
-    claudeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
 
-    expect(createdSettings.map(setting => setting.name)).not.toContain('settings.enableOpus1M.name');
-    expect(createdSettings.map(setting => setting.name)).not.toContain('settings.enableSonnet1M.name');
+    expect(context.renderAgentSkillSettings).not.toHaveBeenCalled();
+    expect(mockSlashCommandSettings).toHaveBeenCalledWith(
+      expect.anything(),
+      plugin.app,
+      mockVaultCommandRepository,
+    );
   });
 
-  it('does not switch the active model while the custom models textarea is mid-edit', async () => {
+  it('scopes custom model overrides to the Claude environment section', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
+    const target = createContainer();
 
-    claudeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
 
-    const customModelsSetting = findSetting('settings.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
-
-    await customModelsTextArea.onChangeCallback?.('claude-opus-4-7');
-
-    expect(plugin.settings.providerConfigs.claude.customModels).toBe('claude-opus-4-6');
-    expect(plugin.settings.model).toBe('claude-opus-4-6');
-    expect(mockSaveSettings).not.toHaveBeenCalled();
-    expect(context.refreshModelSelectors).not.toHaveBeenCalled();
+    const environmentOptions = mockRenderEnvironmentSettingsSection.mock.calls[0]?.[0];
+    expect(environmentOptions).toEqual(expect.objectContaining({
+      scope: 'provider:claude',
+      renderCustomContextLimits: expect.any(Function),
+    }));
+    environmentOptions.renderCustomContextLimits(target);
+    expect(context.renderCustomContextLimits).toHaveBeenCalledWith(target, 'claude');
   });
 
   it('offers auto as a Claude safe mode and persists it', async () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
 
-    claudeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
 
     const safeModeSetting = findSetting('settings.claudeSafeMode.name');
     const safeModeDropdown = safeModeSetting.dropdownComponents[0];
@@ -458,26 +677,5 @@ describe('ClaudeSettingsTab', () => {
 
     expect(plugin.settings.providerConfigs.claude.safeMode).toBe('auto');
     expect(mockSaveSettings).toHaveBeenCalledTimes(1);
-  });
-
-  it('reconciles removed custom models on blur and clears stale title model selections', async () => {
-    const plugin = createPlugin({
-      titleGenerationModel: 'claude-opus-4-6',
-    });
-    const context = createContext(plugin);
-
-    claudeSettingsTabRenderer.render(createContainer(), context);
-
-    const customModelsSetting = findSetting('settings.customModels.name');
-    const customModelsTextArea = customModelsSetting.textAreaComponents[0];
-
-    await customModelsTextArea.onChangeCallback?.('claude-opus-4-7');
-    await customModelsTextArea.trigger('blur');
-
-    expect(plugin.settings.providerConfigs.claude.customModels).toBe('claude-opus-4-7');
-    expect(plugin.settings.model).toBe('sonnet');
-    expect(plugin.settings.titleGenerationModel).toBe('');
-    expect(mockSaveSettings).toHaveBeenCalledTimes(1);
-    expect(context.refreshModelSelectors).toHaveBeenCalledTimes(1);
   });
 });

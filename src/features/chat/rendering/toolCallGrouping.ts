@@ -1,41 +1,37 @@
 /**
- * Tool-call post-processing: groups consecutive tool calls + thinking blocks
- * into collapsible summary wrappers. Runs progressively during streaming and
- * again when a message finishes rendering (or is replayed from history).
+ * Tool-call grouping (fork-only): collapses runs of consecutive tool calls and
+ * thinking blocks into summary wrappers. Runs progressively while streaming and
+ * again when a response is finalized or replayed from history; the completed
+ * groups then move into the upstream "Worked for" history like any other work.
  *
  * Chain-breaker approach: groupable elements accumulate into runs; text blocks
- * and chain-breakers (AskUserQuestion, response-footer, compact boundary) close
- * the current run. Runs shorter than MIN_GROUP_SIZE are left alone. The
- * ephemeral thinking indicator is transparent: it neither joins nor breaks
- * a run.
+ * and chain-breakers (AskUserQuestion, compact boundary) close the current run.
+ * Runs shorter than MIN_GROUP_SIZE are left alone. The ephemeral thinking
+ * indicator is transparent: it neither joins nor breaks a run.
  */
 
-const CHECKMARK_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
-const ERROR_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+import { setIcon } from 'obsidian';
 
 const MIN_GROUP_SIZE = 2;
 
 /** How many trailing tool calls stay visible while the stream is active. */
 export const STREAMING_TRAILING_VISIBLE = 4;
 
+let nextGroupId = 0;
+
 function isGroupableElement(el: Element): boolean {
   if (el.querySelector('.claudian-tool-content-ask')) return false;
-  // Keep live subagent status visible (incl. async "running in background").
+  // Keep live tool and subagent status visible (incl. async "running in background").
   if (el.querySelector('.status-running')) return false;
-  if (el.classList.contains('claudian-tool-call')) return true;
-  if (el.classList.contains('claudian-write-edit-block')) return true;
-  if (el.classList.contains('claudian-thinking-block')) return true;
-  if (el.classList.contains('claudian-subagent-list')) return true;
-  return false;
+  return el.classList.contains('claudian-tool-call')
+    || el.classList.contains('claudian-write-edit-block')
+    || el.classList.contains('claudian-thinking-block')
+    || el.classList.contains('claudian-subagent-list');
 }
 
 function isChainBreaker(el: Element): boolean {
-  if (el.querySelector('.claudian-tool-content-ask')) return true;
-  if (el.classList.contains('claudian-response-footer')) return true;
-  if (el.classList.contains('claudian-compact-boundary')) return true;
-  return false;
+  return el.querySelector('.claudian-tool-content-ask') !== null
+    || el.classList.contains('claudian-compact-boundary');
 }
 
 /** Ephemeral stream UI that neither joins nor breaks a run. */
@@ -55,35 +51,29 @@ interface GroupStats {
 }
 
 function countGroupStats(elements: Element[]): GroupStats {
-  let toolCount = 0;
-  let thinkingCount = 0;
-  let thinkingDuration = 0;
-  let hasErrors = false;
+  const stats: GroupStats = { toolCount: 0, thinkingCount: 0, thinkingDuration: 0, hasErrors: false };
 
   for (const el of elements) {
     if (
-      el.classList.contains('claudian-tool-call') ||
-      el.classList.contains('claudian-write-edit-block') ||
-      el.classList.contains('claudian-subagent-list')
+      el.classList.contains('claudian-tool-call')
+      || el.classList.contains('claudian-write-edit-block')
+      || el.classList.contains('claudian-subagent-list')
     ) {
-      toolCount++;
+      stats.toolCount++;
     } else if (el.classList.contains('claudian-thinking-block')) {
-      thinkingCount++;
-      const label = el.querySelector('.claudian-thinking-label');
-      if (label?.textContent) {
-        const match = label.textContent.match(/(\d+)s/);
-        if (match) thinkingDuration += parseInt(match[1], 10);
-      }
+      stats.thinkingCount++;
+      const match = el.querySelector('.claudian-thinking-label')?.textContent?.match(/(\d+)s/);
+      if (match) stats.thinkingDuration += parseInt(match[1], 10);
     }
     if (el.querySelector('.status-error') || el.classList.contains('error')) {
-      hasErrors = true;
+      stats.hasErrors = true;
     }
   }
 
-  return { toolCount, thinkingCount, thinkingDuration, hasErrors };
+  return stats;
 }
 
-function buildGroupLabel(toolCount: number, thinkingCount: number, thinkingDuration: number): string {
+function buildGroupLabel({ toolCount, thinkingCount, thinkingDuration }: GroupStats): string {
   const parts: string[] = [];
   if (toolCount > 0) parts.push(`${toolCount} tool call${toolCount !== 1 ? 's' : ''}`);
   if (thinkingCount > 0) {
@@ -97,20 +87,16 @@ function refreshGroupSummary(wrapperEl: Element): void {
   const contentEl = wrapperEl.querySelector('.claudian-tool-group-content');
   const summaryEl = wrapperEl.querySelector('.claudian-tool-group-summary');
   const labelEl = wrapperEl.querySelector('.claudian-tool-group-label');
-  const statusEl = wrapperEl.querySelector('.claudian-tool-group-status');
+  const statusEl = wrapperEl.querySelector<HTMLElement>('.claudian-tool-group-status');
   if (!contentEl || !summaryEl || !labelEl || !statusEl) return;
 
-  const { toolCount, thinkingCount, thinkingDuration, hasErrors } =
-    countGroupStats(Array.from(contentEl.children));
-  const labelText = buildGroupLabel(toolCount, thinkingCount, thinkingDuration);
+  const stats = countGroupStats(Array.from(contentEl.children));
+  const labelText = buildGroupLabel(stats);
   labelEl.textContent = labelText;
-  summaryEl.setAttribute('aria-label', labelText);
-  if (hasErrors) {
-    statusEl.classList.add('has-errors');
-    statusEl.innerHTML = ERROR_SVG;
-  } else {
-    statusEl.classList.remove('has-errors');
-    statusEl.innerHTML = CHECKMARK_SVG;
+  summaryEl.setAttribute('aria-label', stats.hasErrors ? `${labelText} (with errors)` : labelText);
+  if (statusEl.classList.contains('has-errors') !== stats.hasErrors || !statusEl.hasChildNodes()) {
+    statusEl.classList.toggle('has-errors', stats.hasErrors);
+    setIcon(statusEl, stats.hasErrors ? 'x' : 'check');
   }
 }
 
@@ -125,43 +111,28 @@ function absorbIntoGroup(groupEl: Element, elements: Element[]): void {
 }
 
 function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
-  // Popout-window safety: create elements in the document that owns the message.
-  const doc = parentEl.ownerDocument;
+  const contentId = `claudian-tool-group-${nextGroupId++}`;
 
-  const wrapperEl = doc.createElement('div');
-  wrapperEl.className = 'claudian-tool-group';
-
-  const summaryEl = doc.createElement('div');
-  summaryEl.className = 'claudian-tool-group-summary';
-  summaryEl.setAttribute('tabindex', '0');
-  summaryEl.setAttribute('role', 'button');
-  summaryEl.setAttribute('aria-expanded', 'false');
-
-  const chevron = doc.createElement('span');
-  chevron.className = 'claudian-tool-group-chevron';
-  chevron.textContent = '▶';
-
-  const labelEl = doc.createElement('span');
-  labelEl.className = 'claudian-tool-group-label';
-
-  const statusEl = doc.createElement('span');
-  statusEl.className = 'claudian-tool-group-status';
-
-  summaryEl.appendChild(chevron);
-  summaryEl.appendChild(labelEl);
-  summaryEl.appendChild(statusEl);
-
-  const contentEl = doc.createElement('div');
-  contentEl.className = 'claudian-tool-group-content';
-
-  wrapperEl.appendChild(summaryEl);
-  wrapperEl.appendChild(contentEl);
-
+  // Obsidian's create helpers use the owning document, so popouts stay safe.
+  const wrapperEl = parentEl.createDiv({ cls: 'claudian-tool-group' });
   if (elements.length > 0 && elements[0].parentNode === parentEl) {
     parentEl.insertBefore(wrapperEl, elements[0]);
-  } else {
-    parentEl.appendChild(wrapperEl);
   }
+
+  const summaryEl = wrapperEl.createEl('button', {
+    cls: 'claudian-tool-group-summary',
+    attr: { type: 'button', 'aria-expanded': 'false', 'aria-controls': contentId },
+  });
+  summaryEl.createSpan({
+    cls: 'claudian-tool-group-chevron',
+    text: '▶',
+    attr: { 'aria-hidden': 'true' },
+  });
+  summaryEl.createSpan({ cls: 'claudian-tool-group-label' });
+  summaryEl.createSpan({ cls: 'claudian-tool-group-status', attr: { 'aria-hidden': 'true' } });
+
+  const contentEl = wrapperEl.createDiv({ cls: 'claudian-tool-group-content', attr: { id: contentId } });
+  contentEl.hidden = true;
 
   for (const el of elements) {
     contentEl.appendChild(el);
@@ -170,14 +141,8 @@ function createGroupWrapper(parentEl: HTMLElement, elements: Element[]): void {
 
   summaryEl.addEventListener('click', () => {
     const isExpanded = wrapperEl.classList.toggle('expanded');
+    contentEl.hidden = !isExpanded;
     summaryEl.setAttribute('aria-expanded', String(isExpanded));
-  });
-
-  summaryEl.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      summaryEl.click();
-    }
   });
 }
 
@@ -188,6 +153,11 @@ function previousRelevantSibling(el: Element): Element | null {
     prev = prev.previousElementSibling;
   }
   return prev;
+}
+
+function hasAdjacentGroup(el: Element): boolean {
+  const prev = previousRelevantSibling(el);
+  return prev !== null && isAlreadyGrouped(prev);
 }
 
 export interface GroupToolBlocksOptions {
@@ -205,14 +175,10 @@ export interface GroupToolBlocksOptions {
 }
 
 /**
- * Post-processes a `.claudian-message-content` element: finds runs of
- * groupable elements (tool calls, thinking, write-edit, subagent lists) and
- * wraps each run of length >= MIN_GROUP_SIZE in a collapsible summary.
+ * Post-processes a `.claudian-message-content` element: wraps each run of
+ * groupable elements with length >= MIN_GROUP_SIZE in a collapsible summary.
  * Consecutive passes merge into existing adjacent groups instead of creating
- * chains of wrappers.
- *
- * Safe to call multiple times — already-grouped wrappers are skipped, so it
- * can run progressively during streaming and again at end of turn.
+ * chains of wrappers, so it is safe to call repeatedly.
  */
 export function groupToolBlocks(
   contentEl: HTMLElement | null,
@@ -231,27 +197,23 @@ export function groupToolBlocks(
     }
   }
 
-  interface Run {
-    elements: Element[];
-  }
-  const runs: Run[] = [];
-  let currentRun: Run | null = null;
+  const runs: Element[][] = [];
+  let currentRun: Element[] | null = null;
 
-  const closeRun = () => {
-    if (!currentRun) return;
+  const closeRun = (): void => {
     const run = currentRun;
     currentRun = null;
-    if (run.elements.length < MIN_GROUP_SIZE) return;
+    if (!run || run.length < MIN_GROUP_SIZE) return;
 
-    const isTrailing = run.elements[run.elements.length - 1] === lastRelevantChild;
+    const isTrailing = run[run.length - 1] === lastRelevantChild;
     if (options?.keepTrailingOpen && isTrailing) {
-      // Trailing run stays open — unless it exceeds the visibility cap, in
-      // which case the overflow is collapsed and the newest calls stay visible.
+      // Trailing run stays open unless it exceeds the visibility cap; then the
+      // overflow collapses and the newest calls stay visible.
       const cap = options.maxTrailingVisible;
-      if (cap !== undefined && run.elements.length > cap) {
-        const overflow = run.elements.slice(0, run.elements.length - cap);
+      if (cap !== undefined && run.length > cap) {
+        const overflow = run.slice(0, run.length - cap);
         if (overflow.length >= MIN_GROUP_SIZE || hasAdjacentGroup(overflow[0])) {
-          runs.push({ elements: overflow });
+          runs.push(overflow);
         }
       }
       return;
@@ -259,49 +221,32 @@ export function groupToolBlocks(
     runs.push(run);
   };
 
-  const hasAdjacentGroup = (el: Element): boolean => {
-    const prev = previousRelevantSibling(el);
-    return prev !== null && isAlreadyGrouped(prev);
-  };
-
   for (const child of children) {
-    if (isTransparentElement(child)) {
-      continue;
-    }
-    if (isAlreadyGrouped(child)) {
+    if (isTransparentElement(child)) continue;
+    if (isAlreadyGrouped(child) || isChainBreaker(child) || !isGroupableElement(child)) {
       closeRun();
       continue;
     }
-    if (isChainBreaker(child)) {
-      closeRun();
-    } else if (isGroupableElement(child)) {
-      if (!currentRun) {
-        currentRun = { elements: [] };
-      }
-      currentRun.elements.push(child);
-    } else {
-      closeRun();
-    }
+    currentRun ??= [];
+    currentRun.push(child);
   }
   closeRun();
 
   if (!options?.keepTrailingOpen) {
     // Final/replay pass: results may have arrived after a progressive pass
-    // grouped their tool calls — refresh every group's label and status.
+    // grouped their tool calls, so refresh every group's label and status.
     for (const child of children) {
       if (isAlreadyGrouped(child)) refreshGroupSummary(child);
     }
   }
 
-  if (runs.length === 0) return;
-
   for (let r = runs.length - 1; r >= 0; r--) {
     const run = runs[r];
-    const prev = previousRelevantSibling(run.elements[0]);
+    const prev = previousRelevantSibling(run[0]);
     if (prev && isAlreadyGrouped(prev)) {
-      absorbIntoGroup(prev, run.elements);
+      absorbIntoGroup(prev, run);
     } else {
-      createGroupWrapper(contentEl, run.elements);
+      createGroupWrapper(contentEl, run);
     }
   }
 }

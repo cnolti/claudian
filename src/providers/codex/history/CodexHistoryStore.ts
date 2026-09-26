@@ -4,7 +4,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo } from '../../../core/types';
+import type {
+  ChatMessage,
+  CitationGroup,
+  ContentBlock,
+  ImageAttachment,
+  ToolCallInfo,
+} from '../../../core/types';
+import { createTurnStats, isTokenCount } from '../../../core/types';
 import { extractUserDisplayContent } from '../../../utils/context';
 import {
   buildImageAttachmentFromBase64,
@@ -15,13 +22,17 @@ import {
   joinCodexUserTextParts,
 } from '../codexUserText';
 import {
+  normalizeCodexMemoryCitation,
+  stripCodexMemoryCitationMarkup,
+} from '../normalization/CodexMemoryCitation';
+import {
   appendCodexCommandOutput,
   decodeCodexExecEnvelope,
   extractCodexExecCellId,
   isCodexToolOutputError,
-  normalizeCodexMcpToolInput,
-  normalizeCodexMcpToolName,
-  normalizeCodexMcpToolState,
+  normalizeCodexMCPToolInput,
+  normalizeCodexMCPToolName,
+  normalizeCodexMCPToolState,
   normalizeCodexToolCall,
   normalizeCodexToolInput,
   normalizeCodexToolName,
@@ -101,7 +112,7 @@ interface PersistedWebSearchCallPayload {
   call_id?: string;
 }
 
-interface PersistedMcpToolCallPayload {
+interface PersistedMCPToolCallPayload {
   type: 'mcp_tool_call';
   server?: string;
   tool?: string;
@@ -117,6 +128,8 @@ interface PersistedEventPayload {
   type?: string;
   text?: string;
   message?: string;
+  memory_citation?: unknown;
+  memoryCitation?: unknown;
 }
 
 interface PersistedCompactionPayload {
@@ -152,6 +165,8 @@ interface CodexTurnState {
   startedAt: number;
   completedAt?: number;
   completed?: boolean;
+  outputTokens?: number;
+  durationMs?: number;
   lastEventAt: number;
   userTimestamp?: number;
   userChunks: string[];
@@ -166,7 +181,7 @@ type PersistedPayload =
   | PersistedToolCallPayload
   | PersistedToolCallOutputPayload
   | PersistedWebSearchCallPayload
-  | PersistedMcpToolCallPayload
+  | PersistedMCPToolCallPayload
   | PersistedCompactionPayload
   | PersistedEventPayload
   | undefined;
@@ -298,6 +313,51 @@ function appendOrderedTextChunk(
   bubble.contentBlocks.push({ type, content: trimmed });
 }
 
+function appendCitationBlock(bubble: CodexAssistantBubble, value: unknown): void {
+  const citations = normalizeCodexMemoryCitation(value);
+  if (!citations) return;
+
+  const lastBlock = bubble.contentBlocks[bubble.contentBlocks.length - 1];
+  if (
+    lastBlock?.type === 'citations'
+    && areCitationGroupsEqual(lastBlock.citations, citations)
+  ) {
+    return;
+  }
+  bubble.contentBlocks.push({ type: 'citations', citations });
+}
+
+function areCitationGroupsEqual(left: CitationGroup, right: CitationGroup): boolean {
+  return left.kind === right.kind
+    && left.entries.length === right.entries.length
+    && left.entries.every((entry, index) => {
+      const other = right.entries[index];
+      return entry.path === other.path
+        && entry.lineStart === other.lineStart
+        && entry.lineEnd === other.lineEnd
+        && entry.note === other.note;
+    });
+}
+
+function appendPersistedAssistantText(
+  bubble: CodexAssistantBubble,
+  value: string,
+): void {
+  const trimmed = value.trim();
+  if (!trimmed) return;
+
+  const lastBlock = bubble.contentBlocks[bubble.contentBlocks.length - 1];
+  const previousBlock = bubble.contentBlocks[bubble.contentBlocks.length - 2];
+  if (
+    lastBlock?.type === 'citations'
+    && previousBlock?.type === 'text'
+    && previousBlock.content.trim() === trimmed
+  ) {
+    return;
+  }
+  appendOrderedTextChunk(bubble, 'text', trimmed);
+}
+
 function replaceLatestOrderedTextChunk(
   bubble: CodexAssistantBubble,
   type: 'text' | 'thinking',
@@ -353,6 +413,7 @@ interface TurnAccumulator {
   contentBlocks: ContentBlock[];
   interrupted: boolean;
   timestamp: number;
+  completedAt?: number;
 }
 
 function newTurn(timestamp = 0): TurnAccumulator {
@@ -380,6 +441,7 @@ function flushTurn(turn: TurnAccumulator, messages: ChatMessage[], msgIndex: num
     role: 'assistant',
     content: turn.assistantText,
     timestamp: turn.timestamp || Date.now(),
+    completedAt: turn.completedAt,
     toolCalls: turn.toolCalls.length > 0 ? turn.toolCalls : undefined,
     contentBlocks: turn.contentBlocks.length > 0 ? turn.contentBlocks : undefined,
   };
@@ -568,8 +630,9 @@ function processLegacyItem(
     case 'agent_message':
       if (eventType === 'item.completed' || eventType === 'item.updated') {
         if (item.text) {
-          turn.assistantText = item.text;
-          setTextBlock(turn, item.text);
+          const visibleText = stripCodexMemoryCitationMarkup(item.text);
+          turn.assistantText = visibleText;
+          setTextBlock(turn, visibleText);
         }
       }
       break;
@@ -1052,8 +1115,8 @@ function processPersistedWebSearchCall(
   });
 }
 
-function processPersistedMcpToolCall(
-  payload: PersistedMcpToolCallPayload,
+function processPersistedMCPToolCall(
+  payload: PersistedMCPToolCallPayload,
   timestamp: number,
   ctx: PersistedParseContext,
 ): void {
@@ -1065,12 +1128,12 @@ function processPersistedMcpToolCall(
 
   if (bubble.toolIndexesById.has(callId)) return;
 
-  const normalizedInput = normalizeCodexMcpToolInput(payload.arguments);
-  const normalizedState = normalizeCodexMcpToolState(payload.status, payload.result, payload.error);
+  const normalizedInput = normalizeCodexMCPToolInput(payload.arguments);
+  const normalizedState = normalizeCodexMCPToolState(payload.status, payload.result, payload.error);
 
   const toolCall: ToolCallInfo = {
     id: callId,
-    name: normalizeCodexMcpToolName(payload.server, payload.tool),
+    name: normalizeCodexMCPToolName(payload.server, payload.tool),
     input: normalizedInput,
     status: normalizedState.status,
     ...(normalizedState.result ? { result: normalizedState.result } : {}),
@@ -1119,11 +1182,13 @@ function processPersistedPayload(
         }
         appendUserImages(turn, messagePayload.content, timestamp);
       } else if (messagePayload.role === 'assistant') {
-        const text = extractMessageText(messagePayload.content);
+        const text = stripCodexMemoryCitationMarkup(
+          extractMessageText(messagePayload.content),
+        );
         const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
         const bubble = ensureAssistantBubble(turn, timestamp);
         if (text) {
-          appendOrderedTextChunk(bubble, 'text', text);
+          appendPersistedAssistantText(bubble, text);
         }
       }
       break;
@@ -1155,7 +1220,7 @@ function processPersistedPayload(
       break;
 
     case 'mcp_tool_call':
-      processPersistedMcpToolCall(payload as PersistedMcpToolCallPayload, timestamp, ctx);
+      processPersistedMCPToolCall(payload as PersistedMCPToolCallPayload, timestamp, ctx);
       break;
 
     case 'compaction':
@@ -1199,6 +1264,8 @@ function processEventMsg(
         if (turn) {
           turn.completedAt = timestamp;
           turn.completed = true;
+          const duration = (payload as Record<string, unknown>).duration_ms;
+          if (typeof duration === 'number') turn.durationMs = duration;
           closeAssistantBubble(turn);
           const serverTurnId = extractServerTurnId(payload);
           if (serverTurnId && !turn.serverTurnId) turn.serverTurnId = serverTurnId;
@@ -1239,8 +1306,15 @@ function processEventMsg(
       const bubble = ensureAssistantBubble(turn, timestamp);
       const msg = payload.message;
       if (typeof msg === 'string') {
-        appendOrderedTextChunk(bubble, 'text', msg);
+        appendPersistedAssistantText(
+          bubble,
+          stripCodexMemoryCitationMarkup(msg),
+        );
       }
+      appendCitationBlock(
+        bubble,
+        payload.memory_citation ?? payload.memoryCitation,
+      );
       break;
     }
 
@@ -1316,9 +1390,10 @@ function flushBubbleTurnMessages(
     const hasContent = contentText.trim().length > 0;
     const hasThinking = thinkingText.trim().length > 0;
     const hasToolCalls = bubble.toolCalls.length > 0;
+    const hasCitations = bubble.contentBlocks.some(block => block.type === 'citations');
     const hasCompactBoundary = bubble.contentBlocks.some(b => b.type === 'context_compacted');
 
-    if (!hasContent && !hasThinking && !hasToolCalls && !hasCompactBoundary) {
+    if (!hasContent && !hasThinking && !hasToolCalls && !hasCitations && !hasCompactBoundary) {
       if (bubble.interrupted) {
         messages.push({
           id: `codex-msg-${msgIndex}`,
@@ -1362,10 +1437,12 @@ function flushBubbleTurnMessages(
     lastMsg.durationSeconds = Math.round(durationMs / 1000);
   }
 
-  if (turn.serverTurnId && turn.completed && assistantMessages.length > 0) {
+  if (turn.completed && assistantMessages.length > 0) {
     const lastNonInterrupt = [...assistantMessages].reverse().find(m => !m.isInterrupt);
     if (lastNonInterrupt) {
-      lastNonInterrupt.assistantMessageId = turn.serverTurnId;
+      lastNonInterrupt.completedAt = turn.completedAt || undefined;
+      lastNonInterrupt.turnStats = createTurnStats(turn.outputTokens, turn.durationMs);
+      if (turn.serverTurnId) lastNonInterrupt.assistantMessageId = turn.serverTurnId;
     }
   }
 
@@ -1552,17 +1629,6 @@ async function defaultPathExists(value: string): Promise<boolean> {
   }
 }
 
-export function parseCodexSessionFile(filePath: string): ChatMessage[] {
-  let content: string;
-  try {
-    content = fs.readFileSync(filePath, 'utf-8');
-  } catch {
-    return [];
-  }
-
-  return parseCodexSessionContent(content);
-}
-
 export async function parseCodexSessionFileAsync(
   filePath: string,
   timeoutMs = 10_000,
@@ -1587,6 +1653,36 @@ export interface CodexParsedTurn {
 export function parseCodexSessionContent(content: string): ChatMessage[] {
   const turns = parseCodexSessionTurns(content);
   return turns.flatMap(t => t.messages);
+}
+
+export function parseCodexSessionModel(
+  content: string,
+  resumeAtTurnId?: string,
+): string | null {
+  let model: string | null = null;
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line) as {
+        type?: unknown;
+        payload?: { model?: unknown; turn_id?: unknown };
+      };
+      if (record.type !== 'turn_context') continue;
+      const candidate = typeof record.payload?.model === 'string'
+        ? record.payload.model.trim()
+        : '';
+      if (candidate) model = candidate;
+      if (
+        resumeAtTurnId
+        && record.payload?.turn_id === resumeAtTurnId
+      ) {
+        return model;
+      }
+    } catch {
+      // Ignore malformed provider-native transcript records.
+    }
+  }
+  return resumeAtTurnId ? null : model;
 }
 
 export function parseCodexSessionTurns(content: string): CodexParsedTurn[] {
@@ -1645,6 +1741,7 @@ function parseLegacySession(records: ParsedSessionRecord[]): ChatMessage[] {
           break;
 
         case 'turn.completed':
+          turn.completedAt = parsed.timestamp || undefined;
           msgIndex = flushTurn(turn, messages, msgIndex);
           turn = newTurn();
           break;
@@ -1671,9 +1768,24 @@ function parseLegacySession(records: ParsedSessionRecord[]): ChatMessage[] {
 
 function parseModernSessionTurns(records: ParsedSessionRecord[]): CodexParsedTurn[] {
   const ctx = createPersistedParseContext();
+  let threadId: string | undefined;
+  const turnOutputTokens = new Map<string, number | undefined>();
 
   for (const [lineIndex, parsed] of records.entries()) {
     const timestamp = parsed.timestamp;
+
+    const payload = parsed.payload as Record<string, unknown> | undefined;
+    if (parsed.type === 'session_meta') {
+      // A fork's own header precedes inherited parent metadata.
+      threadId ??= typeof payload?.id === 'string' ? payload.id : undefined;
+    }
+    if (parsed.type === 'token_usage_record' && threadId && payload?.thread_id === threadId) {
+      if (typeof payload.turn_id === 'string') {
+        const usage = payload.turn_token_usage as { output_tokens?: unknown } | undefined;
+        turnOutputTokens.set(payload.turn_id, isTokenCount(usage?.output_tokens) ? usage.output_tokens : undefined);
+      }
+      continue;
+    }
 
     // Legacy event records can appear in mixed sessions
     if (parsed.type === 'event' && parsed.event) {
@@ -1697,6 +1809,9 @@ function parseModernSessionTurns(records: ParsedSessionRecord[]): CodexParsedTur
     }
   }
 
+  for (const turn of ctx.turns.values()) {
+    if (turn.serverTurnId) turn.outputTokens = turnOutputTokens.get(turn.serverTurnId);
+  }
   return flushBubbleTurnsGrouped(ctx.turns, ctx.turnOrder);
 }
 
@@ -1781,7 +1896,11 @@ function processLegacyItemInModernContext(
       if ((eventType === 'item.updated' || eventType === 'item.completed') && item.text) {
         const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
         const bubble = ensureAssistantBubble(turn, timestamp);
-        replaceLatestOrderedTextChunk(bubble, 'text', item.text);
+        replaceLatestOrderedTextChunk(
+          bubble,
+          'text',
+          stripCodexMemoryCitationMarkup(item.text),
+        );
       }
       break;
     }
@@ -1916,7 +2035,11 @@ function processLegacyEventInModernContext(
     case 'turn.completed': {
       if (ctx.currentTurnId) {
         const turn = ctx.turns.get(ctx.currentTurnId);
-        if (turn) closeAssistantBubble(turn);
+        if (turn) {
+          turn.completed = true;
+          turn.completedAt = timestamp;
+          closeAssistantBubble(turn);
+        }
       }
       ctx.currentTurnId = null;
       break;

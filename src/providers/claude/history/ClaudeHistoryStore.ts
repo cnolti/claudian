@@ -1,32 +1,36 @@
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+
 import type { ProviderHistoryPathContext } from '../../../core/providers/types';
-import { isSubagentToolName } from '../../../core/tools/toolNames';
 import type { ChatMessage, SubagentInfo, ToolCallInfo } from '../../../core/types';
+import { ClaudeTaskToolNormalizer } from '../normalization/ClaudeTaskToolNormalizer';
+import { isClaudeSubagentToolName } from '../subagentToolNames';
+import { ClaudeTurnStats } from './ClaudeTurnStats';
 import { buildAsyncSubagentInfo } from './sdkAsyncSubagent';
 import { filterActiveBranch } from './sdkBranchFilter';
-import type { SDKSessionLoadResult } from './sdkHistoryTypes';
+import type { SDKNativeMessage, SDKSessionLoadResult } from './sdkHistoryTypes';
 import {
   collectAsyncSubagentResults,
   collectStructuredPatchResults,
   collectToolResults,
-  extractXmlTag,
+  extractXMLTag,
   hydrateFallbackAskUserAnswers,
   hydrateStructuredToolResults,
+  isCanonicalSDKUserMessage,
   isSystemInjectedMessage,
   mergeAssistantMessage,
   parseSDKMessageToChat,
+  parseTaskNotification,
 } from './sdkMessageParsing';
 import {
-  deleteSDKSession,
   encodeVaultPathForSDK,
   getSDKProjectsPath,
-  getSDKSessionAvailability,
   getSDKSessionPath,
   isValidSessionId,
   locateSDKSession,
   locateSDKSessions,
   readSDKSession,
   readSDKSessionFile,
-  sdkSessionExists,
 } from './sdkSessionPaths';
 import {
   isValidAgentId,
@@ -34,6 +38,14 @@ import {
   loadSubagentToolCalls,
 } from './sdkSubagentSidecar';
 
+export type {
+  ClaudeSessionTimeCandidate,
+  ClaudeSessionTimeFingerprint,
+} from './ClaudeSessionRecovery';
+export {
+  recoverSDKSessionIdByTime,
+  selectClaudeSessionRecoveryCandidate,
+} from './ClaudeSessionRecovery';
 export type {
   AsyncSubagentResult,
   ResolvedAsyncStatus,
@@ -44,12 +56,10 @@ export type {
 } from './sdkHistoryTypes';
 export {
   collectAsyncSubagentResults,
-  deleteSDKSession,
   encodeVaultPathForSDK,
-  extractXmlTag,
+  extractXMLTag,
   filterActiveBranch,
   getSDKProjectsPath,
-  getSDKSessionAvailability,
   getSDKSessionPath,
   isValidSessionId,
   loadSubagentFinalResult,
@@ -59,12 +69,59 @@ export {
   parseSDKMessageToChat,
   readSDKSession,
   readSDKSessionFile,
-  sdkSessionExists,
 };
 export {
   extractAgentIdFromToolUseResult,
   resolveToolUseResultStatus,
 } from './sdkAsyncSubagent';
+
+export function parseLegacyConversationSessionId(
+  content: string,
+  conversationId: string,
+): string | null {
+  const firstLine = content.split(/\r?\n/, 1)[0];
+  if (!firstLine) {
+    return null;
+  }
+
+  try {
+    const record = JSON.parse(firstLine) as {
+      type?: unknown;
+      id?: unknown;
+      sessionId?: unknown;
+    };
+    if (
+      record.type !== 'meta'
+      || record.id !== conversationId
+      || typeof record.sessionId !== 'string'
+      || !isValidSessionId(record.sessionId)
+    ) {
+      return null;
+    }
+    return record.sessionId;
+  } catch {
+    return null;
+  }
+}
+
+export async function readLegacyConversationSessionId(
+  vaultPath: string,
+  conversationId: string,
+): Promise<string | null> {
+  if (!isValidSessionId(conversationId)) {
+    return null;
+  }
+
+  try {
+    const content = await fs.readFile(
+      path.join(vaultPath, '.claude', 'sessions', `${conversationId}.jsonl`),
+      'utf8',
+    );
+    return parseLegacyConversationSessionId(content, conversationId);
+  } catch {
+    return null;
+  }
+}
 
 export async function loadSDKSessionMessages(
   vaultPath: string,
@@ -83,17 +140,68 @@ export async function loadSDKSessionMessages(
     return { messages: [], skippedLines: result.skippedLines, error: result.error };
   }
 
-  const filteredEntries = filterActiveBranch(result.messages, resumeAtMessageId);
+  const filteredEntries = filterActiveBranch(result.messages.filter(entry => !entry.isSidechain), resumeAtMessageId);
 
   const toolResults = collectToolResults(filteredEntries);
   const toolUseResults = collectStructuredPatchResults(filteredEntries);
   const asyncSubagentResults = collectAsyncSubagentResults(filteredEntries);
+  const nativeTurnDurations = collectNativeTurnDurations(result.messages);
 
   const chatMessages: ChatMessage[] = [];
   let pendingAssistant: ChatMessage | null = null;
+  let turnStartedAt: number | undefined;
+  let lastAssistantAt: number | undefined;
+  let requestedResponsePending = false;
+  let turnStats = new ClaudeTurnStats();
+  const taskToolNormalizer = new ClaudeTaskToolNormalizer();
 
-  // Merge consecutive assistant messages until an actual user message appears
+  const flushPendingAssistant = (includeDuration: boolean): void => {
+    if (pendingAssistant) {
+      const nativeDuration = pendingAssistant.assistantMessageId
+        ? nativeTurnDurations.get(pendingAssistant.assistantMessageId)
+        : undefined;
+      const inferredDuration = turnStartedAt !== undefined && lastAssistantAt !== undefined
+        && lastAssistantAt >= turnStartedAt
+        ? Math.floor((lastAssistantAt - turnStartedAt) / 1_000)
+        : undefined;
+      if (includeDuration) {
+        if (!pendingAssistant.isAutomaticResponse) {
+          pendingAssistant.durationSeconds = nativeDuration !== undefined ? Math.floor(nativeDuration / 1000) : inferredDuration;
+        }
+        pendingAssistant.completedAt = lastAssistantAt;
+        pendingAssistant.turnStats = turnStats.finish(turnStartedAt, lastAssistantAt);
+      }
+      chatMessages.push(pendingAssistant);
+    }
+    pendingAssistant = null;
+    lastAssistantAt = undefined;
+    turnStartedAt = undefined;
+    requestedResponsePending = false;
+    turnStats = new ClaudeTurnStats();
+  };
+
+  // Preserve task notification boundaries without ending an unfinished requested response.
   for (const sdkMsg of filteredEntries) {
+    const notification = parseTaskNotification(sdkMsg);
+    if (notification !== null) {
+      if (pendingAssistant && requestedResponsePending) {
+        pendingAssistant.contentBlocks?.push({ type: 'task_notification', content: notification });
+        continue;
+      }
+      const requestedStartedAt: number | undefined = pendingAssistant ? undefined : turnStartedAt;
+      flushPendingAssistant(true);
+      turnStartedAt = requestedStartedAt;
+      requestedResponsePending = requestedStartedAt !== undefined;
+      pendingAssistant = {
+        id: sdkMsg.uuid ?? `task-notification-${chatMessages.length}`,
+        role: 'assistant',
+        isAutomaticResponse: requestedStartedAt === undefined,
+        content: '',
+        timestamp: parseNativeTimestamp(sdkMsg.timestamp) ?? 0,
+        contentBlocks: [{ type: 'task_notification', content: notification }],
+      };
+      continue;
+    }
     if (isSystemInjectedMessage(sdkMsg)) continue;
 
     // Skip synthetic assistant messages (e.g., "No response requested." after /compact)
@@ -101,33 +209,35 @@ export async function loadSDKSessionMessages(
 
     const chatMsg = parseSDKMessageToChat(sdkMsg, toolResults);
     if (!chatMsg) continue;
+    normalizeTaskToolCalls(chatMsg, taskToolNormalizer, toolUseResults);
 
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)
       const isCompactBoundary = chatMsg.contentBlocks?.some(b => b.type === 'context_compacted');
       if (isCompactBoundary) {
-        if (pendingAssistant) {
-          chatMessages.push(pendingAssistant);
-        }
+        flushPendingAssistant(true);
         chatMessages.push(chatMsg);
-        pendingAssistant = null;
-      } else if (pendingAssistant) {
-        mergeAssistantMessage(pendingAssistant, chatMsg);
       } else {
-        pendingAssistant = chatMsg;
+        if (pendingAssistant) {
+          mergeAssistantMessage(pendingAssistant, chatMsg);
+        } else {
+          pendingAssistant = chatMsg;
+        }
+        turnStats.add(sdkMsg);
+        lastAssistantAt = parseNativeTimestamp(sdkMsg.timestamp);
+        requestedResponsePending = turnStartedAt !== undefined
+          && sdkMsg.message?.stop_reason === 'tool_use';
       }
     } else {
-      if (pendingAssistant) {
-        chatMessages.push(pendingAssistant);
-        pendingAssistant = null;
+      flushPendingAssistant(!chatMsg.isInterrupt);
+      if (isCanonicalSDKUserMessage(sdkMsg)) {
+        turnStartedAt = parseNativeTimestamp(sdkMsg.timestamp);
       }
       chatMessages.push(chatMsg);
     }
   }
 
-  if (pendingAssistant) {
-    chatMessages.push(pendingAssistant);
-  }
+  flushPendingAssistant(true);
 
   hydrateStructuredToolResults(chatMessages, toolUseResults);
   hydrateFallbackAskUserAnswers(chatMessages);
@@ -139,7 +249,7 @@ export async function loadSDKSessionMessages(
     for (const msg of chatMessages) {
       if (msg.role !== 'assistant' || !msg.toolCalls) continue;
       for (const toolCall of msg.toolCalls) {
-        if (!isSubagentToolName(toolCall.name)) continue;
+        if (!isClaudeSubagentToolName(toolCall.name)) continue;
         if (toolCall.subagent) continue;
         if (toolCall.input?.run_in_background !== true) continue;
 
@@ -188,4 +298,137 @@ export async function loadSDKSessionMessages(
   chatMessages.sort((a, b) => a.timestamp - b.timestamp);
 
   return { messages: chatMessages, skippedLines: result.skippedLines };
+}
+
+function parseNativeTimestamp(value: string | undefined): number | undefined {
+  if (typeof value !== 'string' || !value) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function collectNativeTurnDurations(
+  entries: SDKNativeMessage[],
+): Map<string, number> {
+  const durations = new Map<string, number>();
+  const entriesByUuid = new Map<string, SDKNativeMessage>();
+  for (const entry of entries) {
+    if (entry.uuid && !entriesByUuid.has(entry.uuid)) {
+      entriesByUuid.set(entry.uuid, entry);
+    }
+  }
+
+  for (const entry of entries) {
+    if (
+      entry.type !== 'system'
+      || entry.subtype !== 'turn_duration'
+      || typeof entry.parentUuid !== 'string'
+      || typeof entry.durationMs !== 'number'
+      || !Number.isFinite(entry.durationMs)
+      || entry.durationMs < 0
+    ) {
+      continue;
+    }
+    const assistantUuid = resolveTurnDurationAssistantUuid(
+      entry.parentUuid,
+      entriesByUuid,
+    );
+    if (!assistantUuid) continue;
+
+    durations.set(assistantUuid, entry.durationMs);
+  }
+  return durations;
+}
+
+function resolveTurnDurationAssistantUuid(
+  parentUuid: string,
+  entriesByUuid: ReadonlyMap<string, SDKNativeMessage>,
+): string | null {
+  const seen = new Set<string>();
+  let currentUuid: string | null = parentUuid;
+
+  while (currentUuid && !seen.has(currentUuid)) {
+    seen.add(currentUuid);
+    const entry = entriesByUuid.get(currentUuid);
+    if (!entry) return null;
+    if (entry.type === 'assistant') return currentUuid;
+    if (entry.type !== 'system') return null;
+    currentUuid = typeof entry.parentUuid === 'string'
+      ? entry.parentUuid
+      : null;
+  }
+
+  return null;
+}
+
+export function getLastSDKSessionModel(
+  entries: SDKNativeMessage[],
+  resumeAtMessageId?: string,
+): string | null {
+  const activeBranch = filterActiveBranch(entries, resumeAtMessageId);
+  if (
+    resumeAtMessageId
+    && !activeBranch.some(entry => entry.uuid === resumeAtMessageId)
+  ) {
+    return null;
+  }
+
+  let model: string | null = null;
+  for (const entry of activeBranch) {
+    const candidate = entry.type === 'assistant'
+      ? entry.message?.model?.trim()
+      : '';
+    if (candidate && candidate !== '<synthetic>') {
+      model = candidate;
+    }
+  }
+  return model;
+}
+
+export async function loadSDKSessionModel(
+  vaultPath: string,
+  sessionId: string,
+  resumeAtMessageId?: string,
+  sessionPath?: string,
+  pathContext?: ProviderHistoryPathContext,
+): Promise<string | null> {
+  const result = sessionPath
+    ? await readSDKSessionFile(sessionPath)
+    : await (pathContext
+      ? readSDKSession(vaultPath, sessionId, pathContext)
+      : readSDKSession(vaultPath, sessionId));
+  return result.error
+    ? null
+    : getLastSDKSessionModel(result.messages, resumeAtMessageId);
+}
+
+function normalizeTaskToolCalls(
+  message: ChatMessage,
+  normalizer: ClaudeTaskToolNormalizer,
+  toolUseResults: Map<string, unknown>,
+): void {
+  if (message.role !== 'assistant' || !message.toolCalls) return;
+
+  for (const toolCall of message.toolCalls) {
+    const normalizedUse = normalizer.normalizeToolUse(
+      toolCall.id,
+      toolCall.name,
+      toolCall.input,
+    );
+    if (!normalizedUse) continue;
+
+    const rawOutput = toolUseResults.get(toolCall.id);
+    const normalizedResult = toolCall.status === 'running'
+      ? null
+      : normalizer.normalizeToolResult(toolCall.id, rawOutput, {
+        fallbackContent: toolCall.result,
+        isError: toolCall.status === 'error' || toolCall.status === 'blocked',
+      });
+    const normalized = normalizedResult ?? normalizedUse;
+    toolCall.name = normalized.name;
+    toolCall.input = normalized.input;
+    toolCall.providerPayload = {
+      ...toolCall.providerPayload,
+      ...normalized.providerPayload,
+    };
+  }
 }

@@ -1,4 +1,4 @@
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 
 import {
   createThinkingBlock,
@@ -20,24 +20,18 @@ describe('ThinkingBlockRenderer', () => {
   });
 
   describe('createThinkingBlock', () => {
-    it('should show timer label', () => {
+    it('reports expansion state without rendering content itself', () => {
       const parentEl = createMockEl();
+      const onToggle = jest.fn();
+      const state = createThinkingBlock(parentEl, { onToggle });
+      const header = (state.wrapperEl as any)._children[0];
+      const clickHandlers = header._eventListeners.get('click') || [];
 
-      const state = createThinkingBlock(parentEl, mockRenderContent);
+      clickHandlers[0]();
+      clickHandlers[0]();
 
-      expect(state.labelEl.textContent).toContain('Thinking');
-    });
-
-    it('should clean up timer on finalize', () => {
-      const parentEl = createMockEl();
-
-      const state = createThinkingBlock(parentEl, mockRenderContent);
-
-      expect(state.timerInterval).not.toBeNull();
-
-      finalizeThinkingBlock(state);
-
-      expect(state.timerInterval).toBeNull();
+      expect(onToggle).toHaveBeenNthCalledWith(1, true);
+      expect(onToggle).toHaveBeenNthCalledWith(2, false);
     });
   });
 
@@ -45,7 +39,7 @@ describe('ThinkingBlockRenderer', () => {
     it('should collapse the block when finalized', () => {
       const parentEl = createMockEl();
 
-      const state = createThinkingBlock(parentEl, mockRenderContent);
+      const state = createThinkingBlock(parentEl);
 
       // Manually expand first
       state.wrapperEl.addClass('expanded');
@@ -60,21 +54,25 @@ describe('ThinkingBlockRenderer', () => {
     it('should update label with final duration', () => {
       const parentEl = createMockEl();
 
-      const state = createThinkingBlock(parentEl, mockRenderContent);
+      const state = createThinkingBlock(parentEl);
+
+      expect(state.labelEl.textContent).toContain('Thinking');
+      expect(state.timerInterval).not.toBeNull();
 
       // Advance time by 5 seconds
       jest.advanceTimersByTime(5000);
 
       const duration = finalizeThinkingBlock(state);
 
-      expect(duration).toBeGreaterThanOrEqual(5);
-      expect(state.labelEl.textContent).toContain('Thought for');
+      expect(duration).toBe(5);
+      expect(state.labelEl.textContent).toBe('Thought for 5s');
+      expect(state.timerInterval).toBeNull();
     });
 
     it('should sync isExpanded state so toggle works correctly after finalize', () => {
       const parentEl = createMockEl();
 
-      const state = createThinkingBlock(parentEl, mockRenderContent);
+      const state = createThinkingBlock(parentEl);
       const header = (state.wrapperEl as any)._children[0];
 
       // Expand the block
@@ -82,10 +80,12 @@ describe('ThinkingBlockRenderer', () => {
       clickHandlers[0]();
       expect(state.isExpanded).toBe(true);
       expect((state.wrapperEl as any).hasClass('expanded')).toBe(true);
+      expect(header.getAttribute('aria-expanded')).toBe('true');
 
       // Finalize (which collapses)
       finalizeThinkingBlock(state);
       expect(state.isExpanded).toBe(false);
+      expect(header.getAttribute('aria-expanded')).toBe('false');
       expect((state.wrapperEl as any).hasClass('expanded')).toBe(false);
 
       // Now click once - should expand (not require two clicks)
@@ -93,22 +93,6 @@ describe('ThinkingBlockRenderer', () => {
       expect(state.isExpanded).toBe(true);
       expect((state.wrapperEl as any).hasClass('expanded')).toBe(true);
       expect((state.contentEl as any).hasClass('claudian-hidden')).toBe(false);
-    });
-
-    it('should update aria-expanded on finalize', () => {
-      const parentEl = createMockEl();
-
-      const state = createThinkingBlock(parentEl, mockRenderContent);
-      const header = (state.wrapperEl as any)._children[0];
-
-      // Expand first
-      const clickHandlers = header._eventListeners.get('click') || [];
-      clickHandlers[0]();
-      expect(header.getAttribute('aria-expanded')).toBe('true');
-
-      // Finalize
-      finalizeThinkingBlock(state);
-      expect(header.getAttribute('aria-expanded')).toBe('false');
     });
   });
 
@@ -118,7 +102,7 @@ describe('ThinkingBlockRenderer', () => {
 
       const wrapperEl = renderStoredThinkingBlock(parentEl, 'thinking content', 10, mockRenderContent);
 
-      expect(wrapperEl).toBeDefined();
+      expect(wrapperEl.querySelector('.claudian-thinking-label')?.textContent).toBe('Thought for 10s');
     });
   });
 });

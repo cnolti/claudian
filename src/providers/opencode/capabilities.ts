@@ -2,15 +2,15 @@ import type { ProviderCapabilities } from '../../core/providers/types';
 
 export const OPENCODE_PROVIDER_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   providerId: 'opencode',
-  supportsPersistentRuntime: true,
+  supportsResponseThroughput: true,
   supportsNativeHistory: true,
-  supportsPlanMode: true,
+  supportsEphemeralSessions: true,
   supportsRewind: false,
-  supportsFork: false,
+  supportsFork: true,
+  supportsEphemeralFork: false,
+  forkMode: 'full-session',
   supportsProviderCommands: true,
   supportsImageAttachments: true,
-  supportsInstructionMode: true,
-  supportsMcpTools: false,
   supportsTurnSteer: false,
   reasoningControl: 'effort',
 });

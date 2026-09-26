@@ -1,6 +1,5 @@
 import type { SDKMessage, SDKResultError } from '@anthropic-ai/claude-agent-sdk';
 
-import type { AsyncSubagentCompletion } from '../../../core/runtime/types';
 import type { SDKToolUseResult, StreamChunk, UsageInfo } from '../../../core/types';
 import {
   CLAUDE_MODEL_TIER_PATTERN,
@@ -11,12 +10,18 @@ import {
 import { isBlockedMessage } from '../sdk/messages';
 import { extractToolResultContent } from '../sdk/toolResultContent';
 import type { ClaudeAsyncSubagentCompletionEvent, TransformEvent } from '../sdk/types';
-import { isDefaultClaudeModel, resolveContextWindowSize } from '../types/models';
+import { isDefaultClaudeModel } from '../types/models';
 import { createTransformStreamState, type TransformStreamState } from './toolInputStreamState';
 
 type ToolUseFields = { id: string; name: string; input: Record<string, unknown> };
-type ToolResultFields = { id: string; content: string; isError?: boolean; toolUseResult?: SDKToolUseResult };
-type AsyncSubagentCompletionStatus = AsyncSubagentCompletion['status'];
+type ToolResultFields = {
+  id: string;
+  content: string;
+  isError?: boolean;
+  isBlocked?: boolean;
+  toolUseResult?: SDKToolUseResult;
+};
+type AsyncSubagentCompletionStatus = ClaudeAsyncSubagentCompletionEvent['status'];
 
 export { createTransformStreamState };
 
@@ -82,12 +87,10 @@ function transformTaskNotification(message: SDKMessage): ClaudeAsyncSubagentComp
 }
 
 export interface TransformOptions {
-  /** The intended model from settings/query (used for context window size). */
+  /** The intended model from settings/query (used to match reported context windows). */
   intendedModel?: string;
-  /** Custom context limits from settings (model ID → tokens). */
-  customContextLimits?: Record<string, number>;
-  /** Context window reported by the active provider runtime. */
-  authoritativeContextWindow?: number;
+  /** Context window reported by the active provider runtime for the intended model. */
+  reportedContextWindow?: number;
   /** Tracks active streamed tool blocks so input_json_delta can be normalized. */
   streamState?: TransformStreamState;
   /** Tracks prompt-token usage across Anthropic-compatible stream events. */
@@ -322,23 +325,33 @@ function samePromptUsage(a: PromptUsageSnapshot, b: PromptUsageSnapshot): boolea
 
 function buildUsageInfo(promptUsage: PromptUsageSnapshot, options?: TransformOptions): UsageInfo {
   const model = options?.intendedModel ?? 'sonnet';
-  const contextWindowResolution = resolveContextWindowSize(
-    model,
-    options?.customContextLimits,
-    options?.authoritativeContextWindow,
-  );
-  const { contextWindow } = contextWindowResolution;
-  const percentage = Math.min(100, Math.max(0, Math.round((promptUsage.contextTokens / contextWindow) * 100)));
-
-  return {
+  return withReportedContextWindow({
     model,
     inputTokens: promptUsage.inputTokens,
     cacheCreationInputTokens: promptUsage.cacheCreationInputTokens,
     cacheReadInputTokens: promptUsage.cacheReadInputTokens,
-    contextWindow,
-    ...(contextWindowResolution.source === 'runtime' ? { contextWindowIsAuthoritative: true } : {}),
+    contextWindow: 0,
     contextTokens: promptUsage.contextTokens,
-    percentage,
+    percentage: 0,
+  }, options?.reportedContextWindow);
+}
+
+/** Raw usage carries only a valid reported window; anything else becomes 0 (unknown). */
+export function withReportedContextWindow(
+  usage: UsageInfo,
+  reportedContextWindow?: number,
+): UsageInfo {
+  const contextWindow = typeof reportedContextWindow === 'number'
+    && Number.isFinite(reportedContextWindow)
+    && reportedContextWindow > 0
+    ? reportedContextWindow
+    : 0;
+  return {
+    ...usage,
+    contextWindow,
+    percentage: contextWindow > 0
+      ? Math.min(100, Math.max(0, Math.round((usage.contextTokens / contextWindow) * 100)))
+      : 0,
   };
 }
 
@@ -404,7 +417,6 @@ export function* transformSDKMessage(
         yield {
           type: 'session_init',
           sessionId: message.session_id,
-          agents: message.agents,
           permissionMode: message.permissionMode,
         };
       } else if (message.subtype === 'compact_boundary') {
@@ -414,6 +426,13 @@ export function* transformSDKMessage(
         if (notification) {
           yield notification;
         }
+      } else if (message.subtype === 'permission_denied') {
+        yield emitToolResult(message.agent_id ?? null, {
+          id: message.tool_use_id,
+          content: message.message,
+          isError: true,
+          isBlocked: true,
+        });
       }
       break;
 
@@ -585,14 +604,6 @@ export function* transformSDKMessage(
         }
         options.usageState.clear();
       }
-      if (isResultError(message)) {
-        const content = message.errors.filter((e) => e.trim().length > 0).join('\n');
-        yield {
-          type: 'error',
-          content: content || `Result error: ${message.subtype}`,
-        };
-      }
-
       // Usage is now extracted from assistant messages for accuracy (excludes subagent tokens)
       // Result message usage is aggregated across main + subagents, causing inaccurate spikes
 
@@ -602,6 +613,13 @@ export function* transformSDKMessage(
         if (selectedEntry) {
           yield { type: 'context_window', contextWindow: selectedEntry.contextWindow };
         }
+      }
+      if (isResultError(message)) {
+        const content = message.errors.filter((e) => e.trim().length > 0).join('\n');
+        yield {
+          type: 'error',
+          content: content || `Result error: ${message.subtype}`,
+        };
       }
       break;
 

@@ -1,33 +1,10 @@
-# Claude Provider
+# Claude constraints
 
-`src/providers/claude/` wraps `@anthropic-ai/claude-agent-sdk` behind `ChatRuntime` and layers Claude Code CLI compatibility around it.
-
-## Ownership
-
-- Runtime lifecycle, prompt encoding, stream transforms, history hydration, CLI resolution, plugin discovery, agent discovery, MCP storage, settings UI, and Claude-specific storage live here.
-- Shared feature code should consume Claude behavior through core contracts and registries.
-
-## Design Rules
-
-- Keep the persistent SDK query alive across turns when possible. Update model, permission mode, MCP servers, and effort through SDK calls.
-- Restart the persistent query when the effective system prompt, disabled-tool set, plugin set, settings source set, CLI path, Chrome enablement, or external context paths change.
-- Do not duplicate assistant text. The SDK can emit text incrementally and again in the final assistant message; stream handling must preserve the existing dedupe behavior.
-- Token usage is intentionally merged from assistant and result messages. Assistant messages provide accurate input-side counts; result messages provide authoritative context-window data.
-- `createCustomSpawnFunction()` handles Obsidian/Electron process quirks. Preserve full-path `node` resolution and manual abort handling.
-
-## Storage Rules
-
-- `CCSettingsStorage.save()` must merge with existing `.claude/settings.json`; Claudian only owns permissions and plugin enablement.
-- `.claude/mcp.json` has a Claude-compatible `mcpServers` namespace and a Claudian `_claudian.servers` metadata namespace. Keep them separate.
-- Plugin enabled state is dual-written to `.claude/settings.json` and `PluginManager.plugins[].enabled`. Keep both in sync.
-- Slash command IDs use reversible encoding: dashes become `-_`, slashes become `--`.
-
-## Runtime Gotchas
-
-- SDK amnesia is detected when the returned session ID differs from the resume ID. The next turn injects full conversation history unless this is the first `session_init` after a fork.
-- Crash recovery retries once only when the previous send produced no chunks.
-- Auto-triggered SDK turns can arrive without a registered handler; they buffer until the result event.
-- `MessageChannel` coalesces text-only queued messages and keeps only one queued attachment message.
-- Claude session files are tree-structured. Branch filtering must preserve the canonical branch plus relevant sibling tool results.
-- `EnterPlanMode` does not hit `canUseTool`; `ExitPlanMode` does.
-- Context-window selection must handle multi-model runs by exact model match first, then family match, and null on ambiguity.
+- Preserve a live SDK query across turns when native setters suffice. Prompt/tool/plugin/settings-source/launch changes require restart without losing intended binding.
+- Native incremental and final assistant messages can duplicate text. Deduplicate them while merging assistant input usage with result context-window information; multi-model context selection must return unknown on ambiguity.
+- Resolve Node-backed launches through the full Node executable path when available. Handle abort manually: Obsidian's cross-realm `AbortSignal` cannot safely be passed to Node spawn.
+- Native Claude owns plugin installation and enablement. Plugin discovery is read-only; permission approvals use SDK permission updates rather than rewriting native settings.
+- Native Claude owns MCP setup/authentication/health. Only initialization's legacy cleanup may touch the obsolete `.claude/mcp.json`; never read, inject, or migrate it elsewhere.
+- Resolve native history through configured Claude home, not hardcoded default paths. Branch replay must retain relevant sibling tool results.
+- Missing authoritative checkpoint/latest-segment model evidence cannot fall back to an older segment or make a recovery-only locator resumable.
+- A returned session differing from the resume target triggers history recovery, except initial fork session initialization. Crash retry is allowed only before any output chunk; late automatic turns may arrive without a handler.

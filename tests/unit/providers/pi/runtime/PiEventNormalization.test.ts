@@ -1,16 +1,17 @@
 import {
   createPiEventNormalizationState,
-  normalizePiRpcEvent,
+  getPiTerminalErrorMessage,
+  normalizePiRPCEvent,
 } from '@/providers/pi/normalizations/piEventNormalization';
 
 describe('Pi event normalization', () => {
   it('normalizes text and thinking deltas', () => {
     const state = createPiEventNormalizationState();
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       assistantMessageEvent: { text_delta: 'hello' },
       type: 'message_update',
     }, state)).toEqual([{ type: 'text', content: 'hello' }]);
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       assistantMessageEvent: { thinking_delta: 'hmm' },
       type: 'message_update',
     }, state)).toEqual([{ type: 'thinking', content: 'hmm' }]);
@@ -18,7 +19,7 @@ describe('Pi event normalization', () => {
 
   it('dedupes tool use and maps output/result chunks', () => {
     const state = createPiEventNormalizationState();
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       id: 'tool-1',
       input: { path: 'a.md' },
       name: 'read',
@@ -29,18 +30,18 @@ describe('Pi event normalization', () => {
       name: 'Read',
       type: 'tool_use',
     }]);
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       id: 'tool-1',
       input: { path: 'a.md' },
       name: 'read',
       type: 'tool_execution_start',
     }, state)).toEqual([]);
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       id: 'tool-1',
       partialResult: { content: [{ text: 'partial', type: 'text' }] },
       type: 'tool_execution_update',
     }, state)).toEqual([{ id: 'tool-1', content: 'partial', type: 'tool_output' }]);
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       id: 'tool-1',
       result: { content: [{ text: 'done', type: 'text' }] },
       type: 'tool_execution_end',
@@ -56,7 +57,7 @@ describe('Pi event normalization', () => {
   it('normalizes Pi RPC toolName and args to shared renderer tool shapes', () => {
     const state = createPiEventNormalizationState();
 
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       args: { command: 'pwd' },
       toolCallId: 'bash-1',
       toolName: 'bash',
@@ -68,7 +69,7 @@ describe('Pi event normalization', () => {
       type: 'tool_use',
     }]);
 
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       args: { pattern: 'src/**/*.ts' },
       toolCallId: 'find-1',
       toolName: 'find',
@@ -81,10 +82,38 @@ describe('Pi event normalization', () => {
     }]);
   });
 
+  it('maps Pi web extension tools to shared renderer names', () => {
+    const state = createPiEventNormalizationState();
+
+    expect(normalizePiRPCEvent({
+      args: { count: 5, query: 'provider protocol' },
+      toolCallId: 'web-search-1',
+      toolName: 'web_search',
+      type: 'tool_execution_start',
+    }, state)).toEqual([{
+      id: 'web-search-1',
+      input: { count: 5, query: 'provider protocol' },
+      name: 'WebSearch',
+      type: 'tool_use',
+    }]);
+
+    expect(normalizePiRPCEvent({
+      args: { url: 'https://example.com/reference' },
+      toolCallId: 'web-fetch-1',
+      toolName: 'web_fetch',
+      type: 'tool_execution_start',
+    }, state)).toEqual([{
+      id: 'web-fetch-1',
+      input: { url: 'https://example.com/reference' },
+      name: 'WebFetch',
+      type: 'tool_use',
+    }]);
+  });
+
   it('preserves Pi write/edit result payloads for diff extraction', () => {
     const state = createPiEventNormalizationState();
 
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       args: { content: 'new text', path: 'notes/a.md' },
       toolCallId: 'write-1',
       toolName: 'write',
@@ -96,7 +125,7 @@ describe('Pi event normalization', () => {
       type: 'tool_use',
     }]);
 
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       isError: false,
       result: {
         content: [{ text: 'Edited notes/a.md', type: 'text' }],
@@ -119,8 +148,8 @@ describe('Pi event normalization', () => {
 
   it('maps compaction and extension errors', () => {
     const state = createPiEventNormalizationState();
-    expect(normalizePiRpcEvent({ type: 'compaction_end' }, state)).toEqual([{ type: 'context_compacted' }]);
-    expect(normalizePiRpcEvent({ error: 'extension failed', type: 'extension_error' }, state)).toEqual([{
+    expect(normalizePiRPCEvent({ type: 'compaction_end' }, state)).toEqual([{ type: 'context_compacted' }]);
+    expect(normalizePiRPCEvent({ error: 'extension failed', type: 'extension_error' }, state)).toEqual([{
       content: 'extension failed',
       level: 'warning',
       type: 'notice',
@@ -130,18 +159,30 @@ describe('Pi event normalization', () => {
   it('surfaces terminal Pi stop-reason errors', () => {
     const state = createPiEventNormalizationState();
 
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       errorMessage: 'Invalid image',
       stopReason: 'error',
       type: 'message_end',
     }, state)).toEqual([{ type: 'error', content: 'Invalid image' }]);
 
-    expect(normalizePiRpcEvent({
+    expect(normalizePiRPCEvent({
       assistant_message_event: {
         error_message: 'Authentication failed',
         stop_reason: 'error',
       },
       type: 'turn_end',
     }, state)).toEqual([{ type: 'error', content: 'Authentication failed' }]);
+  });
+
+  it('reads terminal errors from the native Pi message payload', () => {
+    expect(getPiTerminalErrorMessage({
+      message: {
+        content: [],
+        errorMessage: 'OpenRouter quota exceeded',
+        role: 'assistant',
+        stopReason: 'error',
+      },
+      type: 'message_end',
+    })).toBe('OpenRouter quota exceeded');
   });
 });

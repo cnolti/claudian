@@ -5,14 +5,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { isWriteEditTool } from '../../../core/tools/toolNames';
-import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo } from '../../../core/types';
+import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo, TurnStats } from '../../../core/types';
+import { createTurnStats, isTokenCount } from '../../../core/types';
+import { extractUserQuery } from '../../../utils/context';
 import { extractDiffData } from '../../../utils/diff';
 import { buildImageAttachmentFromBase64 } from '../../../utils/imageAttachment';
+import { encodePiModelId } from '../models';
 import {
   extractPiToolTextContent,
   normalizePiToolInput,
   normalizePiToolName,
 } from '../normalizations/piToolNormalization';
+import { decodePiRecoveryPrompt } from './PiRecoveryPromptCodec';
 
 export interface PiSessionEntry {
   id?: string;
@@ -30,6 +34,7 @@ export interface ParsedPiSessionEntries {
 export interface ParsePiSessionContentOptions {
   leafEntryId?: string;
   requireLeafEntryId?: boolean;
+  syntheticIdNamespace?: string;
 }
 
 export interface CreatePiForkSessionFileOptions {
@@ -46,6 +51,17 @@ export interface CreatedPiForkSessionFile {
   sessionId: string;
 }
 
+interface PiForkRollbackOwnership {
+  flight: Promise<void> | null;
+  readonly parentSession: string;
+  readonly sessionFile: string;
+}
+
+const rollbackEligibleForkTargets = new WeakMap<
+  CreatedPiForkSessionFile,
+  PiForkRollbackOwnership
+>();
+
 export function parsePiSessionContent(
   content: string,
   options: ParsePiSessionContentOptions = {},
@@ -59,10 +75,36 @@ export function parsePiSessionContent(
     return [];
   }
 
-  return mapPiSessionEntries(resolvePiActivePath(
-    parsed.entries,
-    leafEntryId,
-  ));
+  return mapPiSessionEntries(
+    resolvePiActivePath(parsed.entries, leafEntryId),
+    options.syntheticIdNamespace,
+  );
+}
+
+export function parsePiSessionModel(
+  content: string,
+  leafEntryId?: string,
+): string | null {
+  const parsed = parsePiSessionEntries(content);
+  const persistedLeafEntryId = leafEntryId?.trim();
+  if (
+    persistedLeafEntryId
+    && !parsed.entries.some(entry => entry.id === persistedLeafEntryId)
+  ) {
+    return null;
+  }
+  const entries = resolvePiActivePath(parsed.entries, persistedLeafEntryId);
+  let selection: string | null = null;
+  for (const entry of entries) {
+    const provider = getString(entry.raw.provider)
+      ?? getString(entry.message?.provider);
+    const modelId = getString(entry.raw.modelId)
+      ?? getString(entry.message?.model);
+    if (provider && modelId) {
+      selection = encodePiModelId(provider, modelId);
+    }
+  }
+  return selection;
 }
 
 export function parsePiSessionEntries(content: string): ParsedPiSessionEntries {
@@ -106,6 +148,33 @@ export function parsePiSessionEntries(content: string): ParsedPiSessionEntries {
   return { entries, header };
 }
 
+export async function readPiSessionHeader(
+  sessionFile: string,
+): Promise<Record<string, unknown> | null> {
+  const maxHeaderBytes = 64 * 1024;
+  let handle: fsp.FileHandle | null = null;
+  try {
+    handle = await fsp.open(sessionFile, 'r');
+    const buffer = Buffer.alloc(maxHeaderBytes);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const content = buffer.subarray(0, bytesRead).toString('utf8');
+    const newlineIndex = content.search(/\r?\n/);
+    if (newlineIndex === -1 && bytesRead === maxHeaderBytes) {
+      return null;
+    }
+    const firstLine = newlineIndex === -1 ? content : content.slice(0, newlineIndex);
+    const parsed = JSON.parse(firstLine) as unknown;
+    if (!isPlainObject(parsed) || getString(parsed.type) !== 'session') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 export function resolvePiActivePath(entries: PiSessionEntry[], leafId?: string): PiSessionEntry[] {
   const entriesWithIds = entries.filter((entry): entry is PiSessionEntry & { id: string } => !!entry.id);
   if (entriesWithIds.length === 0) {
@@ -137,7 +206,7 @@ export function resolvePiActivePath(entries: PiSessionEntry[], leafId?: string):
     : includePiLinearPathEntries(entries, activePath);
 }
 
-export function resolvePiEntryPath(entries: PiSessionEntry[], leafId: string): PiSessionEntry[] {
+function resolvePiEntryPath(entries: PiSessionEntry[], leafId: string): PiSessionEntry[] {
   const entriesWithIds = entries.filter((entry): entry is PiSessionEntry & { id: string } => !!entry.id);
   const byId = new Map(entriesWithIds.map(entry => [entry.id, entry] as const));
   if (!byId.has(leafId)) {
@@ -268,12 +337,37 @@ export async function createPiForkSessionFile(
   await fsp.mkdir(sessionDir, { recursive: true });
   await fsp.writeFile(sessionFile, `${lines.join('\n')}\n`, { flag: 'wx' });
 
-  return {
+  const created = {
     leafEntryId: resumeAt,
     parentSession: sourceSessionFile,
     sessionFile,
     sessionId,
   };
+  rollbackEligibleForkTargets.set(created, {
+    flight: null,
+    parentSession: sourceSessionFile,
+    sessionFile,
+  });
+  return created;
+}
+
+export async function rollbackCreatedPiForkSessionFile(
+  created: CreatedPiForkSessionFile,
+): Promise<void> {
+  const ownership = rollbackEligibleForkTargets.get(created);
+  if (!ownership) {
+    throw new Error('Pi fork rollback target is not owned by this process.');
+  }
+  if (!ownership.flight) {
+    ownership.flight = (async () => {
+      if (path.resolve(ownership.sessionFile) === path.resolve(ownership.parentSession)) {
+        throw new Error('Pi fork rollback cannot remove the source session.');
+      }
+      await fsp.unlink(ownership.sessionFile);
+      rollbackEligibleForkTargets.delete(created);
+    })();
+  }
+  return ownership.flight;
 }
 
 export function findPiSessionFile(
@@ -328,20 +422,16 @@ export function findPiSessionFileInRoot(
   return findSessionFileInRoot(root, trimmed);
 }
 
-export function derivePiSessionsRootFromSessionPath(sessionPath: string): string | null {
-  const normalized = sessionPath.trim();
-  if (!normalized) {
-    return null;
-  }
-
-  return path.dirname(normalized);
-}
-
-function mapPiSessionEntries(entries: PiSessionEntry[]): ChatMessage[] {
+function mapPiSessionEntries(
+  entries: PiSessionEntry[],
+  syntheticIdNamespace?: string,
+): ChatMessage[] {
   const messages: ChatMessage[] = [];
+  let turnStartedAt: number | undefined;
+  const stats = new PiTurnStats();
 
   for (const entry of entries) {
-    const mapped = mapPiSessionEntry(entry, messages);
+    const mapped = mapPiSessionEntry(entry, messages, syntheticIdNamespace);
     if (mapped) {
       const previous = messages[messages.length - 1];
       if (isAssistantMessageEntry(entry) && canMergeAssistantContinuation(previous, mapped)) {
@@ -349,10 +439,68 @@ function mapPiSessionEntries(entries: PiSessionEntry[]): ChatMessage[] {
       } else {
         messages.push(mapped);
       }
+
+      const nativeMessage = entry.message ?? entry.raw;
+      const turnStats = stats.add(entry);
+      if (mapped.role === 'user') {
+        turnStartedAt = parseTimestamp(nativeMessage.timestamp) ?? parseTimestamp(entry.raw.timestamp);
+      } else if (isBoundaryMessage(mapped)) {
+        turnStartedAt = undefined;
+      } else if (isAssistantMessageEntry(entry)) {
+        const stopReason = getString(nativeMessage.stopReason);
+        // Pi's inner assistant timestamp is generation start; the entry is written on completion.
+        const completedAt = parseTimestamp(entry.raw.timestamp);
+        if ((stopReason === 'stop' || stopReason === 'length')
+          && turnStartedAt !== undefined && completedAt !== undefined && completedAt >= turnStartedAt) {
+          messages[messages.length - 1].turnStats = turnStats;
+          messages[messages.length - 1].completedAt = completedAt;
+          messages[messages.length - 1].durationSeconds = Math.floor((completedAt - turnStartedAt) / 1_000);
+        }
+        if (stopReason && stopReason !== 'toolUse') turnStartedAt = undefined;
+      }
     }
   }
 
   return messages;
+}
+
+/** Account on the resolved native branch; tool results never contribute usage. */
+class PiTurnStats {
+  private startedAt: number | undefined;
+  private outputTokens: number | undefined = 0;
+
+  add(entry: PiSessionEntry): TurnStats | undefined {
+    const message = entry.message ?? entry.raw;
+    const role = getString(message.role) ?? inferRole(entry.type);
+    if (role === 'user') {
+      if (isHiddenPiRecoveryInput(message)) return undefined;
+      this.startedAt = parseTimestamp(message.timestamp) ?? parseTimestamp(entry.raw.timestamp);
+      this.outputTokens = 0;
+    } else if (entry.type === 'compaction') {
+      this.startedAt = undefined;
+    } else if (role === 'assistant') {
+      const output = getRecord(message.usage)?.output;
+      this.outputTokens = this.outputTokens !== undefined && isTokenCount(output)
+        ? this.outputTokens + output : undefined;
+      const stopReason = getString(message.stopReason);
+      const completedAt = parseTimestamp(entry.raw.timestamp);
+      const stats = (stopReason === 'stop' || stopReason === 'length')
+        && this.startedAt !== undefined && completedAt !== undefined
+        ? createTurnStats(this.outputTokens, completedAt - this.startedAt) : undefined;
+      if (stopReason && stopReason !== 'toolUse') this.startedAt = undefined;
+      return stats;
+    }
+    return undefined;
+  }
+}
+
+export function getPiTurnStats(entries: PiSessionEntry[], assistantId: string | undefined): TurnStats | undefined {
+  const stats = new PiTurnStats();
+  for (const entry of entries) {
+    const result = stats.add(entry);
+    if (assistantId && entry.id === assistantId) return result;
+  }
+  return undefined;
 }
 
 function isAssistantMessageEntry(entry: PiSessionEntry): boolean {
@@ -400,16 +548,33 @@ function mergeAssistantContinuation(target: ChatMessage, source: ChatMessage): v
 function mapPiSessionEntry(
   entry: PiSessionEntry,
   messages: ChatMessage[],
+  syntheticIdNamespace?: string,
 ): ChatMessage | null {
   const message = entry.message ?? entry.raw;
   const role = getString(message.role) ?? inferRole(entry.type);
   const timestamp = getTimestamp(message.timestamp ?? entry.raw.timestamp);
 
   if (role === 'user') {
-    const images = extractUserImages(message.content ?? message.parts ?? message.blocks, entry.id ?? `pi-user-${messages.length}`);
+    const rawContent = extractTextContent(message.content ?? message.text ?? message.message);
+    const recoveryPrompt = decodePiRecoveryPrompt(rawContent);
+    const content = recoveryPrompt?.currentInput ?? (recoveryPrompt ? '' : rawContent);
+    const displayContent = extractPiSkillDisplayContent(content);
+    const messageId = entry.id ?? createSyntheticPiMessageId(
+      'user',
+      messages.length,
+      syntheticIdNamespace,
+    );
+    const images = extractUserImages(
+      message.content ?? message.parts ?? message.blocks,
+      messageId,
+    );
+    if (isHiddenPiRecoveryInput(message, images.length > 0)) {
+      return null;
+    }
     return {
-      content: extractTextContent(message.content ?? message.text ?? message.message),
-      id: entry.id ?? `pi-user-${messages.length}`,
+      content,
+      ...(displayContent ? { displayContent } : {}),
+      id: messageId,
       ...(images.length > 0 ? { images } : {}),
       role: 'user',
       timestamp,
@@ -429,7 +594,11 @@ function mapPiSessionEntry(
       assistantMessageId: entry.id,
       content: text,
       ...(contentBlocks.length > 0 ? { contentBlocks } : {}),
-      id: entry.id ?? `pi-assistant-${messages.length}`,
+      id: entry.id ?? createSyntheticPiMessageId(
+        'assistant',
+        messages.length,
+        syntheticIdNamespace,
+      ),
       role: 'assistant',
       timestamp,
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
@@ -445,7 +614,11 @@ function mapPiSessionEntry(
     return {
       content: '',
       contentBlocks: [{ type: 'context_compacted' }],
-      id: entry.id ?? `pi-compaction-${messages.length}`,
+      id: entry.id ?? createSyntheticPiMessageId(
+        'compaction',
+        messages.length,
+        syntheticIdNamespace,
+      ),
       role: 'assistant',
       timestamp,
     };
@@ -462,13 +635,42 @@ function mapPiSessionEntry(
     return {
       content,
       contentBlocks: [{ type: 'text', content }],
-      id: entry.id ?? `pi-notice-${messages.length}`,
+      id: entry.id ?? createSyntheticPiMessageId(
+        'notice',
+        messages.length,
+        syntheticIdNamespace,
+      ),
       role: 'assistant',
       timestamp,
     };
   }
 
   return null;
+}
+
+function isHiddenPiRecoveryInput(message: Record<string, unknown>, hasImages?: boolean): boolean {
+  const content = extractTextContent(message.content ?? message.text ?? message.message);
+  if (decodePiRecoveryPrompt(content)?.currentInput !== null) return false;
+  return !(hasImages ?? (extractUserImages(message.content ?? message.parts ?? message.blocks, 'recovery').length > 0));
+}
+
+function createSyntheticPiMessageId(
+  kind: string,
+  index: number,
+  namespace?: string,
+): string {
+  const localId = `pi-${kind}-${index}`;
+  return namespace ? `${namespace}:${localId}` : localId;
+}
+
+function extractPiSkillDisplayContent(content: string): string | undefined {
+  const match = content.match(
+    /^<skill name="([^"]+)" location="[^"]+">\n[\s\S]*?\n<\/skill>(?:\n\n([\s\S]+))?$/,
+  );
+  if (!match) return undefined;
+
+  const visibleArguments = match[2] ? extractUserQuery(match[2]) : '';
+  return `/skill:${match[1]}${visibleArguments ? ` ${visibleArguments}` : ''}`;
 }
 
 function extractAssistantContentBlocks(value: unknown): ContentBlock[] {
@@ -693,6 +895,10 @@ function fileExists(filePath: string): boolean {
 }
 
 function getTimestamp(value: unknown): number {
+  return parseTimestamp(value) ?? Date.now();
+}
+
+function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
   }
@@ -702,7 +908,7 @@ function getTimestamp(value: unknown): number {
       return parsed;
     }
   }
-  return Date.now();
+  return undefined;
 }
 
 function getRecord(value: unknown): Record<string, unknown> | null {

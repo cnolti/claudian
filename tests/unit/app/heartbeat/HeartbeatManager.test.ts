@@ -1,189 +1,263 @@
+import * as nodeTimers from 'node:timers';
+
+import { testDate } from '@test/helpers/testClock';
 import * as fs from 'fs/promises';
 
-import { HeartbeatManager } from '../../../../src/app/heartbeat/HeartbeatManager';
-import type { HeartbeatState } from '../../../../src/app/heartbeat/types';
+import { HeartbeatManager } from '@/app/heartbeat/HeartbeatManager';
+import type { HeartbeatState } from '@/app/heartbeat/types';
+import type {
+  ClaudianSettings,
+  HeartbeatQueryRequest,
+  HeartbeatQueryResult,
+  HeartbeatSummary,
+} from '@/core/types';
 
-// Mock window for Node test environment
-const mockWindow = {
-  setInterval: jest.fn((fn: () => void, ms: number) => setInterval(fn, ms)),
-  clearInterval: jest.fn((id: number) => clearInterval(id)),
-  setTimeout: jest.fn((fn: () => void, ms: number) => setTimeout(fn, ms)),
-  clearTimeout: jest.fn((id: number) => clearTimeout(id)),
-};
-(global as any).window = mockWindow;
-
-// Mock dependencies
-jest.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  query: jest.fn(),
-}));
 jest.mock('fs/promises');
-jest.mock('../../../../src/providers/claude/runtime/customSpawn', () => ({
-  createCustomSpawnFunction: jest.fn(() => jest.fn()),
-}));
-jest.mock('../../../../src/providers/claude/settings', () => ({
-  getClaudeProviderSettings: jest.fn(() => ({ loadUserSettings: false })),
-}));
-jest.mock('../../../../src/core/providers/ProviderWorkspaceRegistry', () => ({
-  ProviderWorkspaceRegistry: {
-    getMcpServerManager: jest.fn(() => ({ getActiveServers: jest.fn(() => ({})) })),
-  },
-}));
-jest.mock('../../../../src/utils/env', () => ({
-  getEnhancedPath: jest.fn(() => '/usr/bin'),
-  parseEnvironmentVariables: jest.fn(() => ({})),
-  getMissingNodeError: jest.fn(() => null),
-}));
-jest.mock('../../../../src/utils/path', () => ({
-  getVaultPath: jest.fn(() => '/vault'),
-}));
 
-function makePlugin(overrides: Record<string, unknown> = {}): any {
+const mockFs = fs as jest.Mocked<typeof fs>;
+const STATE_FILE = '/vault/.agentfiles/daemon/state.json';
+const STARTUP_DELAY_MS = 30_000;
+
+if (typeof window === 'undefined') {
+  Object.assign(globalThis, { window: globalThis });
+}
+
+function atLocalTime(hours: number, minutes = 0): Date {
+  const date = testDate();
+  date.setHours(hours, minutes, 0, 0);
+  return date;
+}
+
+function makeState(overrides: Partial<HeartbeatState> = {}): HeartbeatState {
   return {
-    settings: {
-      heartbeatEnabled: true,
-      heartbeatIntervalMinutes: 30,
-      heartbeatMaxTurns: 25,
-      heartbeatModel: 'sonnet',
-      heartbeatQuietStart: '22:00',
-      heartbeatQuietEnd: '06:00',
-      heartbeatPauseOnStreaming: true,
-      ...overrides,
-    },
-    app: { vault: { adapter: { basePath: '/vault' } } },
-    getAllViews: jest.fn(() => []),
-    getResolvedProviderCliPath: jest.fn(() => '/usr/local/bin/claude'),
-    getActiveEnvironmentVariables: jest.fn(() => ''),
-    saveSettings: jest.fn(),
+    session_id: null,
+    run_count: 3,
+    total_runs: 40,
+    last_run: null,
+    last_compaction: null,
+    last_mode: 'active',
+    today: 'stale-day',
+    morning_briefing_sent_today: true,
+    evening_summary_sent_today: false,
+    recommend_resume: false,
+    started_at: null,
+    ...overrides,
   };
+}
+
+function makeSettings(overrides: Partial<ClaudianSettings> = {}): ClaudianSettings {
+  return {
+    heartbeatEnabled: true,
+    heartbeatIntervalMinutes: 30,
+    heartbeatMaxTurns: 25,
+    heartbeatModel: 'sonnet',
+    heartbeatQuietStart: '22:00',
+    heartbeatQuietEnd: '06:00',
+    heartbeatPauseOnStreaming: true,
+    ...overrides,
+  } as ClaudianSettings;
+}
+
+interface Harness {
+  manager: HeartbeatManager;
+  settings: ClaudianSettings;
+  runQuery: jest.Mock<Promise<HeartbeatQueryResult>, [HeartbeatQueryRequest]>;
+  setStreaming(value: boolean): void;
+  writtenState(): HeartbeatState | null;
+}
+
+function createHarness(options: {
+  now?: Date;
+  settings?: Partial<ClaudianSettings>;
+  state?: HeartbeatState | null;
+  result?: HeartbeatQueryResult;
+} = {}): Harness {
+  const settings = makeSettings(options.settings);
+  let streaming = false;
+  let storedState = options.state === undefined ? makeState() : options.state;
+  let lastWrite: HeartbeatState | null = null;
+
+  mockFs.readFile.mockImplementation(async (file) => {
+    if (file === STATE_FILE && storedState) return JSON.stringify(storedState);
+    throw new Error('ENOENT');
+  });
+  mockFs.readdir.mockRejectedValue(new Error('ENOENT'));
+  mockFs.mkdir.mockResolvedValue(undefined);
+  mockFs.writeFile.mockImplementation(async (file, data) => {
+    if (file === STATE_FILE) {
+      lastWrite = JSON.parse(String(data)) as HeartbeatState;
+      storedState = lastWrite;
+    }
+  });
+
+  const runQuery = jest.fn<Promise<HeartbeatQueryResult>, [HeartbeatQueryRequest]>()
+    .mockResolvedValue(options.result ?? { sessionId: 'new-session', success: true, error: null });
+  const now = options.now ?? atLocalTime(12);
+  const manager = new HeartbeatManager({
+    getSettings: () => settings,
+    getVaultPath: () => '/vault',
+    isAnyTabStreaming: () => streaming,
+    runQuery,
+    now: () => now,
+  });
+
+  return {
+    manager,
+    settings,
+    runQuery,
+    setStreaming: (value) => { streaming = value; },
+    writtenState: () => lastWrite,
+  };
+}
+
+async function flushAsyncWork(): Promise<void> {
+  for (let i = 0; i < 10; i++) {
+    // node:timers keeps the real setImmediate while Jest fakes the globals.
+    await new Promise<void>(resolve => nodeTimers.setImmediate(resolve));
+  }
+}
+
+async function runFirstBeat(harness: Harness): Promise<void> {
+  harness.manager.start();
+  await jest.advanceTimersByTimeAsync(STARTUP_DELAY_MS);
+  await flushAsyncWork();
 }
 
 describe('HeartbeatManager', () => {
   beforeEach(() => {
     jest.useFakeTimers();
+    jest.clearAllMocks();
   });
 
   afterEach(() => {
     jest.useRealTimers();
-    jest.restoreAllMocks();
   });
 
-  describe('lifecycle', () => {
-    it('should not start if heartbeat is disabled', () => {
-      const plugin = makePlugin({ heartbeatEnabled: false });
-      const manager = new HeartbeatManager(plugin);
+  it('stays disabled and never beats when the setting is off', async () => {
+    const harness = createHarness({ settings: { heartbeatEnabled: false } });
 
-      manager.start();
+    await runFirstBeat(harness);
 
-      expect(manager.getStatus()).toBe('disabled');
-    });
-
-    it('should report idle status when started and enabled', () => {
-      const plugin = makePlugin();
-      const manager = new HeartbeatManager(plugin);
-
-      // Mock: not quiet hours (default test assumes daytime)
-      jest.spyOn(Date.prototype, 'getHours').mockReturnValue(12);
-
-      manager.start();
-
-      expect(manager.getStatus()).toBe('idle');
-      manager.destroy();
-    });
-
-    it('should stop cleanly', () => {
-      const plugin = makePlugin();
-      const manager = new HeartbeatManager(plugin);
-
-      jest.spyOn(Date.prototype, 'getHours').mockReturnValue(12);
-
-      manager.start();
-      manager.stop();
-
-      // Should still be enabled in settings but timer is stopped
-      expect(plugin.settings.heartbeatEnabled).toBe(true);
-    });
+    expect(harness.manager.getStatus()).toBe('disabled');
+    expect(harness.runQuery).not.toHaveBeenCalled();
   });
 
-  describe('getStatus', () => {
-    it('should return disabled when heartbeat is off', () => {
-      const plugin = makePlugin({ heartbeatEnabled: false });
-      const manager = new HeartbeatManager(plugin);
-      expect(manager.getStatus()).toBe('disabled');
-    });
+  it('reports quiet hours across midnight and paused while a tab streams', () => {
+    expect(createHarness({ now: atLocalTime(23) }).manager.getStatus()).toBe('quiet');
+    expect(createHarness({ now: atLocalTime(5, 59) }).manager.getStatus()).toBe('quiet');
 
-    it('should return quiet during quiet hours', () => {
-      const plugin = makePlugin();
-      const manager = new HeartbeatManager(plugin);
-
-      // Mock 23:00 (within 22:00-06:00 quiet window)
-      jest.spyOn(Date.prototype, 'getHours').mockReturnValue(23);
-      jest.spyOn(Date.prototype, 'getMinutes').mockReturnValue(0);
-
-      expect(manager.getStatus()).toBe('quiet');
-    });
-
-    it('should return paused when user is streaming', () => {
-      const mockTab = { state: { isStreaming: true } };
-      const mockTabManager = { getAllTabs: () => [mockTab] };
-      const mockView = { getTabManager: () => mockTabManager };
-
-      const plugin = makePlugin();
-      plugin.getAllViews = jest.fn(() => [mockView]);
-
-      jest.spyOn(Date.prototype, 'getHours').mockReturnValue(12);
-      jest.spyOn(Date.prototype, 'getMinutes').mockReturnValue(0);
-
-      const manager = new HeartbeatManager(plugin);
-      expect(manager.getStatus()).toBe('paused');
-    });
+    const harness = createHarness({ now: atLocalTime(12) });
+    expect(harness.manager.getStatus()).toBe('idle');
+    harness.setStreaming(true);
+    expect(harness.manager.getStatus()).toBe('paused');
   });
 
-  describe('getSummary', () => {
-    it('should return default summary when no state exists', async () => {
-      (fs.readFile as jest.Mock).mockRejectedValue(new Error('ENOENT'));
-      (fs.readdir as jest.Mock).mockRejectedValue(new Error('ENOENT'));
+  it('skips beats during quiet hours', async () => {
+    const harness = createHarness({ now: atLocalTime(23) });
 
-      const plugin = makePlugin({ heartbeatEnabled: false });
-      const manager = new HeartbeatManager(plugin);
+    await runFirstBeat(harness);
 
-      const summary = await manager.getSummary();
+    expect(harness.runQuery).not.toHaveBeenCalled();
+    harness.manager.destroy();
+  });
 
-      expect(summary.status).toBe('disabled');
-      expect(summary.lastRun).toBeNull();
-      expect(summary.runCount).toBe(0);
-      expect(summary.totalRuns).toBe(0);
+  it('runs a beat and advances the daemon state', async () => {
+    const harness = createHarness();
+
+    await runFirstBeat(harness);
+
+    expect(harness.runQuery).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: '/vault',
+      model: 'sonnet',
+      maxTurns: 25,
+      resumeSessionId: null,
+    }));
+    expect(harness.runQuery.mock.calls[0][0].prompt).toContain('Modus: active');
+    expect(harness.writtenState()).toEqual(expect.objectContaining({
+      session_id: 'new-session',
+      run_count: 4,
+      total_runs: 41,
+      last_mode: 'active',
+      morning_briefing_sent_today: false,
+    }));
+    expect(harness.manager.getStatus()).toBe('idle');
+    harness.manager.destroy();
+  });
+
+  it('resumes the recommended session and resets it on compaction', async () => {
+    const resuming = createHarness({ state: makeState({ session_id: 'old', recommend_resume: true }) });
+    await runFirstBeat(resuming);
+    expect(resuming.runQuery.mock.calls[0][0].resumeSessionId).toBe('old');
+    resuming.manager.destroy();
+
+    const compacting = createHarness({
+      state: makeState({ session_id: 'old', recommend_resume: true, run_count: 30 }),
+    });
+    await runFirstBeat(compacting);
+    expect(compacting.runQuery.mock.calls[0][0].resumeSessionId).toBeNull();
+    expect(compacting.writtenState()).toEqual(expect.objectContaining({
+      session_id: null,
+      run_count: 0,
+      recommend_resume: false,
+    }));
+    compacting.manager.destroy();
+  });
+
+  it('surfaces failed beats as an error status', async () => {
+    const harness = createHarness({
+      result: { sessionId: null, success: false, error: 'error_max_turns' },
     });
 
-    it('should parse state.json correctly', async () => {
-      const state: HeartbeatState = {
-        session_id: 'abc123',
-        run_count: 7,
-        total_runs: 42,
-        last_run: '2026-02-25T14:32:00.000Z',
-        last_compaction: null,
-        last_mode: 'active',
-        today: '2026-02-25',
-        morning_briefing_sent_today: true,
-        evening_summary_sent_today: false,
-        recommend_resume: true,
-        started_at: '2026-02-25T06:00:00.000Z',
-      };
+    await runFirstBeat(harness);
 
-      (fs.readFile as jest.Mock).mockResolvedValue(JSON.stringify(state));
-      (fs.readdir as jest.Mock).mockRejectedValue(new Error('ENOENT'));
+    expect(harness.manager.getStatus()).toBe('error');
+    await expect(harness.manager.getSummary()).resolves.toEqual(expect.objectContaining({
+      status: 'error',
+      error: 'error_max_turns',
+    }));
+    harness.manager.destroy();
+  });
 
-      jest.spyOn(Date.prototype, 'getHours').mockReturnValue(12);
-      jest.spyOn(Date.prototype, 'getMinutes').mockReturnValue(0);
+  it('aborts a running beat on stop without touching the daemon state', async () => {
+    const harness = createHarness();
+    let seenSignal: AbortSignal | null = null;
+    harness.runQuery.mockImplementation(request => new Promise((resolve) => {
+      seenSignal = request.signal;
+      request.signal.addEventListener('abort', () => resolve({
+        sessionId: null,
+        success: false,
+        error: 'aborted',
+      }));
+    }));
 
-      const plugin = makePlugin();
-      const manager = new HeartbeatManager(plugin);
+    await runFirstBeat(harness);
+    expect(harness.manager.getStatus()).toBe('running');
+    harness.manager.stop();
+    await flushAsyncWork();
 
-      const summary = await manager.getSummary();
+    expect(seenSignal!.aborted).toBe(true);
+    expect(harness.writtenState()).toBeNull();
+    expect(harness.manager.getStatus()).toBe('idle');
+  });
 
-      expect(summary.runCount).toBe(7);
-      expect(summary.totalRuns).toBe(42);
-      expect(summary.lastRun).toBe('2026-02-25T14:32:00.000Z');
-      expect(summary.lastMode).toBe('active');
-    });
+  it('notifies every subscriber until it unsubscribes', async () => {
+    const harness = createHarness();
+    const first = jest.fn<void, [HeartbeatSummary]>();
+    const second = jest.fn<void, [HeartbeatSummary]>();
+    const unsubscribeFirst = harness.manager.subscribe(first);
+    harness.manager.subscribe(second);
+
+    harness.manager.start();
+    await flushAsyncWork();
+    expect(first).toHaveBeenCalledWith(expect.objectContaining({ status: 'idle', runCount: 3 }));
+    expect(second).toHaveBeenCalled();
+
+    unsubscribeFirst();
+    first.mockClear();
+    harness.manager.stop();
+    await flushAsyncWork();
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(2);
+    harness.manager.destroy();
   });
 });

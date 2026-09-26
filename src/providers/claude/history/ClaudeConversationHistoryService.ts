@@ -1,9 +1,10 @@
+import { encodeProviderModelSelectionId } from '../../../core/providers/modelSelection';
 import type {
   ProviderConversationHistoryService,
   ProviderConversationSessionAvailability,
   ProviderHistoryPathContext,
 } from '../../../core/providers/types';
-import { isSubagentToolName, TOOL_TASK } from '../../../core/tools/toolNames';
+import { TOOL_SUBAGENT } from '../../../core/tools/toolNames';
 import type {
   AsyncSubagentStatus,
   ChatMessage,
@@ -13,15 +14,22 @@ import type {
   SubagentInfo,
   ToolCallInfo,
 } from '../../../core/types';
-import { type ClaudeProviderState, getClaudeState } from '../types/providerState';
+import { isClaudeSubagentToolName } from '../subagentToolNames';
 import {
-  deleteSDKSession,
+  type ClaudeProviderState,
+  getClaudeConversationSessionIds,
+  getClaudeState,
+} from '../types/providerState';
+import {
   encodeVaultPathForSDK,
   getSDKProjectsPath,
   loadSDKSessionMessages,
+  loadSDKSessionModel,
   loadSubagentToolCalls,
   locateSDKSession,
   locateSDKSessions,
+  readLegacyConversationSessionId,
+  recoverSDKSessionIdByTime,
 } from './ClaudeHistoryStore';
 import type { SDKSessionLocation } from './sdkSessionPaths';
 
@@ -118,13 +126,13 @@ function ensureTaskToolCall(
 ): ToolCallInfo {
   msg.toolCalls = msg.toolCalls || [];
   let taskToolCall = msg.toolCalls.find(
-    tc => tc.id === subagentId && isSubagentToolName(tc.name),
+    tc => tc.id === subagentId && isClaudeSubagentToolName(tc.name),
   );
 
   if (!taskToolCall) {
     taskToolCall = {
       id: subagentId,
-      name: TOOL_TASK,
+      name: TOOL_SUBAGENT,
       input: {
         description: subagent.description,
         prompt: subagent.prompt || '',
@@ -138,6 +146,8 @@ function ensureTaskToolCall(
     msg.toolCalls.push(taskToolCall);
     return taskToolCall;
   }
+
+  taskToolCall.name = TOOL_SUBAGENT;
 
   if (!taskToolCall.input.description) {
     taskToolCall.input.description = subagent.description;
@@ -365,7 +375,7 @@ function buildPersistedSubagentData(messages: ChatMessage[]): Record<string, Sub
     if (msg.role !== 'assistant' || !msg.toolCalls) continue;
 
     for (const toolCall of msg.toolCalls) {
-      if (!isSubagentToolName(toolCall.name) || !toolCall.subagent) continue;
+      if (!isClaudeSubagentToolName(toolCall.name) || !toolCall.subagent) continue;
       result[toolCall.subagent.id] = toolCall.subagent;
     }
   }
@@ -385,27 +395,20 @@ function sanitizeProviderState(
 }
 
 export class ClaudeConversationHistoryService implements ProviderConversationHistoryService {
-  private hydratedConversationIds = new Set<string>();
-  private historyCacheKeysByConversation = new Map<string, string>();
-  private pendingSessionLocationsByConversation = new Map<
-    string,
+  // A discarded repository draft must not mark another projection hydrated.
+  private hydratedConversations = new WeakSet<Conversation>();
+  private historyCacheKeysByConversation = new WeakMap<Conversation, string>();
+  private pendingSessionLocationsByConversation = new WeakMap<
+    Conversation,
     Map<string, SDKSessionLocation>
   >();
-  private relocatedSessionPathsByConversation = new Map<string, Map<string, string>>();
+  private relocatedSessionPathsByConversation = new WeakMap<Conversation, Map<string, string>>();
 
-  private getConversationSessionIds(conversation: Conversation): string[] {
-    const state = getClaudeState(conversation.providerState);
-    if (this.isPendingForkConversation(conversation)) {
-      return [state.forkSource!.sessionId];
-    }
-
-    return [...new Set([
-      ...(state.previousProviderSessionIds || []),
-      state.providerSessionId ?? conversation.sessionId,
-    ].filter((id): id is string => !!id))];
+  #getConversationSessionIds(conversation: Conversation): string[] {
+    return getClaudeConversationSessionIds(conversation);
   }
 
-  private synchronizeHistoryCache(
+  #synchronizeHistoryCache(
     conversation: Conversation,
     vaultPath: string,
     pathContext?: ProviderHistoryPathContext,
@@ -414,17 +417,17 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     const cacheKey = JSON.stringify([
       getSDKProjectsPath(pathContext),
       encodeVaultPathForSDK(vaultPath),
-      this.getConversationSessionIds(conversation),
+      this.#getConversationSessionIds(conversation),
       conversation.resumeAtMessageId ?? null,
       state.forkSource?.resumeAt ?? null,
     ]);
-    const previousKey = this.historyCacheKeysByConversation.get(conversation.id);
+    const previousKey = this.historyCacheKeysByConversation.get(conversation);
     if (previousKey !== undefined && previousKey !== cacheKey) {
-      this.hydratedConversationIds.delete(conversation.id);
-      this.pendingSessionLocationsByConversation.delete(conversation.id);
-      this.relocatedSessionPathsByConversation.delete(conversation.id);
+      this.hydratedConversations.delete(conversation);
+      this.pendingSessionLocationsByConversation.delete(conversation);
+      this.relocatedSessionPathsByConversation.delete(conversation);
     }
-    this.historyCacheKeysByConversation.set(conversation.id, cacheKey);
+    this.historyCacheKeysByConversation.set(conversation, cacheKey);
   }
 
   async getConversationSessionAvailability(
@@ -436,37 +439,37 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     if (!vaultPath) {
       return 'unknown';
     }
-    this.synchronizeHistoryCache(conversation, vaultPath, pathContext);
+    this.#synchronizeHistoryCache(conversation, vaultPath, pathContext);
     if (!sessionId) return 'unknown';
 
     const location = await (pathContext
       ? locateSDKSession(vaultPath, sessionId, pathContext)
       : locateSDKSession(vaultPath, sessionId));
     this.pendingSessionLocationsByConversation.set(
-      conversation.id,
+      conversation,
       new Map([[sessionId, location]]),
     );
     if (location.availability === 'relocated' && location.sessionPath) {
       const relocatedSessionPaths = new Map(
-        this.relocatedSessionPathsByConversation.get(conversation.id) ?? [],
+        this.relocatedSessionPathsByConversation.get(conversation) ?? [],
       );
       relocatedSessionPaths.set(sessionId, location.sessionPath);
       this.relocatedSessionPathsByConversation.set(
-        conversation.id,
+        conversation,
         relocatedSessionPaths,
       );
     } else if (location.availability !== 'unknown') {
       const relocatedSessionPaths = new Map(
-        this.relocatedSessionPathsByConversation.get(conversation.id) ?? [],
+        this.relocatedSessionPathsByConversation.get(conversation) ?? [],
       );
       relocatedSessionPaths.delete(sessionId);
       if (relocatedSessionPaths.size > 0) {
         this.relocatedSessionPathsByConversation.set(
-          conversation.id,
+          conversation,
           relocatedSessionPaths,
         );
       } else {
-        this.relocatedSessionPathsByConversation.delete(conversation.id);
+        this.relocatedSessionPathsByConversation.delete(conversation);
       }
     }
     return location.availability;
@@ -483,7 +486,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     }
 
     await this.hydrateConversationHistory(conversation, vaultPath, pathContext);
-    if (!this.hydratedConversationIds.has(conversation.id)) {
+    if (!this.hydratedConversations.has(conversation)) {
       return false;
     }
 
@@ -519,9 +522,9 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       return 'preserve';
     }
 
-    this.synchronizeHistoryCache(conversation, vaultPath, pathContext);
+    this.#synchronizeHistoryCache(conversation, vaultPath, pathContext);
 
-    const sessionIds = this.getConversationSessionIds(conversation);
+    const sessionIds = this.#getConversationSessionIds(conversation);
     const locations = await (pathContext
       ? locateSDKSessions(vaultPath, sessionIds, pathContext)
       : locateSDKSessions(vaultPath, sessionIds));
@@ -529,9 +532,9 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       sessionId => locations.get(sessionId)?.availability !== 'missing',
     );
     if (preservedSessionIds.length === 0) {
-      this.pendingSessionLocationsByConversation.delete(conversation.id);
-      this.relocatedSessionPathsByConversation.delete(conversation.id);
-      this.hydratedConversationIds.delete(conversation.id);
+      this.pendingSessionLocationsByConversation.delete(conversation);
+      this.relocatedSessionPathsByConversation.delete(conversation);
+      this.hydratedConversations.delete(conversation);
       return 'delete';
     }
 
@@ -545,8 +548,8 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
 
     conversation.sessionId = null;
     conversation.providerState = sanitizeProviderState(state);
-    this.pendingSessionLocationsByConversation.delete(conversation.id);
-    this.hydratedConversationIds.delete(conversation.id);
+    this.pendingSessionLocationsByConversation.delete(conversation);
+    this.hydratedConversations.delete(conversation);
     return 'reset';
   }
 
@@ -591,6 +594,44 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     return sanitizeProviderState(providerState);
   }
 
+  async recoverConversationSessionReference(
+    conversation: Conversation,
+    vaultPath: string | null,
+    pathContext?: ProviderHistoryPathContext,
+  ): Promise<boolean> {
+    if (!vaultPath || this.resolveSessionIdForConversation(conversation)) {
+      return false;
+    }
+
+    const legacySessionId = await readLegacyConversationSessionId(
+      vaultPath,
+      conversation.id,
+    );
+    if (legacySessionId) {
+      conversation.providerState = sanitizeProviderState({
+        ...getClaudeState(conversation.providerState),
+        previousProviderSessionIds: [legacySessionId],
+      });
+      return true;
+    }
+
+    const fingerprint = {
+      createdAt: conversation.createdAt,
+      lastActivityAt: conversation.lastActivityAt,
+    };
+    const recoveredSessionId = pathContext
+      ? await recoverSDKSessionIdByTime(vaultPath, fingerprint, pathContext)
+      : await recoverSDKSessionIdByTime(vaultPath, fingerprint);
+    if (!recoveredSessionId) return false;
+
+    conversation.sessionId = recoveredSessionId;
+    conversation.providerState = sanitizeProviderState({
+      ...getClaudeState(conversation.providerState),
+      providerSessionId: recoveredSessionId,
+    });
+    return true;
+  }
+
   async hydrateConversationHistory(
     conversation: Conversation,
     vaultPath: string | null,
@@ -599,12 +640,15 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     if (!vaultPath) {
       return;
     }
-    this.synchronizeHistoryCache(conversation, vaultPath, pathContext);
-    if (this.hydratedConversationIds.has(conversation.id)) return;
+
+    await this.recoverConversationSessionReference(conversation, vaultPath, pathContext);
+    const allSessionIds = this.#getConversationSessionIds(conversation);
+
+    this.#synchronizeHistoryCache(conversation, vaultPath, pathContext);
+    if (this.hydratedConversations.has(conversation)) return;
 
     const state = getClaudeState(conversation.providerState);
     const isPendingFork = this.isPendingForkConversation(conversation);
-    const allSessionIds = this.getConversationSessionIds(conversation);
 
     if (allSessionIds.length === 0) {
       return;
@@ -616,12 +660,12 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
     let errorCount = 0;
     let successCount = 0;
     const relocatedSessionPaths = new Map(
-      this.relocatedSessionPathsByConversation.get(conversation.id) ?? [],
+      this.relocatedSessionPathsByConversation.get(conversation) ?? [],
     );
     const cachedLocations = new Map(
-      this.pendingSessionLocationsByConversation.get(conversation.id) ?? [],
+      this.pendingSessionLocationsByConversation.get(conversation) ?? [],
     );
-    this.pendingSessionLocationsByConversation.delete(conversation.id);
+    this.pendingSessionLocationsByConversation.delete(conversation);
     const unresolvedSessionIds = allSessionIds.filter(
       id => !relocatedSessionPaths.has(id) && !cachedLocations.has(id),
     );
@@ -635,7 +679,7 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
       }
     }
     if (relocatedSessionPaths.size > 0) {
-      this.relocatedSessionPathsByConversation.set(conversation.id, relocatedSessionPaths);
+      this.relocatedSessionPathsByConversation.set(conversation, relocatedSessionPaths);
     }
 
     const resumableSessionId = isPendingFork
@@ -709,29 +753,58 @@ export class ClaudeConversationHistoryService implements ProviderConversationHis
 
     conversation.messages = merged;
     if (errorCount === 0 && unknownSessionCount === 0) {
-      this.hydratedConversationIds.add(conversation.id);
+      this.hydratedConversations.add(conversation);
     }
   }
 
-  async deleteConversationSession(
+  hasConversationModelRecoverySource(conversation: Conversation): boolean {
+    return getClaudeConversationSessionIds(conversation).length > 0;
+  }
+
+  async recoverConversationModelSelection(
     conversation: Conversation,
     vaultPath: string | null,
     pathContext?: ProviderHistoryPathContext,
-  ): Promise<void> {
-    this.pendingSessionLocationsByConversation.delete(conversation.id);
-    this.relocatedSessionPathsByConversation.delete(conversation.id);
-    this.hydratedConversationIds.delete(conversation.id);
-    this.historyCacheKeysByConversation.delete(conversation.id);
+  ): Promise<string | null> {
+    if (!vaultPath) return null;
+
     const state = getClaudeState(conversation.providerState);
-    const sessionId = state.providerSessionId ?? conversation.sessionId;
-    if (!vaultPath || !sessionId) {
-      return;
+    const sessionIds = getClaudeConversationSessionIds(conversation);
+    if (sessionIds.length === 0) return null;
+
+    const locations = await (pathContext
+      ? locateSDKSessions(vaultPath, sessionIds, pathContext)
+      : locateSDKSessions(vaultPath, sessionIds));
+    const isPendingFork = this.isPendingForkConversation(conversation);
+    const checkpointSessionId = isPendingFork
+      ? state.forkSource!.sessionId
+      : (state.providerSessionId ?? conversation.sessionId)
+        ?? sessionIds.at(-1)
+        ?? null;
+    let model: string | null = null;
+    let resolvedAuthoritativeSegment = checkpointSessionId === null;
+
+    for (const sessionId of sessionIds) {
+      const location = locations.get(sessionId);
+      const resumeAt = sessionId === checkpointSessionId
+        ? (isPendingFork ? state.forkSource!.resumeAt : conversation.resumeAtMessageId)
+        : undefined;
+      const recovered = await loadSDKSessionModel(
+        vaultPath,
+        sessionId,
+        resumeAt,
+        location?.sessionPath,
+        pathContext,
+      );
+      if (sessionId === checkpointSessionId) {
+        if (!recovered) return null;
+        resolvedAuthoritativeSegment = true;
+      }
+      if (recovered) model = recovered;
     }
 
-    if (pathContext) {
-      await deleteSDKSession(vaultPath, sessionId, pathContext);
-    } else {
-      await deleteSDKSession(vaultPath, sessionId);
-    }
+    return model && resolvedAuthoritativeSegment
+      ? encodeProviderModelSelectionId('claude', model)
+      : null;
   }
 }

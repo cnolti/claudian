@@ -1,3 +1,4 @@
+import { formatReasoningValueLabel } from '../../../core/providers/reasoning';
 import type {
   ProviderChatUIConfig,
   ProviderPermissionModeToggleConfig,
@@ -11,7 +12,6 @@ import {
   getPiSupportedThinkingLevels,
   isPiModelSelectionId,
   PI_DEFAULT_THINKING_LEVEL,
-  PI_SYNTHETIC_MODEL_ID,
   type PiDiscoveredModel,
   type PiThinkingLevel,
 } from '../models';
@@ -20,11 +20,7 @@ import {
   updatePiProviderSettings,
 } from '../settings';
 
-const PI_MODELS: ProviderUIOption[] = [
-  { value: PI_SYNTHETIC_MODEL_ID, label: 'Pi', description: 'Configure models in settings' },
-];
 const DEFAULT_PI_REASONING_LEVELS = getPiSupportedThinkingLevels({ reasoning: true });
-const DEFAULT_CONTEXT_WINDOW = 200_000;
 const PI_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
   inactiveValue: 'normal',
   inactiveLabel: 'Read-only',
@@ -39,58 +35,23 @@ export const piChatUIConfig: ProviderChatUIConfig = {
       model.encodedId,
       buildModelOption(model, piSettings.modelAliases[model.encodedId]),
     ]));
-    const savedProviderModel = (
-      settings.savedProviderModel
-      && typeof settings.savedProviderModel === 'object'
-      && !Array.isArray(settings.savedProviderModel)
-    )
-      ? settings.savedProviderModel as Record<string, unknown>
-      : null;
-
     const options: ProviderUIOption[] = [];
     const seen = new Set<string>();
     for (const encodedId of [...piSettings.visibleModels].reverse()) {
-      pushOption(
-        options,
-        seen,
-        encodedId,
-        discoveredModels.get(encodedId)
-          ?? {
-            description: 'Configured model',
-            label: piSettings.modelAliases[encodedId] ?? formatFallbackLabel(encodedId),
-            value: encodedId,
-          },
-      );
+      const option = discoveredModels.get(encodedId);
+      if (option) pushOption(options, seen, encodedId, option);
     }
 
-    const selectedModelValues = [
-      typeof settings.model === 'string' ? settings.model : '',
-      typeof savedProviderModel?.pi === 'string' ? savedProviderModel.pi : '',
-    ];
+    return options;
+  },
 
-    for (const model of selectedModelValues) {
-      if (!model || model === PI_SYNTHETIC_MODEL_ID || !decodePiModelId(model)) {
-        continue;
-      }
-
-      pushOption(
-        options,
-        seen,
-        model,
-        discoveredModels.get(model)
-          ?? {
-            description: 'Selected in an existing session',
-            label: piSettings.modelAliases[model] ?? formatFallbackLabel(model),
-            value: model,
-          },
-      );
-    }
-
-    return options.length > 0 ? options : [...PI_MODELS];
+  getDefaultModel(settings: Record<string, unknown>): string | null {
+    const current = getPiProviderSettings(settings);
+    return current.visibleModels.find(id => current.discoveredModels.some(model => model.encodedId === id)) ?? null;
   },
 
   ownsModel(model: string): boolean {
-    return model === PI_SYNTHETIC_MODEL_ID || decodePiModelId(model) !== null;
+    return isPiModelSelectionId(model);
   },
 
   isAdaptiveReasoningModel(model: string, settings: Record<string, unknown>): boolean {
@@ -104,26 +65,16 @@ export const piChatUIConfig: ProviderChatUIConfig = {
 
   getReasoningOptions(model: string, settings: Record<string, unknown>): ProviderReasoningOption[] {
     const piModel = getCachedModel(model, settings);
+    if (piModel && !piModel.reasoning) return [];
     const levels = piModel?.thinkingLevels
       ?? (decodePiModelId(model) ? DEFAULT_PI_REASONING_LEVELS : ['off']);
     return levels.map((level) => ({
-      label: formatThinkingLevelLabel(level),
+      label: formatReasoningValueLabel(level),
       value: level,
     }));
   },
 
   getDefaultReasoningValue: getPiDefaultReasoningValue,
-
-  getContextWindowSize(
-    model: string,
-    customLimits?: Record<string, number>,
-    settings?: Record<string, unknown>,
-  ): number {
-    const metadataContextWindow = settings
-      ? getCachedModel(model, settings)?.contextWindow
-      : undefined;
-    return metadataContextWindow ?? customLimits?.[model] ?? DEFAULT_CONTEXT_WINDOW;
-  },
 
   isDefaultModel(model: string): boolean {
     return isPiModelSelectionId(model);
@@ -159,6 +110,10 @@ export const piChatUIConfig: ProviderChatUIConfig = {
     updatePiProviderSettings(settingsBag, {
       preferredThinkingByModel: nextPreferredThinkingByModel,
     });
+  },
+
+  normalizeAvailableModelSelection(model: string): string {
+    return isPiModelSelectionId(model) ? model : `pi:${model}`;
   },
 
   normalizeModelVariant(model: string): string {
@@ -253,17 +208,6 @@ function buildModelOption(model: PiDiscoveredModel, alias: string | undefined): 
     label: alias ?? model.label,
     value: model.encodedId,
   };
-}
-
-function formatFallbackLabel(encodedId: string): string {
-  const decoded = decodePiModelId(encodedId);
-  return decoded ? `${decoded.provider}/${decoded.modelId}` : 'Pi';
-}
-
-function formatThinkingLevelLabel(value: PiThinkingLevel): string {
-  return value === 'xhigh'
-    ? 'XHigh'
-    : value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function pushOption(

@@ -5,7 +5,7 @@ interface PromptContext {
   mode: string;
   needsCompaction: boolean;
   compactionThreshold: number;
-  timestamp: string;
+  now: Date;
 }
 
 export class HeartbeatPromptBuilder {
@@ -14,7 +14,7 @@ export class HeartbeatPromptBuilder {
     const totalRuns = ctx.state.total_runs + 1;
     const runsToCompaction = ctx.compactionThreshold - ctx.state.run_count;
 
-    const dayOfWeek = new Date().toLocaleDateString('de-DE', { weekday: 'long' });
+    const dayOfWeek = ctx.now.toLocaleDateString('de-DE', { weekday: 'long' });
 
     let memoryContext = '';
     if (ctx.needsCompaction) {
@@ -26,7 +26,7 @@ export class HeartbeatPromptBuilder {
       briefingNote = '\nMORNING BRIEFING: Noch nicht gesendet. Kompiliere und sende jetzt.';
     }
 
-    return `[DAEMON] Heartbeat @ ${ctx.timestamp} (${dayOfWeek})
+    return `[DAEMON] Heartbeat @ ${ctx.now.toISOString()} (${dayOfWeek})
 
 Modus: ${ctx.mode} | Run #${runCount} | Gesamt: ${totalRuns} | Session-Runs bis Compaction: ${runsToCompaction}${memoryContext}${briefingNote}
 

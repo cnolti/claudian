@@ -1,9 +1,18 @@
 import {
   DEFAULT_REASONING_VALUE,
-  resolvePreferredReasoningDefault,
 } from '../../core/providers/reasoning';
 
-export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+const PI_THINKING_LEVELS = [
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+
+export type PiThinkingLevel = typeof PI_THINKING_LEVELS[number];
 
 export interface PiDiscoveredModel {
   api?: string;
@@ -15,6 +24,7 @@ export interface PiDiscoveredModel {
   maxTokens?: number;
   provider: string;
   reasoning: boolean;
+  reasoningMetadataResolved?: boolean;
   thinkingLevels: PiThinkingLevel[];
 }
 
@@ -23,36 +33,23 @@ export interface DecodedPiModelId {
   provider: string;
 }
 
-export const PI_SYNTHETIC_MODEL_ID = 'pi';
 export const PI_MODEL_PREFIX = 'pi:';
 export const PI_DEFAULT_THINKING_LEVEL: PiThinkingLevel = DEFAULT_REASONING_VALUE;
 
-const VALID_THINKING_LEVELS = new Set<PiThinkingLevel>([
-  'off',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-]);
-
-const DEFAULT_REASONING_LEVELS: PiThinkingLevel[] = [
-  'off',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-];
+const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set(PI_THINKING_LEVELS);
+const DEFAULT_REASONING_LEVELS: PiThinkingLevel[] = PI_THINKING_LEVELS.filter(
+  level => level !== 'xhigh' && level !== 'max',
+);
 
 export function isPiModelSelectionId(model: string): boolean {
-  return model === PI_SYNTHETIC_MODEL_ID || model.startsWith(PI_MODEL_PREFIX);
+  return decodePiModelId(model) !== null;
 }
 
 export function encodePiModelId(provider: string, modelId: string): string {
   const normalizedProvider = provider.trim();
   const normalizedModelId = modelId.trim();
   if (!normalizedProvider || !normalizedModelId) {
-    return PI_SYNTHETIC_MODEL_ID;
+    return '';
   }
 
   return `${PI_MODEL_PREFIX}${normalizedProvider}/${normalizedModelId}`;
@@ -80,7 +77,7 @@ export function normalizePiThinkingLevel(value: unknown): PiThinkingLevel | null
   }
 
   const normalized = value.trim().toLowerCase();
-  return VALID_THINKING_LEVELS.has(normalized as PiThinkingLevel)
+  return VALID_THINKING_LEVELS.has(normalized)
     ? normalized as PiThinkingLevel
     : null;
 }
@@ -176,6 +173,9 @@ export function normalizePiDiscoveredModels(value: unknown): PiDiscoveredModel[]
       provider,
       reasoning,
       thinkingLevels,
+      ...(entry.reasoningMetadataResolved === false
+        || (!Array.isArray(entry.thinkingLevels) || entry.thinkingLevels.length === 0)
+        ? { reasoningMetadataResolved: false } : {}),
     });
   }
 
@@ -198,11 +198,8 @@ export function clampPiThinkingLevel(
     return normalized;
   }
 
-  if (supportedLevels.length === 0) {
-    return 'off';
-  }
-
-  return resolvePreferredReasoningDefault(supportedLevels, 'medium') as PiThinkingLevel;
+  if (!supportedLevels.some(level => level !== 'off')) return 'off';
+  return DEFAULT_REASONING_VALUE;
 }
 
 function collectExplicitThinkingLevels(record: Record<string, unknown>): Array<PiThinkingLevel | null> {
@@ -259,7 +256,7 @@ function collectThinkingLevelMapLevels(record: Record<string, unknown>): {
 }
 
 function sortThinkingLevels(levels: PiThinkingLevel[]): PiThinkingLevel[] {
-  const rank = new Map(DEFAULT_REASONING_LEVELS.concat('xhigh').map((level, index) => [level, index] as const));
+  const rank = new Map(PI_THINKING_LEVELS.map((level, index) => [level, index] as const));
   return [...levels].sort((left, right) => (rank.get(left) ?? 99) - (rank.get(right) ?? 99));
 }
 

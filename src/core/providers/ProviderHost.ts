@@ -1,10 +1,13 @@
 import type { App } from 'obsidian';
 
 import type { SharedAppStorage } from '../bootstrap/storage';
-import type { ChatRuntime } from '../runtime/ChatRuntime';
+import type {
+  ProviderExecutionLifecycleRegistry,
+  ProviderExecutionTransitionScope,
+} from '../execution';
 import type { ClaudianSettings } from '../types';
 import type { EnvironmentScope } from '../types/settings';
-import type { ProviderCliResolutionContext, ProviderId } from './types';
+import type { ProviderCLIResolutionContext, ProviderId } from './types';
 
 /**
  * Application capabilities available to provider adapters.
@@ -15,20 +18,17 @@ import type { ProviderCliResolutionContext, ProviderId } from './types';
  */
 export interface ProviderHost {
   readonly app: App;
+  readonly executionLifecycleRegistry: ProviderExecutionLifecycleRegistry;
   readonly settings: ClaudianSettings;
   readonly storage: SharedAppStorage;
   readonly manifest?: { version?: string };
 
-  saveSettings(): Promise<void>;
   mutateSettings(
     mutation: (settings: ClaudianSettings) => void | Promise<void>,
   ): Promise<void>;
   mutateSettingsConditionally(
     mutation: (settings: ClaudianSettings) => boolean | Promise<boolean>,
   ): Promise<void>;
-  loadData(): Promise<unknown>;
-  saveData(data: unknown): Promise<void>;
-  normalizeModelVariantSettings(): boolean;
 
   getActiveEnvironmentVariables(providerId: ProviderId): string;
   getEnvironmentVariablesForScope(scope: EnvironmentScope): string;
@@ -36,17 +36,24 @@ export interface ProviderHost {
   applyEnvironmentVariablesBatch(
     updates: Array<{ scope: EnvironmentScope; envText: string }>,
   ): Promise<void>;
+  /**
+   * Persists runtime inputs, their reconciled fingerprints, and any durable
+   * session-invalidation marker in one settings transaction.
+   */
+  applyProviderRuntimeSettings(
+    providerIds: ProviderId[],
+    mutation: (settings: ClaudianSettings) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ): Promise<void>;
   getResolvedProviderCliPath(
     providerId: ProviderId,
-    context?: ProviderCliResolutionContext,
-  ): string | null;
+    context?: ProviderCLIResolutionContext,
+  ): Promise<string | null>;
+  runProviderExecutionTransition<T>(
+    providerIds: ProviderId[],
+    mutation: (scope: ProviderExecutionTransitionScope) => Promise<T>,
+    parentScope?: ProviderExecutionTransitionScope,
+  ): Promise<T>;
 
-  refreshModelSelectors?(): void;
-  broadcastToActiveViewRuntimes?(
-    action: (runtime: ChatRuntime) => Promise<void> | void,
-  ): Promise<void>;
-  broadcastToAllViewRuntimes?(
-    action: (runtime: ChatRuntime) => Promise<void> | void,
-  ): Promise<void>;
-  recycleProviderRuntimes?(providerId: ProviderId): Promise<void>;
+  notifyProviderChatOptionsChanged(providerId: ProviderId): void;
 }

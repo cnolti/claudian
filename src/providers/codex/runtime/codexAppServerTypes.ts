@@ -6,27 +6,27 @@
 // JSON-RPC base
 // ---------------------------------------------------------------------------
 
-export interface JsonRpcRequest {
+export interface JSONRPCRequest {
   jsonrpc: '2.0';
   id: number;
   method: string;
   params?: unknown;
 }
 
-export interface JsonRpcNotification {
+export interface JSONRPCNotification {
   jsonrpc: '2.0';
   method: string;
   params?: unknown;
 }
 
-export interface JsonRpcResponse {
+export interface JSONRPCResponse {
   jsonrpc: '2.0';
   id: number;
   result?: unknown;
-  error?: JsonRpcError;
+  error?: JSONRPCError;
 }
 
-export interface JsonRpcError {
+export interface JSONRPCError {
   code: number;
   message: string;
   data?: unknown;
@@ -84,6 +84,7 @@ export interface GitInfo {
 
 export interface Turn {
   id: string;
+  durationMs?: number | null;
   items: ThreadItem[];
   status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
   error: TurnError | null;
@@ -109,7 +110,7 @@ export type ThreadItem =
   | ImageViewItem
   | WebSearchItem
   | CollabAgentToolCallItem
-  | McpToolCallItem
+  | MCPToolCallItem
   | DynamicToolCallItem
   | ContextCompactionItem;
 
@@ -124,7 +125,19 @@ export interface AgentMessageItem {
   id: string;
   text: string;
   phase: string;
-  memoryCitation: unknown;
+  memoryCitation: CodexMemoryCitation | null;
+}
+
+export interface CodexMemoryCitation {
+  entries: CodexMemoryCitationEntry[];
+  threadIds: string[];
+}
+
+export interface CodexMemoryCitationEntry {
+  path: string;
+  lineStart: number;
+  lineEnd: number;
+  note: string;
 }
 
 export interface PlanItem {
@@ -212,7 +225,7 @@ export interface CollabAgentToolCallItem {
   result?: unknown;
 }
 
-export interface McpToolCallItem {
+export interface MCPToolCallItem {
   type: 'mcpToolCall';
   id: string;
   server: string;
@@ -362,6 +375,7 @@ export interface ThreadStartParams {
   serviceTier?: string | null;
   baseInstructions?: string;
   experimentalRawEvents?: boolean;
+  ephemeral?: boolean;
   persistExtendedHistory?: boolean;
   sandboxPolicy?: SandboxPolicy;
   dynamicTools?: LegacyDynamicToolSpec[];
@@ -415,6 +429,10 @@ export interface ThreadStartResult {
   approvalsReviewer: string;
   sandbox: SandboxPolicy;
   reasoningEffort: string;
+}
+
+export interface ThreadReadResult {
+  thread: Thread;
 }
 
 export type SandboxPolicy =
@@ -762,6 +780,22 @@ export interface PermissionsApprovalRequest {
 export interface PermissionsApprovalResponse {
   permissions: GrantedPermissionProfile;
   scope?: PermissionGrantScope;
+}
+
+// -- MCP elicitation (mcpServer/elicitation/request) -------------------------
+
+export interface MCPElicitationRequest {
+  threadId: string;
+  turnId: string | null;
+  serverName: string;
+  mode: 'form' | 'openai/form' | 'url';
+  message: string;
+  requestedSchema?: unknown;
+}
+
+export interface MCPElicitationResponse {
+  action: 'accept' | 'decline' | 'cancel';
+  content: Record<string, unknown> | null;
 }
 
 // -- Tool request user input (item/tool/requestUserInput) --------------------

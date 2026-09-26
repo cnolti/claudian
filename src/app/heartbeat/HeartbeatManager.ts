@@ -1,56 +1,84 @@
-import type { Options } from '@anthropic-ai/claude-agent-sdk';
-import { query as agentQuery } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-import { ProviderWorkspaceRegistry } from '../../core/providers/ProviderWorkspaceRegistry';
-import type ClaudianPlugin from '../../main';
-import { createCustomSpawnFunction } from '../../providers/claude/runtime/customSpawn';
-import { getClaudeProviderSettings } from '../../providers/claude/settings';
-import { getEnhancedPath, getMissingNodeError, parseEnvironmentVariables } from '../../utils/env';
-import { getVaultPath } from '../../utils/path';
+import type {
+  ClaudianSettings,
+  HeartbeatHost,
+  HeartbeatQueryResult,
+  HeartbeatQueryRunner,
+  HeartbeatStatus,
+  HeartbeatStatusListener,
+  HeartbeatSummary,
+} from '../../core/types';
 import { loadConfig } from './HeartbeatConfig';
 import { HeartbeatPromptBuilder } from './HeartbeatPromptBuilder';
-import type { HeartbeatState, HeartbeatStatus, HeartbeatSummary } from './types';
+import type { HeartbeatState } from './types';
 
-export class HeartbeatManager {
-  private plugin: ClaudianPlugin;
+const DAEMON_DIR = '.agentfiles/daemon';
+const STARTUP_DELAY_MS = 30_000;
+const DEFAULT_COMPACTION_THRESHOLD = 30;
+
+export interface HeartbeatManagerHost {
+  getSettings(): ClaudianSettings;
+  getVaultPath(): string | null;
+  isAnyTabStreaming(): boolean;
+  runQuery: HeartbeatQueryRunner;
+  now?: () => Date;
+}
+
+function formatLocalDate(date: Date): string {
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function parseTimeToMinutes(timeStr: string, fallback: number): number {
+  const match = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return fallback;
+  return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+}
+
+export class HeartbeatManager implements HeartbeatHost {
   private intervalId: number | null = null;
   private initialTimeoutId: number | null = null;
   private isRunning = false;
   private abortController: AbortController | null = null;
   private lastError: string | null = null;
   private lastTickTime: number | null = null;
-  private cachedJournalLines: string[] | null = null;
+  private readonly listeners = new Set<HeartbeatStatusListener>();
 
-  onStatusChange?: (summary: HeartbeatSummary) => void;
+  constructor(private readonly host: HeartbeatManagerHost) {}
 
-  constructor(plugin: ClaudianPlugin) {
-    this.plugin = plugin;
+  private get settings(): ClaudianSettings {
+    return this.host.getSettings();
+  }
+
+  private now(): Date {
+    return this.host.now?.() ?? new Date();
   }
 
   start(): void {
-    if (this.intervalId) return;
-    if (!this.plugin.settings.heartbeatEnabled) return;
+    if (this.intervalId !== null) return;
+    if (!this.settings.heartbeatEnabled) return;
 
-    const intervalMs = this.plugin.settings.heartbeatIntervalMinutes * 60 * 1000;
-    this.intervalId = window.setInterval(() => this.tick(), intervalMs);
+    const intervalMs = this.settings.heartbeatIntervalMinutes * 60 * 1000;
+    this.intervalId = window.setInterval(() => void this.tick(), intervalMs);
 
-    // First heartbeat after short delay (let Obsidian finish starting)
+    // Let Obsidian finish starting before the first beat.
     this.initialTimeoutId = window.setTimeout(() => {
       this.initialTimeoutId = null;
-      this.tick();
-    }, 30_000);
+      void this.tick();
+    }, STARTUP_DELAY_MS);
 
     this.notifyStatusChange();
   }
 
   stop(): void {
-    if (this.initialTimeoutId) {
+    if (this.initialTimeoutId !== null) {
       window.clearTimeout(this.initialTimeoutId);
       this.initialTimeoutId = null;
     }
-    if (this.intervalId) {
+    if (this.intervalId !== null) {
       window.clearInterval(this.intervalId);
       this.intervalId = null;
     }
@@ -58,47 +86,41 @@ export class HeartbeatManager {
     this.notifyStatusChange();
   }
 
-  destroy(): void {
-    this.stop();
-    this.onStatusChange = undefined;
-  }
-
-  abort(): void {
-    if (this.abortController) {
-      this.abortController.abort();
-      this.abortController = null;
-    }
-  }
-
   restart(): void {
     this.stop();
     this.start();
   }
 
+  destroy(): void {
+    this.listeners.clear();
+    this.stop();
+  }
+
+  subscribe(listener: HeartbeatStatusListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
   getStatus(): HeartbeatStatus {
-    if (!this.plugin.settings.heartbeatEnabled) return 'disabled';
+    if (!this.settings.heartbeatEnabled) return 'disabled';
     if (this.lastError) return 'error';
     if (this.isRunning) return 'running';
     if (this.isQuietHours()) return 'quiet';
-    if (this.plugin.settings.heartbeatPauseOnStreaming && this.isUserStreaming()) return 'paused';
+    if (this.settings.heartbeatPauseOnStreaming && this.host.isAnyTabStreaming()) return 'paused';
     return 'idle';
   }
 
   async getSummary(): Promise<HeartbeatSummary> {
-    const vaultPath = getVaultPath(this.plugin.app);
+    const vaultPath = this.host.getVaultPath();
     const state = vaultPath ? await this.readState(vaultPath) : this.defaultState();
-    const compactionThreshold = 30;
 
     let nextHeartbeatIn: number | null = null;
-    if (this.intervalId && this.lastTickTime) {
-      const intervalMs = this.plugin.settings.heartbeatIntervalMinutes * 60 * 1000;
-      const elapsed = Date.now() - this.lastTickTime;
+    if (this.intervalId !== null && this.lastTickTime !== null) {
+      const intervalMs = this.settings.heartbeatIntervalMinutes * 60 * 1000;
+      const elapsed = this.now().getTime() - this.lastTickTime;
       nextHeartbeatIn = Math.max(0, Math.round((intervalMs - elapsed) / 60000));
-    }
-
-    // Read journal lines on demand
-    if (vaultPath) {
-      this.cachedJournalLines = await this.getLatestJournalLines(vaultPath);
     }
 
     return {
@@ -107,29 +129,27 @@ export class HeartbeatManager {
       lastMode: state.last_mode,
       runCount: state.run_count,
       totalRuns: state.total_runs,
-      runsToCompaction: compactionThreshold - state.run_count,
+      runsToCompaction: DEFAULT_COMPACTION_THRESHOLD - state.run_count,
       nextHeartbeatIn,
       error: this.lastError,
-      lastJournalLines: this.cachedJournalLines,
+      lastJournalLines: vaultPath ? await this.getLatestJournalLines(vaultPath) : null,
     };
   }
 
   private async tick(): Promise<void> {
     if (this.isRunning) return;
 
-    if (this.isQuietHours()) {
-      this.notifyStatusChange();
-      return;
-    }
-
-    if (this.plugin.settings.heartbeatPauseOnStreaming && this.isUserStreaming()) {
+    if (
+      this.isQuietHours()
+      || (this.settings.heartbeatPauseOnStreaming && this.host.isAnyTabStreaming())
+    ) {
       this.notifyStatusChange();
       return;
     }
 
     this.isRunning = true;
     this.lastError = null;
-    this.lastTickTime = Date.now();
+    this.lastTickTime = this.now().getTime();
     this.notifyStatusChange();
 
     try {
@@ -142,8 +162,13 @@ export class HeartbeatManager {
     }
   }
 
+  private abort(): void {
+    this.abortController?.abort();
+    this.abortController = null;
+  }
+
   private async executeHeartbeat(): Promise<void> {
-    const vaultPath = getVaultPath(this.plugin.app);
+    const vaultPath = this.host.getVaultPath();
     if (!vaultPath) {
       this.lastError = 'Could not determine vault path';
       return;
@@ -159,94 +184,41 @@ export class HeartbeatManager {
       mode,
       needsCompaction,
       compactionThreshold: config.compaction_threshold,
-      timestamp: new Date().toISOString(),
+      now: this.now(),
     });
 
-    let sessionId: string | null = null;
-    if (state.session_id && state.recommend_resume && !needsCompaction) {
-      sessionId = state.session_id;
+    const resumeSessionId = state.session_id && state.recommend_resume && !needsCompaction
+      ? state.session_id
+      : null;
+
+    const abortController = new AbortController();
+    this.abortController = abortController;
+    let result: HeartbeatQueryResult;
+    try {
+      result = await this.host.runQuery({
+        cwd: vaultPath,
+        prompt,
+        model: this.settings.heartbeatModel,
+        maxTurns: this.settings.heartbeatMaxTurns,
+        resumeSessionId,
+        signal: abortController.signal,
+      });
+    } finally {
+      if (this.abortController === abortController) this.abortController = null;
     }
 
-    this.abortController = new AbortController();
-    const result = await this.runQuery(vaultPath, prompt, sessionId);
-
-    // Read journal lines after heartbeat completes
-    this.cachedJournalLines = await this.getLatestJournalLines(vaultPath);
+    // stop()/unload aborted this beat: leave the daemon state untouched.
+    if (abortController.signal.aborted) return;
+    if (!result.success) this.lastError = result.error ?? 'Heartbeat query failed';
 
     await this.updateState(vaultPath, state, result, mode, needsCompaction);
   }
 
-  private async runQuery(
-    vaultPath: string,
-    prompt: string,
-    sessionId: string | null
-  ): Promise<{ sessionId: string | null; success: boolean }> {
-    const resolvedClaudePath = this.plugin.getResolvedProviderCliPath('claude');
-    if (!resolvedClaudePath) {
-      return { sessionId: null, success: false };
-    }
-
-    const customEnv = parseEnvironmentVariables(this.plugin.getActiveEnvironmentVariables('claude'));
-    const enhancedPath = getEnhancedPath(customEnv.PATH, resolvedClaudePath);
-    const missingNodeError = getMissingNodeError(resolvedClaudePath, enhancedPath);
-    if (missingNodeError) {
-      this.lastError = missingNodeError;
-      return { sessionId: null, success: false };
-    }
-
-    const options: Options = {
-      cwd: vaultPath,
-      model: this.plugin.settings.heartbeatModel,
-      abortController: this.abortController!,
-      pathToClaudeCodeExecutable: resolvedClaudePath,
-      maxTurns: this.plugin.settings.heartbeatMaxTurns,
-      env: {
-        ...process.env,
-        ...customEnv,
-        PATH: enhancedPath,
-      },
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: getClaudeProviderSettings(
-        this.plugin.settings
-      ).loadUserSettings
-        ? ['user', 'project']
-        : ['project'],
-      spawnClaudeCodeProcess: createCustomSpawnFunction(enhancedPath),
-    };
-
-    // Add Claude-provider MCP servers (calendar, paperless, whatsapp, etc.)
-    const mcpManager = ProviderWorkspaceRegistry.getMcpServerManager('claude');
-    const mcpServers = mcpManager?.getActiveServers(new Set()) ?? {};
-    if (Object.keys(mcpServers).length > 0) {
-      options.mcpServers = mcpServers;
-    }
-
-    if (sessionId) {
-      options.resume = sessionId;
-    }
-
-    let newSessionId: string | null = null;
-
-    try {
-      const response = agentQuery({ prompt, options });
-      for await (const message of response) {
-        if (message.type === 'system' && message.subtype === 'init' && message.session_id) {
-          newSessionId = message.session_id;
-        }
-      }
-      return { sessionId: newSessionId, success: true };
-    } catch (err) {
-      this.lastError = err instanceof Error ? err.message : 'Query failed';
-      return { sessionId: null, success: false };
-    }
-  }
-
   private async readState(vaultPath: string): Promise<HeartbeatState> {
-    const stateFile = path.join(vaultPath, '.agentfiles/daemon/state.json');
+    const stateFile = path.join(vaultPath, DAEMON_DIR, 'state.json');
     try {
       const content = await fs.readFile(stateFile, 'utf-8');
-      return JSON.parse(content);
+      return JSON.parse(content) as HeartbeatState;
     } catch {
       return this.defaultState();
     }
@@ -255,97 +227,67 @@ export class HeartbeatManager {
   private async updateState(
     vaultPath: string,
     oldState: HeartbeatState,
-    result: { sessionId: string | null; success: boolean },
+    result: HeartbeatQueryResult,
     mode: string,
-    compacted: boolean
+    compacted: boolean,
   ): Promise<void> {
-    // Re-read state (daemon may have modified it during the heartbeat)
+    // Re-read: the daemon agent may have rewritten state.json during the beat.
     const freshState = await this.readState(vaultPath);
+    const now = this.now();
 
     const newState: HeartbeatState = {
       ...freshState,
       session_id: compacted ? null : (result.sessionId || freshState.session_id),
       run_count: compacted ? 0 : freshState.run_count + 1,
       total_runs: freshState.total_runs + 1,
-      last_run: new Date().toISOString(),
+      last_run: now.toISOString(),
       last_mode: mode,
-      today: new Date().toISOString().split('T')[0],
+      today: formatLocalDate(now),
     };
 
     if (compacted) {
-      newState.last_compaction = new Date().toISOString();
+      newState.last_compaction = now.toISOString();
       newState.recommend_resume = false;
     }
 
-    // Day change: reset daily flags
     if (oldState.today !== newState.today) {
       newState.morning_briefing_sent_today = false;
       newState.evening_summary_sent_today = false;
     }
 
-    const stateFile = path.join(vaultPath, '.agentfiles/daemon/state.json');
-    const stateDir = path.dirname(stateFile);
-    await fs.mkdir(stateDir, { recursive: true });
+    const stateFile = path.join(vaultPath, DAEMON_DIR, 'state.json');
+    await fs.mkdir(path.dirname(stateFile), { recursive: true });
     await fs.writeFile(stateFile, JSON.stringify(newState, null, 2));
   }
 
   private async getLatestJournalLines(vaultPath: string, maxLines = 5): Promise<string[]> {
-    const journalDir = path.join(vaultPath, '.agentfiles/daemon/journal');
+    const journalDir = path.join(vaultPath, DAEMON_DIR, 'journal');
     try {
-      const files = await fs.readdir(journalDir);
-      if (files.length === 0) return [];
-
-      // Sort descending to get newest first
-      const sorted = files.filter(f => f.endsWith('.md')).sort().reverse();
-      if (sorted.length === 0) return [];
-
-      const latestFile = path.join(journalDir, sorted[0]);
-      const content = await fs.readFile(latestFile, 'utf-8');
-      const lines = content.split('\n').filter(l => l.trim());
-
-      // Return last N non-empty lines
-      return lines.slice(-maxLines);
+      const files = (await fs.readdir(journalDir)).filter(f => f.endsWith('.md')).sort();
+      const latest = files.at(-1);
+      if (!latest) return [];
+      const content = await fs.readFile(path.join(journalDir, latest), 'utf-8');
+      return content.split('\n').filter(l => l.trim()).slice(-maxLines);
     } catch {
       return [];
     }
   }
 
   private isQuietHours(): boolean {
-    const now = new Date();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
-    const currentMinutes = hour * 60 + minute;
-
-    const quietStart = this.parseTimeToMinutes(this.plugin.settings.heartbeatQuietStart, 22 * 60);
-    const quietEnd = this.parseTimeToMinutes(this.plugin.settings.heartbeatQuietEnd, 6 * 60);
+    const now = this.now();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    const quietStart = parseTimeToMinutes(this.settings.heartbeatQuietStart, 22 * 60);
+    const quietEnd = parseTimeToMinutes(this.settings.heartbeatQuietEnd, 6 * 60);
 
     if (quietStart > quietEnd) {
-      // Over midnight (e.g. 22:00 - 06:00)
+      // Window spans midnight (e.g. 22:00 - 06:00).
       return currentMinutes >= quietStart || currentMinutes < quietEnd;
     }
     return currentMinutes >= quietStart && currentMinutes < quietEnd;
   }
 
-  private parseTimeToMinutes(timeStr: string, fallback: number): number {
-    const match = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-    if (!match) return fallback;
-    return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
-  }
-
-  private isUserStreaming(): boolean {
-    for (const view of this.plugin.getAllViews()) {
-      const tabManager = view.getTabManager();
-      if (tabManager) {
-        for (const tab of tabManager.getAllTabs()) {
-          if (tab.state?.isStreaming) return true;
-        }
-      }
-    }
-    return false;
-  }
-
   private getCurrentMode(): string {
-    const hour = new Date().getHours();
+    const hour = this.now().getHours();
     if (hour >= 22 || hour < 6) return 'sleep';
     if (hour === 6) return 'dawn';
     if (hour >= 18) return 'evening';
@@ -360,7 +302,7 @@ export class HeartbeatManager {
       last_run: null,
       last_compaction: null,
       last_mode: null,
-      today: new Date().toISOString().split('T')[0],
+      today: formatLocalDate(this.now()),
       morning_briefing_sent_today: false,
       evening_summary_sent_today: false,
       recommend_resume: false,
@@ -369,11 +311,9 @@ export class HeartbeatManager {
   }
 
   private notifyStatusChange(): void {
-    if (this.onStatusChange) {
-      // Fire-and-forget async summary
-      this.getSummary().then(summary => {
-        this.onStatusChange?.(summary);
-      });
-    }
+    if (this.listeners.size === 0) return;
+    void this.getSummary().then((summary) => {
+      for (const listener of this.listeners) listener(summary);
+    }).catch(() => undefined);
   }
 }

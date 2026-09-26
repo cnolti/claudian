@@ -1,12 +1,19 @@
-import { ProviderRegistry } from '../providers/ProviderRegistry';
-import { DEFAULT_CHAT_PROVIDER_ID } from '../providers/types';
+import { mapWithConcurrency } from '../../utils/concurrency';
+import { decodeLinkedContentPathFields } from '../path/LinkedContentPath';
+import {
+  type SessionMetadataListOptions,
+  type SessionMetadataScanResult,
+} from '../providers/types';
 import type { VaultFileAdapter } from '../storage/VaultFileAdapter';
 import type {
-  Conversation,
-  ConversationMeta,
+  ConversationModelRecoverySource,
   SessionMetadata,
 } from '../types';
-import { LEGACY_SESSIONS_PATH, SESSIONS_PATH } from './StoragePaths';
+import {
+  getDeviceSessionsPath,
+  LEGACY_SESSIONS_PATH,
+  SESSIONS_PATH,
+} from './storagePaths';
 
 export {
   LEGACY_SESSIONS_PATH,
@@ -14,6 +21,37 @@ export {
 };
 
 const SAFE_METADATA_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SESSION_METADATA_READ_CONCURRENCY = 8;
+const SESSION_METADATA_PUBLISH_BATCH_SIZE = 16;
+const METADATA_SUFFIX = '.meta.json';
+
+export type SessionMetadataAuthority = 'device' | 'unscoped';
+export type SessionMetadataSource = SessionMetadataAuthority | 'legacy';
+
+export interface SessionMetadataReadResult {
+  metadata: SessionMetadata;
+  needsMigration: boolean;
+  source: SessionMetadataSource;
+}
+
+export interface SessionMetadataReadScanResult {
+  records: SessionMetadataReadResult[];
+  complete: boolean;
+  invalidMetadataCount: number;
+}
+
+export interface SessionMetadataReadOptions {
+  onBatch?: (records: SessionMetadataReadResult[]) => void;
+  batchSize?: number;
+}
+
+export interface SessionMetadataReader {
+  load(id: string): Promise<SessionMetadataReadResult | null>;
+  scan(options?: SessionMetadataReadOptions): Promise<SessionMetadataReadScanResult>;
+  loadMetadata(id: string): Promise<SessionMetadata | null>;
+  scanMetadata(options?: SessionMetadataListOptions): Promise<SessionMetadataScanResult>;
+  listMetadata(options?: SessionMetadataListOptions): Promise<SessionMetadata[]>;
+}
 
 export function isValidSessionMetadataId(id: string): boolean {
   return SAFE_METADATA_ID_PATTERN.test(id)
@@ -22,197 +60,304 @@ export function isValidSessionMetadataId(id: string): boolean {
     && !/%(?:2f|5c)/i.test(id);
 }
 
-function assertValidSessionMetadataId(id: string): void {
+export function assertValidSessionMetadataId(id: string): void {
   if (!isValidSessionMetadataId(id)) {
     throw new Error(`Invalid session metadata id: ${JSON.stringify(id)}`);
   }
 }
 
-export class SessionStorage {
-  constructor(private adapter: VaultFileAdapter) {}
+export class SessionStorage implements SessionMetadataReader {
+  private readonly deviceSessionsPath: string;
+
+  constructor(
+    private readonly adapter: VaultFileAdapter,
+    deviceKey: string,
+  ) {
+    this.deviceSessionsPath = getDeviceSessionsPath(deviceKey);
+  }
 
   getMetadataPath(id: string): string {
     assertValidSessionMetadataId(id);
-    return `${SESSIONS_PATH}/${id}.meta.json`;
+    return `${this.deviceSessionsPath}/${id}${METADATA_SUFFIX}`;
+  }
+
+  getUnscopedMetadataPath(id: string): string {
+    assertValidSessionMetadataId(id);
+    return `${SESSIONS_PATH}/${id}${METADATA_SUFFIX}`;
   }
 
   getLegacyMetadataPath(id: string): string {
     assertValidSessionMetadataId(id);
-    return `${LEGACY_SESSIONS_PATH}/${id}.meta.json`;
+    return `${LEGACY_SESSIONS_PATH}/${id}${METADATA_SUFFIX}`;
   }
 
-  async saveMetadata(metadata: SessionMetadata): Promise<void> {
-    const filePath = this.getMetadataPath(metadata.id);
-    const content = JSON.stringify(metadata, null, 2);
-    await this.adapter.write(filePath, content);
-    await this.deleteLegacyMetadataIfPresent(metadata.id);
-  }
-
-  async loadMetadata(id: string): Promise<SessionMetadata | null> {
+  async load(id: string): Promise<SessionMetadataReadResult | null> {
     if (!isValidSessionMetadataId(id)) {
       return null;
     }
-    const filePath = await this.getLoadPath(id);
 
-    try {
-      if (!filePath) {
-        return null;
-      }
-
-      const content = await this.adapter.read(filePath);
-      const metadata = JSON.parse(content) as SessionMetadata;
-      if (metadata.id !== id || !isValidSessionMetadataId(metadata.id)) {
-        return null;
-      }
-
-      if (filePath !== this.getMetadataPath(id)) {
-        await this.saveMetadata(metadata);
-      }
-
-      return metadata;
-    } catch {
-      return null;
-    }
-  }
-
-  async deleteMetadata(id: string): Promise<void> {
-    await this.adapter.delete(this.getMetadataPath(id));
-    await this.deleteLegacyMetadataIfPresent(id);
-  }
-
-  async listMetadata(): Promise<SessionMetadata[]> {
-    const metas: SessionMetadata[] = [];
-
-    const files = await this.listUniqueMetadataFiles();
-
-    for (const filePath of files) {
-      const fileId = this.getMetadataIdFromPath(filePath);
-      if (!fileId || !isValidSessionMetadataId(fileId)) {
-        continue;
-      }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const content = await this.adapter.read(filePath);
-        const raw = JSON.parse(content) as SessionMetadata;
-        if (raw.id !== fileId || !isValidSessionMetadataId(raw.id)) {
-          continue;
-        }
-        metas.push(raw);
-
-        if (filePath.startsWith(`${LEGACY_SESSIONS_PATH}/`)) {
-          await this.saveMetadata(raw);
+        const result = await this.loadOnce(id);
+        if (result || attempt === 1) {
+          return result;
         }
       } catch {
-        // Skip files that fail to load.
+        if (attempt === 1) {
+          return null;
+        }
       }
     }
-
-    return metas;
-  }
-
-  async listAllConversations(): Promise<ConversationMeta[]> {
-    const nativeMetas = await this.listMetadata();
-
-    const metas: ConversationMeta[] = nativeMetas.map((meta) => ({
-      id: meta.id,
-      providerId: meta.providerId ?? DEFAULT_CHAT_PROVIDER_ID,
-      title: meta.title,
-      createdAt: meta.createdAt,
-      updatedAt: meta.updatedAt,
-      lastResponseAt: meta.lastResponseAt,
-      messageCount: 0,
-      preview: 'SDK session',
-      titleGenerationStatus: meta.titleGenerationStatus,
-    }));
-
-    return metas.sort((a, b) =>
-      (b.lastResponseAt ?? b.createdAt) - (a.lastResponseAt ?? a.createdAt)
-    );
-  }
-
-  toSessionMetadata(conversation: Conversation): SessionMetadata {
-    const historyService = ProviderRegistry.getConversationHistoryService(conversation.providerId);
-    const providerState = historyService.buildPersistedProviderState
-      ? historyService.buildPersistedProviderState(conversation)
-      : conversation.providerState;
-
-    return {
-      id: conversation.id,
-      providerId: conversation.providerId,
-      title: conversation.title,
-      titleGenerationStatus: conversation.titleGenerationStatus,
-      createdAt: conversation.createdAt,
-      updatedAt: conversation.updatedAt,
-      lastResponseAt: conversation.lastResponseAt,
-      sessionId: conversation.sessionId,
-      selectedModel: conversation.selectedModel,
-      providerState: providerState && Object.keys(providerState).length > 0 ? providerState : undefined,
-      currentNote: conversation.currentNote,
-      externalContextPaths: conversation.externalContextPaths,
-      enabledMcpServers: conversation.enabledMcpServers,
-      usage: conversation.usage,
-      resumeAtMessageId: conversation.resumeAtMessageId,
-    };
-  }
-
-  private async getLoadPath(id: string): Promise<string | null> {
-    const filePath = this.getMetadataPath(id);
-    if (await this.adapter.exists(filePath)) {
-      return filePath;
-    }
-
-    const legacyFilePath = this.getLegacyMetadataPath(id);
-    if (await this.adapter.exists(legacyFilePath)) {
-      return legacyFilePath;
-    }
-
     return null;
   }
 
-  private async deleteLegacyMetadataIfPresent(id: string): Promise<void> {
-    const legacyFilePath = this.getLegacyMetadataPath(id);
-    if (await this.adapter.exists(legacyFilePath)) {
-      await this.adapter.delete(legacyFilePath);
+  private async loadOnce(id: string): Promise<SessionMetadataReadResult | null> {
+    const candidates = [
+      { path: this.getMetadataPath(id), source: 'device' },
+      { path: this.getUnscopedMetadataPath(id), source: 'unscoped' },
+      { path: this.getLegacyMetadataPath(id), source: 'legacy' },
+    ] as const;
+    for (const { path, source } of candidates) {
+      if (await this.adapter.exists(path)) return this.readMetadata(path, id, source);
     }
+    return null;
   }
 
-  private async listUniqueMetadataFiles(): Promise<string[]> {
-    const preferredFiles = await this.listMetadataFiles(SESSIONS_PATH);
-    const fallbackFiles = await this.listMetadataFiles(LEGACY_SESSIONS_PATH);
-    const filesByName = new Map<string, string>();
+  async loadMetadata(id: string): Promise<SessionMetadata | null> {
+    return (await this.load(id))?.metadata ?? null;
+  }
 
-    for (const filePath of preferredFiles) {
-      filesByName.set(this.getFileName(filePath), filePath);
+  async scan(
+    options: SessionMetadataReadOptions = {},
+  ): Promise<SessionMetadataReadScanResult> {
+    const deviceListing = await this.listFiles(this.deviceSessionsPath);
+    if (!deviceListing.complete) {
+      return {
+        records: [],
+        complete: false,
+        invalidMetadataCount: 0,
+      };
     }
 
-    for (const filePath of fallbackFiles) {
-      const fileName = this.getFileName(filePath);
-      if (!filesByName.has(fileName)) {
-        filesByName.set(fileName, filePath);
+    const unscopedListing = await this.listFiles(SESSIONS_PATH);
+    if (!unscopedListing.complete) {
+      return {
+        records: [],
+        complete: false,
+        invalidMetadataCount: 0,
+      };
+    }
+    const legacyListing = await this.listFiles(LEGACY_SESSIONS_PATH);
+    let complete = legacyListing.complete;
+    let invalidMetadataCount = 0;
+    const filesById = new Map<string, { path: string; source: SessionMetadataSource }>();
+    for (const [listing, source] of [
+      [deviceListing, 'device'],
+      [unscopedListing, 'unscoped'],
+      [legacyListing, 'legacy'],
+    ] as const) {
+      for (const [id, path] of this.indexPathsById(listing.files, METADATA_SUFFIX)) {
+        if (!filesById.has(id)) filesById.set(id, { path, source });
       }
     }
 
-    return Array.from(filesByName.values());
+    const pendingBatch: SessionMetadataReadResult[] = [];
+    const batchSize = Math.max(
+      1,
+      options.batchSize ?? SESSION_METADATA_PUBLISH_BATCH_SIZE,
+    );
+    const publish = (record: SessionMetadataReadResult): void => {
+      if (!options.onBatch) return;
+      pendingBatch.push(record);
+      if (pendingBatch.length >= batchSize) {
+        options.onBatch(pendingBatch.splice(0, pendingBatch.length));
+      }
+    };
+    const entries = [...filesById.entries()];
+    const records = await mapWithConcurrency(
+      entries,
+      async ([id, entry]) => {
+        let record: SessionMetadataReadResult | null;
+        try {
+          record = await this.readMetadata(entry.path, id, entry.source);
+        } catch {
+          complete = false;
+          return null;
+        }
+        if (!record) {
+          invalidMetadataCount += 1;
+          return null;
+        }
+        publish(record);
+        return record;
+      },
+      SESSION_METADATA_READ_CONCURRENCY,
+    );
+
+    if (pendingBatch.length > 0) {
+      options.onBatch?.(pendingBatch.splice(0, pendingBatch.length));
+    }
+
+    return {
+      records: records.filter(
+        (record): record is SessionMetadataReadResult => record !== null,
+      ),
+      complete,
+      invalidMetadataCount,
+    };
   }
 
-  private async listMetadataFiles(folderPath: string): Promise<string[]> {
+  async scanMetadata(
+    options: SessionMetadataListOptions = {},
+  ): Promise<SessionMetadataScanResult> {
+    const result = await this.scan({
+      batchSize: options.batchSize,
+      onBatch: options.onBatch
+        ? (records) => options.onBatch?.(records.map(({ metadata }) => metadata))
+        : undefined,
+    });
+    return {
+      metadata: result.records.map(({ metadata }) => metadata),
+      complete: result.complete,
+      invalidMetadataCount: result.invalidMetadataCount,
+    };
+  }
+
+  async listMetadata(
+    options: SessionMetadataListOptions = {},
+  ): Promise<SessionMetadata[]> {
+    return (await this.scanMetadata(options)).metadata;
+  }
+
+  private async readMetadata(
+    path: string,
+    expectedId: string,
+    source: SessionMetadataSource,
+  ): Promise<SessionMetadataReadResult | null> {
+    const content = await this.adapter.read(path);
+    let parsed: unknown;
     try {
-      const files = await this.adapter.listFiles(folderPath);
-      return files.filter((filePath) => filePath.endsWith('.meta.json'));
+      parsed = JSON.parse(content);
     } catch {
-      return [];
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    const rawMetadata = parsed as Record<string, unknown>;
+    if (
+      rawMetadata.id !== expectedId
+      || typeof rawMetadata.id !== 'string'
+      || !isValidSessionMetadataId(rawMetadata.id)
+    ) {
+      return null;
+    }
+    const lastActivityAt = this.getFirstFiniteTimestamp(
+      rawMetadata.lastActivityAt,
+      rawMetadata.lastResponseAt,
+      rawMetadata.updatedAt,
+      rawMetadata.createdAt,
+    ) ?? 0;
+    const {
+      externalContextPaths: _externalContextPaths,
+      updatedAt: _updatedAt,
+      lastResponseAt: _lastResponseAt,
+      selectedModel: rawSelectedModel,
+      modelRecoverySource: rawModelRecoverySource,
+      linkedContentPath: _rawLinkedContentPath,
+      currentNote: _rawCurrentNote,
+      ...metadataFields
+    } = rawMetadata;
+    const selectedModel = typeof rawSelectedModel === 'string'
+      ? rawSelectedModel
+      : undefined;
+    const modelRecoverySource = this.parseModelRecoverySource(rawModelRecoverySource);
+    const linkedContent = decodeLinkedContentPathFields(rawMetadata);
+    const metadata = {
+      ...metadataFields,
+      ...(selectedModel !== undefined ? { selectedModel } : {}),
+      ...(modelRecoverySource ? { modelRecoverySource } : {}),
+      ...(linkedContent.path ? { linkedContentPath: linkedContent.path } : {}),
+      lastActivityAt,
+    } as unknown as SessionMetadata;
+    const needsMigration = !Number.isFinite(rawMetadata.lastActivityAt)
+      || 'externalContextPaths' in rawMetadata
+      || 'updatedAt' in rawMetadata
+      || 'lastResponseAt' in rawMetadata
+      || linkedContent.needsMigration
+      || (rawSelectedModel !== undefined && selectedModel === undefined)
+      || (rawModelRecoverySource !== undefined && modelRecoverySource === undefined);
+    return { metadata, needsMigration, source };
+  }
+
+  private parseModelRecoverySource(value: unknown): ConversationModelRecoverySource | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const source = value as Record<string, unknown>;
+    if (typeof source.sessionId !== 'string' && source.sessionId !== null) return undefined;
+    if (
+      source.providerState !== undefined
+      && (
+        !source.providerState
+        || typeof source.providerState !== 'object'
+        || Array.isArray(source.providerState)
+      )
+    ) {
+      return undefined;
+    }
+    if (
+      source.resumeAtMessageId !== undefined
+      && typeof source.resumeAtMessageId !== 'string'
+    ) {
+      return undefined;
+    }
+    return {
+      sessionId: source.sessionId,
+      ...(source.providerState
+        ? { providerState: source.providerState as Record<string, unknown> }
+        : {}),
+      ...(typeof source.resumeAtMessageId === 'string'
+        ? { resumeAtMessageId: source.resumeAtMessageId }
+        : {}),
+    };
+  }
+
+  private getFirstFiniteTimestamp(...values: unknown[]): number | undefined {
+    return values.find((value): value is number => (
+      typeof value === 'number' && Number.isFinite(value)
+    ));
+  }
+
+  private async listFiles(
+    folderPath: string,
+  ): Promise<{ files: string[]; complete: boolean }> {
+    try {
+      return {
+        files: await this.adapter.listFiles(folderPath),
+        complete: true,
+      };
+    } catch {
+      return { files: [], complete: false };
     }
   }
 
-  private getFileName(filePath: string): string {
-    const parts = filePath.split('/');
-    return parts[parts.length - 1] ?? filePath;
-  }
-
-  private getMetadataIdFromPath(filePath: string): string | null {
-    const fileName = this.getFileName(filePath);
-    const suffix = '.meta.json';
+  private getIdFromPath(path: string, suffix: string): string | null {
+    const fileName = path.split('/').at(-1) ?? path;
     return fileName.endsWith(suffix)
       ? fileName.slice(0, -suffix.length)
       : null;
+  }
+
+  private indexPathsById(
+    files: readonly string[],
+    suffix: string,
+  ): Map<string, string> {
+    const pathsById = new Map<string, string>();
+    for (const path of files) {
+      const id = this.getIdFromPath(path, suffix);
+      if (id && isValidSessionMetadataId(id)) {
+        pathsById.set(id, path);
+      }
+    }
+    return pathsById;
   }
 }

@@ -1,7 +1,16 @@
+import {
+  type CLIPathFingerprintInputs,
+  createCLIPathFingerprintInputs,
+  hasCLIPathFingerprintInputs,
+} from '../../../core/providers/cli/CLIPathFingerprintInputs';
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
+import {
+  createRuntimeInputFingerprint,
+  isVersionedRuntimeInputFingerprint,
+} from '../../../core/providers/settings/RuntimeInputFingerprint';
 import type { ProviderSettingsReconciler } from '../../../core/providers/types';
 import type { Conversation } from '../../../core/types';
-import { parseEnvironmentVariables } from '../../../utils/env';
+import { getHostnameKey, parseEnvironmentVariables } from '../../../utils/env';
 import { sameStringList } from '../internal/compareCollections';
 import {
   clampPiThinkingLevel,
@@ -16,9 +25,9 @@ import {
   normalizePiVisibleModels,
   updatePiProviderSettings,
 } from '../settings';
-import { getPiState } from '../types';
+import { clearPiResumeState } from '../types';
 
-const PI_ENV_HASH_KEYS = [
+const LEGACY_PI_ENV_HASH_KEYS = [
   'PI_CODING_AGENT_DIR',
   'PI_CODING_AGENT_SESSION_DIR',
   'PI_PACKAGE_DIR',
@@ -28,54 +37,80 @@ const PI_ENV_HASH_KEYS = [
   'PI_CACHE_RETENTION',
 ] as const;
 
-function computePiEnvHash(envText: string): string {
-  const envVars = parseEnvironmentVariables(envText || '');
-  return PI_ENV_HASH_KEYS
-    .filter((key) => envVars[key])
-    .map((key) => `${key}=${envVars[key]}`)
+const PI_ENV_HASH_KEYS = [
+  ...LEGACY_PI_ENV_HASH_KEYS,
+  'PATH',
+] as const;
+
+function computePiRuntimeFingerprint(
+  environmentText: string,
+  cliPathInputs: CLIPathFingerprintInputs,
+): string {
+  return createRuntimeInputFingerprint({
+    additionalInputs: cliPathInputs,
+    environmentKeys: PI_ENV_HASH_KEYS,
+    environmentText,
+  });
+}
+
+function invalidatePiConversationSessions(conversations: Conversation[]): Conversation[] {
+  return conversations.filter(conversation => (
+    conversation.providerId === 'pi' && clearPiResumeState(conversation)
+  ));
+}
+
+function isCurrentLegacyPiFingerprint(
+  environmentText: string,
+  savedFingerprint: string,
+  cliPathInputs: CLIPathFingerprintInputs,
+): boolean {
+  if (
+    !savedFingerprint
+    || isVersionedRuntimeInputFingerprint(savedFingerprint)
+    || hasCLIPathFingerprintInputs(cliPathInputs)
+  ) {
+    return false;
+  }
+
+  const environment = parseEnvironmentVariables(environmentText);
+  const legacyFingerprint = LEGACY_PI_ENV_HASH_KEYS
+    .filter(key => environment[key])
+    .map(key => `${key}=${environment[key]}`)
     .sort()
     .join('|');
+  return savedFingerprint === legacyFingerprint;
 }
 
 export const piSettingsReconciler: ProviderSettingsReconciler = {
-  handleEnvironmentChange(settings: Record<string, unknown>): boolean {
-    const current = getPiProviderSettings(settings);
-    if (current.discoveredModels.length === 0) {
-      return false;
-    }
-    updatePiProviderSettings(settings, {
-      discoveredModels: [],
-    });
-    return true;
-  },
+
+  invalidateConversationSessions: invalidatePiConversationSessions,
 
   reconcileModelWithEnvironment(
     settings: Record<string, unknown>,
     conversations: Conversation[],
   ): { changed: boolean; invalidatedConversations: Conversation[] } {
     const envText = getRuntimeEnvironmentText(settings, 'pi');
-    const currentHash = computePiEnvHash(envText);
-    const savedHash = getPiProviderSettings(settings).environmentHash;
+    const piSettings = getPiProviderSettings(settings);
+    const cliPathInputs = createCLIPathFingerprintInputs(
+      piSettings.cliPathsByHost[getHostnameKey()],
+      piSettings.cliPath,
+    );
+    const currentHash = computePiRuntimeFingerprint(envText, cliPathInputs);
+    const savedHash = piSettings.environmentHash;
 
+    const environment = parseEnvironmentVariables(envText);
+    const hasFingerprintInputs = Boolean(
+      hasCLIPathFingerprintInputs(cliPathInputs)
+      || PI_ENV_HASH_KEYS.some(key => Object.prototype.hasOwnProperty.call(environment, key))
+    );
+    if (!savedHash && !hasFingerprintInputs) {
+      return { changed: false, invalidatedConversations: [] };
+    }
     if (currentHash === savedHash) {
       return { changed: false, invalidatedConversations: [] };
     }
 
-    const invalidatedConversations: Conversation[] = [];
-    for (const conversation of conversations) {
-      if (conversation.providerId !== 'pi') {
-        continue;
-      }
-
-      const state = getPiState(conversation.providerState);
-      if (!conversation.sessionId && !state.sessionId && !state.sessionFile) {
-        continue;
-      }
-
-      conversation.sessionId = null;
-      conversation.providerState = undefined;
-      invalidatedConversations.push(conversation);
-    }
+    const invalidatedConversations = invalidatePiConversationSessions(conversations);
 
     updatePiProviderSettings(settings, { environmentHash: currentHash });
     return { changed: true, invalidatedConversations };
@@ -85,33 +120,49 @@ export const piSettingsReconciler: ProviderSettingsReconciler = {
     const piSettings = getPiProviderSettings(settings);
     let changed = false;
 
-    const normalizeSelection = (
-      value: unknown,
-      fallback: 'clear' | 'synthetic',
-    ): string | null => {
-      if (typeof value !== 'string' || !isPiModelSelectionId(value)) {
+    const envText = getRuntimeEnvironmentText(settings, 'pi');
+    const cliPathInputs = createCLIPathFingerprintInputs(
+      piSettings.cliPathsByHost[getHostnameKey()],
+      piSettings.cliPath,
+    );
+    if (isCurrentLegacyPiFingerprint(
+      envText,
+      piSettings.environmentHash,
+      cliPathInputs,
+    )) {
+      updatePiProviderSettings(settings, {
+        environmentHash: computePiRuntimeFingerprint(envText, cliPathInputs),
+      });
+      changed = true;
+    }
+
+    const normalizeSelection = (value: unknown): string | null => {
+      if (typeof value !== 'string') {
         return null;
       }
 
-      if (value === 'pi') {
-        return value;
+      if (!isPiModelSelectionId(value)) {
+        return value === 'pi' || value.startsWith('pi:') ? '' : null;
       }
 
       const decoded = decodePiModelId(value);
       if (decoded) {
         return encodePiModelId(decoded.provider, decoded.modelId);
       }
-
-      return fallback === 'synthetic' ? 'pi' : '';
+      return null;
     };
 
-    const modelSelection = normalizeSelection(settings.model, 'synthetic');
-    if (typeof settings.model === 'string' && modelSelection && settings.model !== modelSelection) {
+    const modelSelection = normalizeSelection(settings.model);
+    if (
+      typeof settings.model === 'string'
+      && modelSelection !== null
+      && settings.model !== modelSelection
+    ) {
       settings.model = modelSelection;
       changed = true;
     }
 
-    const titleModelSelection = normalizeSelection(settings.titleGenerationModel, 'clear');
+    const titleModelSelection = normalizeSelection(settings.titleGenerationModel);
     if (
       typeof settings.titleGenerationModel === 'string'
       && titleModelSelection !== null
@@ -124,7 +175,7 @@ export const piSettingsReconciler: ProviderSettingsReconciler = {
     const savedProviderModelRaw = settings.savedProviderModel;
     if (savedProviderModelRaw && typeof savedProviderModelRaw === 'object' && !Array.isArray(savedProviderModelRaw)) {
       const savedProviderModel = savedProviderModelRaw as Record<string, unknown>;
-      const savedSelection = normalizeSelection(savedProviderModel.pi, 'clear');
+      const savedSelection = normalizeSelection(savedProviderModel.pi);
       if (
         typeof savedProviderModel.pi === 'string'
         && savedSelection !== null

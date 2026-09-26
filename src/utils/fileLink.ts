@@ -5,7 +5,7 @@
  * them clickable to open the file in Obsidian.
  */
 
-import type { App, Component } from 'obsidian';
+import type { App, WorkspaceLeaf } from 'obsidian';
 
 import { getVaultFileByPath } from './obsidianCompat';
 
@@ -52,7 +52,7 @@ function buildWikilinkMatch(
   };
 }
 
-export function extractLinkTarget(fullMatch: string): string {
+function extractLinkTarget(fullMatch: string): string {
   const inner = fullMatch.slice(2, -2);
   const pipeIndex = inner.indexOf('|');
   return pipeIndex >= 0 ? inner.slice(0, pipeIndex) : inner;
@@ -63,6 +63,11 @@ export function extractLinkTarget(fullMatch: string): string {
  * Sorted by index descending for end-to-start processing.
  */
 function findWikilinks(app: App, text: string): WikilinkMatch[] {
+  return parseWikilinks(text).filter(match => fileExistsInVault(app, match.linkPath));
+}
+
+/** Parses wikilink source in descending offset order for text replacement. */
+export function parseWikilinks(text: string): WikilinkMatch[] {
   const pattern = createWikilinkPattern();
   const matches: WikilinkMatch[] = [];
 
@@ -70,8 +75,6 @@ function findWikilinks(app: App, text: string): WikilinkMatch[] {
   while ((match = pattern.exec(text)) !== null) {
     const fullMatch = match[0];
     const linkPath = match[1];
-
-    if (!fileExistsInVault(app, linkPath)) continue;
 
     matches.push(buildWikilinkMatch(fullMatch, linkPath, match.index));
   }
@@ -110,16 +113,18 @@ function extractLinkPathFromTarget(linkTarget: string): string {
  * Click handling is done via event delegation in registerFileLinkHandler.
  */
 function createWikilink(
-  ownerDocument: Document,
+  parent: HTMLElement,
   linkTarget: string,
   displayText: string
 ): HTMLElement {
-  const link = ownerDocument.createElement('a');
-  link.className = 'claudian-file-link internal-link';
-  link.textContent = displayText;
-  link.setAttribute('data-href', linkTarget);
-  link.setAttribute('href', linkTarget);
-  return link;
+  return parent.createEl('a', {
+    cls: 'claudian-file-link internal-link',
+    text: displayText,
+    attr: {
+      'data-href': linkTarget,
+      href: linkTarget,
+    },
+  });
 }
 
 function repairEmptyInternalLink(app: App, link: HTMLAnchorElement): void {
@@ -138,6 +143,26 @@ function repairEmptyInternalLink(app: App, link: HTMLAnchorElement): void {
   link.textContent = linkTarget;
 }
 
+async function openFileLink(app: App, linkTarget: string): Promise<void> {
+  const linkPath = extractLinkPathFromTarget(linkTarget);
+  const file = app.metadataCache.getFirstLinkpathDest(linkPath, '');
+  let existingLeaf: WorkspaceLeaf | undefined;
+  if (file) {
+    app.workspace.iterateAllLeaves(leaf => {
+      if (!existingLeaf && leaf.getViewState().state?.file === file.path) {
+        existingLeaf = leaf;
+      }
+    });
+  }
+  if (existingLeaf) {
+    await app.workspace.revealLeaf(existingLeaf);
+    const subpath = linkTarget.slice(linkPath.length);
+    existingLeaf.setEphemeralState({ focus: true, ...(subpath ? { subpath } : {}) });
+    return;
+  }
+  await app.workspace.openLinkText(linkTarget, '', 'tab');
+}
+
 /**
  * Registers a delegated click handler for file links on a container.
  * Should be called once on the messages container.
@@ -146,9 +171,8 @@ function repairEmptyInternalLink(app: App, link: HTMLAnchorElement): void {
 export function registerFileLinkHandler(
   app: App,
   container: HTMLElement,
-  component: Component
-): void {
-  component.registerDomEvent(container, 'click', (event: MouseEvent) => {
+): () => void {
+  const handler = (event: MouseEvent) => {
     const target = event.target as HTMLElement;
     // Handle both our links and Obsidian's internal links
     const link = target.closest('.claudian-file-link, .internal-link') as HTMLAnchorElement;
@@ -157,14 +181,17 @@ export function registerFileLinkHandler(
       event.preventDefault();
       const linkTarget = link.dataset.href || link.getAttribute('href');
       if (linkTarget) {
-        void app.workspace.openLinkText(linkTarget, '', 'tab');
+        void openFileLink(app, linkTarget);
       }
     }
-  });
+  };
+  container.addEventListener('click', handler);
+  return () => container.removeEventListener('click', handler);
 }
 
-function buildFragmentWithLinks(ownerDocument: Document, text: string, matches: WikilinkMatch[]): DocumentFragment {
-  const fragment = ownerDocument.createDocumentFragment();
+function buildFragmentWithLinks(parent: HTMLElement, text: string, matches: WikilinkMatch[]): DocumentFragment {
+  const ownerDocument = parent.ownerDocument;
+  const fragment = ownerDocument.defaultView?.createFragment() ?? createFragment();
   let currentIndex = text.length;
 
   for (const { index, fullMatch, linkTarget, displayText } of matches) {
@@ -177,7 +204,7 @@ function buildFragmentWithLinks(ownerDocument: Document, text: string, matches: 
       );
     }
 
-    fragment.insertBefore(createWikilink(ownerDocument, linkTarget, displayText), fragment.firstChild);
+    fragment.insertBefore(createWikilink(parent, linkTarget, displayText), fragment.firstChild);
     currentIndex = index;
   }
 
@@ -198,7 +225,10 @@ function processTextNode(app: App, node: Text): boolean {
   const matches = findWikilinks(app, text);
   if (matches.length === 0) return false;
 
-  node.parentNode?.replaceChild(buildFragmentWithLinks(node.ownerDocument, text, matches), node);
+  const parent = node.parentElement;
+  if (!parent) return false;
+
+  node.parentNode?.replaceChild(buildFragmentWithLinks(parent, text, matches), node);
   return true;
 }
 
@@ -225,7 +255,7 @@ export function processFileLinks(app: App, container: HTMLElement): void {
     if (matches.length === 0) return;
 
     codeEl.textContent = '';
-    codeEl.appendChild(buildFragmentWithLinks(container.ownerDocument, text, matches));
+    codeEl.appendChild(buildFragmentWithLinks(codeEl, text, matches));
   });
 
   const walker = container.ownerDocument.createTreeWalker(

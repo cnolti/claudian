@@ -1,27 +1,42 @@
-import { Menu, Notice, setIcon } from 'obsidian';
+import { Notice } from 'obsidian';
 
-import type { TitleGenerationService } from '../../../core/providers/types';
-import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
-import type { ChatRewindMode } from '../../../core/runtime/types';
-import type { Conversation } from '../../../core/types';
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
+
+import type {
+  ChatRewindConflict,
+  ChatRewindMode,
+} from '../../../core/execution';
+import type {
+  ChatMessage,
+  Conversation,
+  ConversationMutablePatch,
+  ProviderId,
+} from '../../../core/types';
 import { t } from '../../../i18n/i18n';
 import { confirm } from '../../../shared/modals/ConfirmModal';
 import { extractUserDisplayContent } from '../../../utils/context';
-import { mergePersistentExternalContextPaths } from '../../../utils/externalContext';
-import type { FeatureHost } from '../../FeatureHost';
+import type { ChatFeatureHost } from '../ChatFeatureHost';
+import type { ChatExecutionCoordinator } from '../execution/ChatExecutionCoordinator';
+import type { LinkedContentController } from '../linked-content';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { cleanupThinkingBlock } from '../rendering/ThinkingBlockRenderer';
+import { createWelcomeElement, renderWelcomeContent } from '../rendering/WelcomeRenderer';
 import { findRewindContext } from '../rewind';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
-import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
-import type { ExternalContextSelector, McpServerSelector } from '../ui/InputToolbar';
-import type { StatusPanel } from '../ui/StatusPanel';
 
-function runConversationAction(action: () => Promise<void>, failureMessage: string): void {
-  void action().catch(() => {
-    new Notice(failureMessage);
+const MAX_REWIND_CONFLICT_PATHS = 5;
+
+function buildRewindConflictConfirmation(conflicts: readonly ChatRewindConflict[]): string {
+  const visiblePaths = conflicts
+    .slice(0, MAX_REWIND_CONFLICT_PATHS)
+    .map(conflict => `- ${conflict.path}`);
+  const omitted = conflicts.length - visiblePaths.length;
+  if (omitted > 0) visiblePaths.push(`- +${omitted} more`);
+  return t('chat.rewind.confirmMessageConflicts', {
+    count: conflicts.length,
+    files: visiblePaths.join('\n'),
   });
 }
 
@@ -32,27 +47,27 @@ export interface ConversationCallbacks {
 }
 
 export interface ConversationControllerDeps {
-  plugin: FeatureHost;
+  plugin: ChatFeatureHost;
   state: ChatState;
   renderer: MessageRenderer;
   subagentManager: SubagentManager;
-  getHistoryDropdown: () => HTMLElement | null;
   getWelcomeEl: () => HTMLElement | null;
   setWelcomeEl: (el: HTMLElement | null) => void;
   getMessagesEl: () => HTMLElement;
-  getInputEl: () => HTMLTextAreaElement;
-  getFileContextManager: () => FileContextManager | null;
+  getInputEl: () => ComposerInputElement;
+  restoreMessageToComposer?: (message: Pick<ChatMessage, 'content' | 'images'>) => void;
+  getLinkedContentController: () => LinkedContentController;
   getImageContextManager: () => ImageContextManager | null;
-  getMcpServerSelector: () => McpServerSelector | null;
-  getExternalContextSelector: () => ExternalContextSelector | null;
   clearQueuedMessage: () => void;
-  getTitleGenerationService: () => TitleGenerationService | null;
-  getStatusPanel: () => StatusPanel | null;
-  getAgentService?: () => ChatRuntime | null;
+  getExecutionCoordinator: () => ChatExecutionCoordinator | null;
+  ensureExecutionInitialized?: () => Promise<boolean>;
+  getProviderId?: () => ProviderId;
   getSelectedModel?: () => string | null;
-  ensureServiceForConversation?: (conversation: Conversation | null) => Promise<void>;
+  ensureExecutionForConversation?: (conversation: Conversation | null) => Promise<void>;
   dismissPendingInlinePrompts?: () => void;
   awaitBackgroundWork?: () => Promise<void>;
+  /** True once the owning tab has begun teardown. */
+  isDisposed?: () => boolean;
 }
 
 type SaveOptions = {
@@ -60,34 +75,19 @@ type SaveOptions = {
   resetProviderSession?: boolean;
 };
 
-export type HistoryConversationOpenState = 'closed' | 'open' | 'current';
-
-export type HistoryConversationStatus = {
-  openState: HistoryConversationOpenState;
-  isRunning: boolean;
-  location?: 'current-view' | 'other-view';
-  tabIndex?: number;
-};
-
-type HistoryRenderOptions = {
-  onSelectConversation: (id: string) => Promise<void>;
-  onOpenConversationInNewTab?: (id: string, activate?: boolean) => Promise<void>;
-  getConversationOpenState?: (id: string) => HistoryConversationOpenState;
-  getConversationStatus?: (id: string) => HistoryConversationStatus;
-  onRerender: () => void;
-};
-
 export class ConversationController {
   private deps: ConversationControllerDeps;
   private callbacks: ConversationCallbacks;
+  private switchRequestRevision = 0;
+  private switchTail: Promise<void> = Promise.resolve();
 
   constructor(deps: ConversationControllerDeps, callbacks: ConversationCallbacks = {}) {
     this.deps = deps;
     this.callbacks = callbacks;
   }
 
-  private getAgentService(): ChatRuntime | null {
-    return this.deps.getAgentService?.() ?? null;
+  #getExecutionCoordinator(): ChatExecutionCoordinator | null {
+    return this.deps.getExecutionCoordinator();
   }
 
   // ============================================
@@ -103,7 +103,9 @@ export class ConversationController {
   async createNew(options: { force?: boolean } = {}): Promise<void> {
     const { plugin, state, subagentManager } = this.deps;
     const force = !!options.force;
+    const isCancellingForegroundTurn = force && state.isStreaming;
     if (state.isStreaming && !force) return;
+    if (state.isRewinding) return;
     if (state.isCreatingConversation) return;
     if (state.isSwitchingConversation) return;
 
@@ -113,10 +115,10 @@ export class ConversationController {
     try {
       this.deps.dismissPendingInlinePrompts?.();
 
-      if (force && state.isStreaming) {
+      if (isCancellingForegroundTurn) {
         state.cancelRequested = true;
         state.bumpStreamGeneration();
-        this.getAgentService()?.cancel();
+        this.#getExecutionCoordinator()?.cancel();
       }
 
       if (this.deps.awaitBackgroundWork) {
@@ -127,7 +129,7 @@ export class ConversationController {
 
       // Persist terminalized background tasks before clearing their runtime state.
       if (state.currentConversationId && state.messages.length > 0) {
-        await this.save();
+        await this.save(isCancellingForegroundTurn);
       }
 
       subagentManager.clear();
@@ -146,43 +148,22 @@ export class ConversationController {
       state.currentConversationId = null;
       state.clearMessages();
       state.usage = null;
-      state.currentTodos = null;
-      state.pendingNewSessionPlan = null;
-      state.planFilePath = null;
-      state.prePlanPermissionMode = null;
       state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
       state.hasPendingConversationSave = false;
 
-      // Reset agent service session (no session ID for entry point)
-      // Pass persistent paths to prevent stale external contexts
-      this.getAgentService()?.syncConversationState(
-        null,
-        plugin.settings.persistentExternalContextPaths || []
-      );
+      await this.#getExecutionCoordinator()?.bindConversation(null);
 
       const messagesEl = this.deps.getMessagesEl();
       messagesEl.empty();
 
-      // Recreate welcome element first (before StatusPanel for consistent ordering)
-      const welcomeEl = messagesEl.createDiv({ cls: 'claudian-welcome' });
-      welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
+      const welcomeEl = createWelcomeElement(messagesEl, this.getGreeting());
       this.deps.setWelcomeEl(welcomeEl);
-
-      // Remount StatusPanel to restore state for new conversation
-      this.deps.getStatusPanel()?.remount();
 
       this.deps.getInputEl().value = '';
 
-      const fileCtx = this.deps.getFileContextManager();
-      fileCtx?.resetForNewConversation();
-      fileCtx?.autoAttachActiveFile();
+      this.deps.getLinkedContentController().resetAutoDraft();
 
       this.deps.getImageContextManager()?.clearImages();
-      this.deps.getMcpServerSelector()?.clearEnabled();
-      // Pass current settings to ensure we have the most up-to-date persistent paths
-      this.deps.getExternalContextSelector()?.clearExternalContexts(
-        plugin.settings.persistentExternalContextPaths || []
-      );
       this.deps.clearQueuedMessage();
 
       this.callbacks.onNewConversation?.();
@@ -208,29 +189,12 @@ export class ConversationController {
       state.currentConversationId = null;
       state.clearMessages();
       state.usage = null;
-      state.currentTodos = null;
-      state.pendingNewSessionPlan = null;
-      state.planFilePath = null;
-      state.prePlanPermissionMode = null;
       state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
       state.hasPendingConversationSave = false;
 
-      // Pass persistent paths to prevent stale external contexts
-      this.getAgentService()?.syncConversationState(
-        null,
-        plugin.settings.persistentExternalContextPaths || []
-      );
+      await this.#getExecutionCoordinator()?.bindConversation(null);
 
-      const fileCtx = this.deps.getFileContextManager();
-      fileCtx?.resetForNewConversation();
-      fileCtx?.autoAttachActiveFile();
-
-      // Initialize external contexts with persistent paths from settings
-      this.deps.getExternalContextSelector()?.clearExternalContexts(
-        plugin.settings.persistentExternalContextPaths || []
-      );
-
-      this.deps.getMcpServerSelector()?.clearEnabled();
+      this.deps.getLinkedContentController().resetAutoDraft();
 
       const welcomeEl = renderer.renderMessages(
         [],
@@ -243,8 +207,8 @@ export class ConversationController {
       return;
     }
 
-    await this.deps.ensureServiceForConversation?.(conversation);
-    this.restoreConversation(conversation, { autoAttachFile: true });
+    await this.deps.ensureExecutionForConversation?.(conversation);
+    this.#restoreConversation(conversation);
     this.updateWelcomeVisibility();
 
     this.callbacks.onConversationLoaded?.();
@@ -252,10 +216,27 @@ export class ConversationController {
 
   /** Switches to a different conversation. */
   async switchTo(id: string): Promise<void> {
+    const requestRevision = ++this.switchRequestRevision;
+    const request = this.switchTail
+      .catch(() => undefined)
+      .then(async () => {
+        if (requestRevision !== this.switchRequestRevision) return;
+        await this.#switchToImmediately(id);
+      });
+    this.switchTail = request.then(
+      () => undefined,
+      () => undefined,
+    );
+    await request;
+  }
+
+  async #switchToImmediately(id: string): Promise<void> {
     const { plugin, state, subagentManager } = this.deps;
 
+    if (this.deps.isDisposed?.()) return;
     if (id === state.currentConversationId) return;
     if (state.isStreaming) return;
+    if (state.isRewinding) return;
     if (state.isSwitchingConversation) return;
     if (state.isCreatingConversation) return;
 
@@ -266,30 +247,31 @@ export class ConversationController {
       if (this.deps.awaitBackgroundWork) {
         await this.deps.awaitBackgroundWork();
       }
+      if (this.deps.isDisposed?.()) return;
       subagentManager.orphanAllActive();
       await this.save();
+      if (this.deps.isDisposed?.()) return;
 
       subagentManager.clear();
 
       const conversation = await plugin.switchConversation(id);
-      if (!conversation) {
+      if (!conversation || this.deps.isDisposed?.()) {
         return;
       }
 
-      await this.deps.ensureServiceForConversation?.(conversation);
+      await this.deps.ensureExecutionForConversation?.(conversation);
+      if (this.deps.isDisposed?.()) return;
 
       this.deps.getInputEl().value = '';
       this.deps.clearQueuedMessage();
 
-      this.restoreConversation(conversation);
+      this.#restoreConversation(conversation);
 
-      this.deps.getHistoryDropdown()?.removeClass('visible');
       this.updateWelcomeVisibility();
-
-      this.callbacks.onConversationSwitched?.();
     } finally {
       state.isSwitchingConversation = false;
     }
+    this.callbacks.onConversationSwitched?.();
   }
 
   async rewind(
@@ -298,12 +280,10 @@ export class ConversationController {
   ): Promise<void> {
     const { plugin, state, renderer } = this.deps;
 
-    const agentServiceForCheck = this.getAgentService();
-    if (agentServiceForCheck && !agentServiceForCheck.getCapabilities().supportsRewind) {
-      new Notice(t('chat.rewind.failed', { error: 'Rewind is not supported by this provider.' }));
+    if (state.isRewinding) {
+      new Notice(t('chat.rewind.inProgress'));
       return;
     }
-
     if (state.isStreaming) {
       new Notice(t('chat.rewind.unavailableStreaming'));
       return;
@@ -328,73 +308,172 @@ export class ConversationController {
     }
     const prevAssistantUuid = rewindCtx.prevAssistantUuid;
 
-    const confirmed = await confirm(
-      plugin.app,
-      mode === 'conversation'
+    const conversationId = state.currentConversationId;
+    const isTargetCurrent = (): boolean => {
+      if (state.currentConversationId !== conversationId) return false;
+      const currentMessages = state.messages;
+      const currentUserIdx = currentMessages.findIndex(message => message.id === userMessageId);
+      if (currentUserIdx < 0) return false;
+      const currentUser = currentMessages[currentUserIdx];
+      if (currentUser.userMessageId !== userMsg.userMessageId) return false;
+      const currentContext = findRewindContext(currentMessages, currentUserIdx);
+      return currentContext.hasResponse
+        && currentContext.prevAssistantUuid === prevAssistantUuid;
+    };
+
+    state.isRewinding = true;
+    try {
+      if (this.deps.ensureExecutionInitialized) {
+        let initialized = false;
+        try {
+          initialized = await this.deps.ensureExecutionInitialized();
+        } catch (e) {
+          new Notice(t('chat.rewind.failed', {
+            error: e instanceof Error ? e.message : 'Failed to initialize agent service',
+          }));
+          return;
+        }
+        if (this.deps.isDisposed?.()) return;
+        if (!initialized) {
+          new Notice(t('chat.rewind.failed', { error: 'Agent service not available' }));
+          return;
+        }
+      }
+
+      const coordinator = this.#getExecutionCoordinator();
+      if (!coordinator) {
+        new Notice(t('chat.rewind.failed', { error: 'Agent execution not available' }));
+        return;
+      }
+      if (!isTargetCurrent()) {
+        new Notice(t('chat.rewind.failed', { error: 'Conversation changed while rewinding.' }));
+        return;
+      }
+
+      let confirmationMessage = mode === 'conversation'
         ? t('chat.rewind.confirmMessageConversationOnly')
-        : t('chat.rewind.confirmMessage'),
-      t('chat.rewind.confirmButton')
-    );
-    if (!confirmed) return;
+        : t('chat.rewind.confirmMessage');
+      if (mode === 'code-and-conversation') {
+        let preview;
+        try {
+          preview = await coordinator.previewRewind(
+            userMsg.userMessageId,
+            prevAssistantUuid,
+            mode,
+          );
+        } catch (e) {
+          new Notice(t('chat.rewind.failed', {
+            error: e instanceof Error ? e.message : 'Unknown error',
+          }));
+          return;
+        }
+        if (!preview.canRewind) {
+          new Notice(t('chat.rewind.cannot', { error: preview.error ?? 'Unknown error' }));
+          return;
+        }
+        if (preview.conflicts && preview.conflicts.length > 0) {
+          confirmationMessage = buildRewindConflictConfirmation(preview.conflicts);
+        }
+        if (state.isStreaming) {
+          new Notice(t('chat.rewind.unavailableStreaming'));
+          return;
+        }
+        if (!isTargetCurrent() || this.#getExecutionCoordinator() !== coordinator) {
+          new Notice(t('chat.rewind.failed', { error: 'Conversation changed while rewinding.' }));
+          return;
+        }
+      }
 
-    if (state.isStreaming) {
-      new Notice(t('chat.rewind.unavailableStreaming'));
-      return;
-    }
+      const confirmed = await confirm(
+        plugin.app,
+        confirmationMessage,
+        t('chat.rewind.confirmButton')
+      );
+      if (!confirmed) return;
 
-    const agentService = this.getAgentService();
-    if (!agentService) {
-      new Notice(t('chat.rewind.failed', { error: 'Agent service not available' }));
-      return;
-    }
+      if (state.isStreaming) {
+        new Notice(t('chat.rewind.unavailableStreaming'));
+        return;
+      }
+      if (!isTargetCurrent() || this.#getExecutionCoordinator() !== coordinator) {
+        new Notice(t('chat.rewind.failed', { error: 'Conversation changed while rewinding.' }));
+        return;
+      }
 
-    let result;
-    try {
-      result = await agentService.rewind(userMsg.userMessageId, prevAssistantUuid, mode);
-    } catch (e) {
-      new Notice(t('chat.rewind.failed', { error: e instanceof Error ? e.message : 'Unknown error' }));
-      return;
-    }
-    if (!result.canRewind) {
-      new Notice(t('chat.rewind.cannot', { error: result.error ?? 'Unknown error' }));
-      return;
-    }
+      let result;
+      try {
+        result = await coordinator.rewind(
+          userMsg.userMessageId,
+          prevAssistantUuid,
+          mode,
+        );
+      } catch (e) {
+        new Notice(t('chat.rewind.failed', { error: e instanceof Error ? e.message : 'Unknown error' }));
+        return;
+      }
+      if (!result.canRewind) {
+        new Notice(t('chat.rewind.cannot', { error: result.error ?? 'Unknown error' }));
+        return;
+      }
+      if (!isTargetCurrent() || this.#getExecutionCoordinator() !== coordinator) {
+        new Notice(t('chat.rewind.failed', { error: 'Conversation changed while rewinding.' }));
+        return;
+      }
 
-    state.truncateAt(userMessageId);
+      state.truncateAt(userMessageId);
+      state.usage = null;
 
-    const inputEl = this.deps.getInputEl();
-    inputEl.value = userMsg.content;
-    inputEl.focus();
+      const restoredContent = userMsg.displayContent
+        ?? extractUserDisplayContent(userMsg.content)
+        ?? userMsg.content;
+      if (this.deps.restoreMessageToComposer) {
+        this.deps.restoreMessageToComposer({
+          content: restoredContent,
+          images: userMsg.images,
+        });
+      } else {
+        const inputEl = this.deps.getInputEl();
+        inputEl.value = restoredContent;
+        inputEl.focus();
+      }
 
-    const welcomeEl = renderer.renderMessages(state.messages, () => this.getGreeting());
-    this.deps.setWelcomeEl(welcomeEl);
-    this.updateWelcomeVisibility();
+      const welcomeEl = renderer.renderMessages(state.messages, () => this.getGreeting());
+      this.deps.setWelcomeEl(welcomeEl);
+      this.updateWelcomeVisibility();
 
-    const filesChanged = result.filesChanged?.length ?? 0;
-    let saveError: string | null = null;
-    try {
-      await this.save(false, {
-        resumeAtMessageId: prevAssistantUuid,
-        resetProviderSession: !prevAssistantUuid,
-      });
-    } catch (e) {
-      saveError = e instanceof Error ? e.message : 'Failed to save';
-    }
+      const filesChanged = result.filesChanged?.length ?? 0;
+      let saveError: string | null = null;
+      try {
+        await this.save(
+          true,
+          result.sessionStrategy === 'preserve-provider-session'
+            ? { resumeAtMessageId: undefined }
+            : {
+              resumeAtMessageId: prevAssistantUuid,
+              resetProviderSession: !prevAssistantUuid,
+            },
+        );
+      } catch (e) {
+        saveError = e instanceof Error ? e.message : 'Failed to save';
+      }
 
-    if (saveError) {
+      if (saveError) {
+        new Notice(
+          mode === 'conversation'
+            ? t('chat.rewind.noticeConversationOnlySaveFailed', { error: saveError })
+            : t('chat.rewind.noticeSaveFailed', { count: String(filesChanged), error: saveError })
+        );
+        return;
+      }
+
       new Notice(
         mode === 'conversation'
-          ? t('chat.rewind.noticeConversationOnlySaveFailed', { error: saveError })
-          : t('chat.rewind.noticeSaveFailed', { count: String(filesChanged), error: saveError })
+          ? t('chat.rewind.noticeConversationOnly')
+          : t('chat.rewind.notice', { count: String(filesChanged) })
       );
-      return;
+    } finally {
+      state.isRewinding = false;
     }
-
-    new Notice(
-      mode === 'conversation'
-        ? t('chat.rewind.noticeConversationOnly')
-        : t('chat.rewind.notice', { count: String(filesChanged) })
-    );
   }
 
   /**
@@ -406,7 +485,7 @@ export class ConversationController {
    * For native sessions (new conversations with sessionId from SDK),
    * only metadata is saved - the SDK handles message persistence.
    */
-  async save(updateLastResponse = false, options?: SaveOptions): Promise<void> {
+  async save(updateLastActivity = false, options?: SaveOptions): Promise<void> {
     const { plugin, state } = this.deps;
 
     // Entry point with no messages - nothing to save
@@ -414,54 +493,27 @@ export class ConversationController {
       return;
     }
 
-    const agentService = this.getAgentService();
-    const sessionInvalidated = agentService?.consumeSessionInvalidation?.() ?? false;
-
     // Entry point with messages - create conversation lazily
     // New conversations always use SDK-native storage.
     if (!state.currentConversationId && state.messages.length > 0) {
-      const initialSessionId = agentService?.getSessionId() ?? undefined;
-      const selectedModel = this.deps.getSelectedModel?.() ?? undefined;
-      const conversation = await plugin.createConversation({
-        providerId: agentService?.providerId,
-        sessionId: initialSessionId,
-        ...(selectedModel ? { selectedModel } : {}),
-      });
-      state.currentConversationId = conversation.id;
+      throw new Error('Cannot save messages before the Conversation shell is created');
     }
 
-    const fileCtx = this.deps.getFileContextManager();
-    const currentNote = fileCtx?.getCurrentNotePath() || undefined;
-    const externalContextSelector = this.deps.getExternalContextSelector();
-    const externalContextPaths = externalContextSelector?.getExternalContexts() ?? [];
-    const mcpServerSelector = this.deps.getMcpServerSelector();
-    const enabledMcpServers = mcpServerSelector ? Array.from(mcpServerSelector.getEnabledServers()) : [];
-
-    const conversation = plugin.getConversationSync(state.currentConversationId!);
-
-    const { updates: sessionUpdates } = agentService && !options?.resetProviderSession
-      ? agentService.buildSessionUpdates({ conversation, sessionInvalidated })
-      : { updates: {} };
-
-    const updates: Partial<Conversation> = {
-      ...sessionUpdates,
+    const updates: ConversationMutablePatch = {
       messages: state.messages,
-      currentNote: currentNote,
-      externalContextPaths: externalContextPaths.length > 0 ? externalContextPaths : undefined,
       usage: state.usage ?? undefined,
-      enabledMcpServers: enabledMcpServers.length > 0 ? enabledMcpServers : undefined,
     };
 
-    if (updateLastResponse) {
-      updates.lastResponseAt = Date.now();
+    if (updateLastActivity) {
+      updates.lastActivityAt = Date.now();
     }
 
-    if (options) {
+    if (options && 'resumeAtMessageId' in options) {
       updates.resumeAtMessageId = options.resumeAtMessageId;
-      if (options.resetProviderSession) {
-        updates.sessionId = null;
-        updates.providerState = undefined;
-      }
+    }
+    if (options?.resetProviderSession) {
+      updates.sessionId = null;
+      updates.providerState = undefined;
     }
 
     await plugin.updateConversation(state.currentConversationId!, updates);
@@ -472,10 +524,7 @@ export class ConversationController {
    * Shared logic for restoring a conversation into the current tab.
    * Used by both loadActive() and switchTo() to avoid duplication.
    */
-  private restoreConversation(
-    conversation: Conversation,
-    options?: { autoAttachFile?: boolean }
-  ): void {
+  #restoreConversation(conversation: Conversation): void {
     const { plugin, state, renderer } = this.deps;
 
     state.currentConversationId = conversation.id;
@@ -484,464 +533,13 @@ export class ConversationController {
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
     state.hasPendingConversationSave = false;
 
-    // Clear status panels (auto-hide: panels reappear when agent creates new todos)
-    state.currentTodos = null;
-
-    const hasMessages = state.messages.length > 0;
-
-    // Determine external context paths for this session
-    // Empty session: use persistent paths; session with messages: union of saved + persistent
-    // so newly-added persistent paths are immediately effective in existing conversations.
-    const externalContextPaths = hasMessages
-      ? mergePersistentExternalContextPaths(
-          plugin.settings.persistentExternalContextPaths,
-          conversation.externalContextPaths
-        )
-      : plugin.settings.persistentExternalContextPaths || [];
-
-    this.getAgentService()?.syncConversationState(conversation, externalContextPaths);
-
-    const fileCtx = this.deps.getFileContextManager();
-    fileCtx?.resetForLoadedConversation(hasMessages);
-
-    if (conversation.currentNote) {
-      fileCtx?.setCurrentNote(conversation.currentNote);
-    } else if (!hasMessages && options?.autoAttachFile) {
-      fileCtx?.autoAttachActiveFile();
-    }
-
-    this.restoreExternalContextPaths(conversation.externalContextPaths, !hasMessages);
-
-    const mcpServerSelector = this.deps.getMcpServerSelector();
-    if (conversation.enabledMcpServers && conversation.enabledMcpServers.length > 0) {
-      mcpServerSelector?.setEnabledServers(conversation.enabledMcpServers);
-    } else {
-      mcpServerSelector?.clearEnabled();
-    }
+    this.deps.getLinkedContentController().lock(conversation.linkedContentPath);
 
     const welcomeEl = renderer.renderMessages(
       state.messages,
       () => this.getGreeting()
     );
     this.deps.setWelcomeEl(welcomeEl);
-  }
-
-  /**
-   * Restores external context paths based on session state.
-   * New or empty sessions get current persistent paths from settings.
-   * Sessions with messages restore exactly what was saved.
-   */
-  private restoreExternalContextPaths(
-    savedPaths: string[] | undefined,
-    isEmptySession: boolean
-  ): void {
-    const { plugin } = this.deps;
-    const externalContextSelector = this.deps.getExternalContextSelector();
-    if (!externalContextSelector) {
-      return;
-    }
-
-    if (isEmptySession) {
-      // Empty session: use current persistent paths from settings
-      externalContextSelector.clearExternalContexts(
-        plugin.settings.persistentExternalContextPaths || []
-      );
-    } else {
-      // Session with messages: restore saved paths plus current persistent paths,
-      // so paths added to settings after the session was created are still available.
-      externalContextSelector.setExternalContexts(
-        mergePersistentExternalContextPaths(
-          plugin.settings.persistentExternalContextPaths,
-          savedPaths
-        )
-      );
-    }
-  }
-
-  // ============================================
-  // History Dropdown
-  // ============================================
-
-  toggleHistoryDropdown(): void {
-    const dropdown = this.deps.getHistoryDropdown();
-    if (!dropdown) return;
-
-    const isVisible = dropdown.hasClass('visible');
-    if (isVisible) {
-      dropdown.removeClass('visible');
-    } else {
-      this.updateHistoryDropdown();
-      dropdown.addClass('visible');
-    }
-  }
-
-  updateHistoryDropdown(): void {
-    const dropdown = this.deps.getHistoryDropdown();
-    if (!dropdown) return;
-
-    this.renderHistoryItems(dropdown, {
-      onSelectConversation: (id) => this.switchTo(id),
-      onRerender: () => this.updateHistoryDropdown(),
-    });
-  }
-
-  /**
-   * Renders history dropdown items to a container.
-   * Shared implementation for updateHistoryDropdown() and renderHistoryDropdown().
-   */
-  private renderHistoryItems(
-    container: HTMLElement,
-    options: HistoryRenderOptions
-  ): void {
-    const { plugin, state } = this.deps;
-
-    container.empty();
-
-    const dropdownHeader = container.createDiv({ cls: 'claudian-history-header' });
-    dropdownHeader.createSpan({ text: 'Conversations' });
-
-    const list = container.createDiv({ cls: 'claudian-history-list' });
-    const allConversations = plugin.getConversationList();
-
-    if (allConversations.length === 0) {
-      list.createDiv({ cls: 'claudian-history-empty', text: 'No conversations' });
-      return;
-    }
-
-    // Sort by lastResponseAt (fallback to createdAt) descending
-    const conversations = [...allConversations].sort((a, b) => {
-      return (b.lastResponseAt ?? b.createdAt) - (a.lastResponseAt ?? a.createdAt);
-    });
-
-    for (const conv of conversations) {
-      const fallbackOpenState: HistoryConversationOpenState =
-        conv.id === state.currentConversationId ? 'current' : 'closed';
-      const conversationStatus = this.getHistoryConversationStatus(conv.id, fallbackOpenState, options);
-      const { openState, isRunning } = conversationStatus;
-      const isCurrent = openState === 'current';
-      const isOpen = openState === 'open';
-      const item = list.createDiv({
-        cls: [
-          'claudian-history-item',
-          isCurrent ? 'active' : '',
-          isOpen ? 'open' : '',
-          isRunning ? 'running' : '',
-        ].filter(Boolean).join(' '),
-      });
-      item.setAttribute('data-open-state', openState);
-      item.setAttribute('data-running', isRunning ? 'true' : 'false');
-      item.setAttribute('data-tab-location', conversationStatus.location ?? 'current-view');
-      if (typeof conversationStatus.tabIndex === 'number') {
-        item.setAttribute('data-tab-index', String(conversationStatus.tabIndex));
-      }
-
-      const iconEl = item.createDiv({ cls: 'claudian-history-item-icon' });
-      setIcon(iconEl, this.getHistoryItemIcon(openState, isRunning));
-
-      const content = item.createDiv({ cls: 'claudian-history-item-content' });
-      const titleEl = content.createDiv({ cls: 'claudian-history-item-title', text: conv.title });
-      titleEl.setAttribute('title', conv.title);
-      content.createDiv({
-        cls: 'claudian-history-item-date',
-        text: this.getHistoryItemStatusText(conversationStatus, conv.lastResponseAt ?? conv.createdAt),
-      });
-
-      if (!isCurrent) {
-        content.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if (this.isHistoryNewTabModifierClick(e) && options.onOpenConversationInNewTab) {
-            e.preventDefault();
-            runConversationAction(
-              () => this.runHistoryAction(
-                () => options.onOpenConversationInNewTab?.(conv.id, true),
-                'Failed to load conversation',
-              ),
-              'Failed to load conversation',
-            );
-            return;
-          }
-
-          runConversationAction(
-            () => this.runHistoryAction(
-              () => options.onSelectConversation(conv.id),
-              'Failed to load conversation',
-            ),
-            'Failed to load conversation',
-          );
-        });
-
-        if (options.onOpenConversationInNewTab) {
-          content.addEventListener('auxclick', (e) => {
-            if (e.button !== 1) return;
-            e.preventDefault();
-            e.stopPropagation();
-            runConversationAction(
-              () => this.runHistoryAction(
-                () => options.onOpenConversationInNewTab?.(conv.id, true),
-                'Failed to load conversation',
-              ),
-              'Failed to load conversation',
-            );
-          });
-        }
-      }
-
-      item.addEventListener('contextmenu', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.showHistoryContextMenu(item, conv.id, conv.title, isCurrent, options, e);
-      });
-
-      const actions = item.createDiv({ cls: 'claudian-history-item-actions' });
-
-      // Show regenerate button if title generation failed, or loading indicator if pending
-      if (conv.titleGenerationStatus === 'pending') {
-        const loadingEl = actions.createEl('span', { cls: 'claudian-action-btn claudian-action-loading' });
-        setIcon(loadingEl, 'loader-2');
-        loadingEl.setAttribute('aria-label', 'Generating title...');
-      } else if (conv.titleGenerationStatus === 'failed') {
-        const regenerateBtn = actions.createEl('button', { cls: 'claudian-action-btn' });
-        setIcon(regenerateBtn, 'refresh-cw');
-        regenerateBtn.setAttribute('aria-label', 'Regenerate title');
-        regenerateBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          runConversationAction(
-            () => this.regenerateTitle(conv.id),
-            'Failed to regenerate response',
-          );
-        });
-      }
-
-      if (openState === 'closed' && options.onOpenConversationInNewTab) {
-        const openInNewTabBtn = actions.createEl('button', {
-          cls: 'claudian-action-btn claudian-open-new-tab-btn',
-        });
-        setIcon(openInNewTabBtn, 'square-plus');
-        openInNewTabBtn.setAttribute('aria-label', 'Open in new tab');
-        openInNewTabBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          runConversationAction(
-            () => this.runHistoryAction(
-              () => options.onOpenConversationInNewTab?.(conv.id, true),
-              'Failed to load conversation',
-            ),
-            'Failed to load conversation',
-          );
-        });
-      }
-
-      const renameBtn = actions.createEl('button', { cls: 'claudian-action-btn' });
-      setIcon(renameBtn, 'pencil');
-      renameBtn.setAttribute('aria-label', 'Rename');
-      renameBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        this.showRenameInput(item, conv.id, conv.title);
-      });
-
-      const deleteBtn = actions.createEl('button', { cls: 'claudian-action-btn claudian-delete-btn' });
-      setIcon(deleteBtn, 'trash-2');
-      deleteBtn.setAttribute('aria-label', 'Delete');
-      deleteBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        runConversationAction(
-          () => this.runHistoryAction(
-            () => this.deleteHistoryConversation(conv.id, options),
-            'Failed to delete conversation',
-          ),
-          'Failed to delete conversation',
-        );
-      });
-    }
-  }
-
-  private getHistoryConversationStatus(
-    conversationId: string,
-    fallbackOpenState: HistoryConversationOpenState,
-    options: HistoryRenderOptions,
-  ): HistoryConversationStatus {
-    const status = options.getConversationStatus?.(conversationId);
-    if (status) return status;
-
-    return {
-      openState: options.getConversationOpenState?.(conversationId) ?? fallbackOpenState,
-      isRunning: false,
-    };
-  }
-
-  private getHistoryItemStatusText(
-    status: HistoryConversationStatus,
-    timestamp: number,
-  ): string {
-    const { openState, isRunning } = status;
-    const location = status.location ?? 'current-view';
-
-    if (openState !== 'closed' && location === 'other-view') {
-      return isRunning ? 'Running in another pane' : 'Open in another pane';
-    }
-
-    if (isRunning) {
-      if (openState === 'closed') return 'Running';
-      return `Running in ${this.getHistoryTabLabel(status)}`;
-    }
-
-    switch (openState) {
-      case 'current':
-        return typeof status.tabIndex === 'number'
-          ? `Current tab ${status.tabIndex}`
-          : 'Current session';
-      case 'open':
-        return `Open in ${this.getHistoryTabLabel(status)}`;
-      case 'closed':
-        return this.formatDate(timestamp);
-    }
-  }
-
-  private getHistoryTabLabel(status: HistoryConversationStatus): string {
-    if (typeof status.tabIndex === 'number') {
-      return `tab ${status.tabIndex}`;
-    }
-
-    if (status.openState === 'current') {
-      return 'current tab';
-    }
-
-    return 'tab';
-  }
-
-  private getHistoryItemIcon(
-    openState: HistoryConversationOpenState,
-    isRunning: boolean,
-  ): string {
-    if (isRunning) return 'loader-2';
-    if (openState === 'current') return 'message-square-dot';
-    return 'message-square';
-  }
-
-  private isHistoryNewTabModifierClick(event: MouseEvent): boolean {
-    return !event.altKey && !event.shiftKey && (event.metaKey || event.ctrlKey);
-  }
-
-  private async runHistoryAction(
-    action: () => Promise<void> | void,
-    errorMessage: string,
-  ): Promise<void> {
-    try {
-      await action();
-    } catch {
-      new Notice(errorMessage);
-    }
-  }
-
-  private showHistoryContextMenu(
-    item: HTMLElement,
-    conversationId: string,
-    title: string,
-    isCurrent: boolean,
-    options: HistoryRenderOptions,
-    event: MouseEvent,
-  ): void {
-    const menu = new Menu();
-    const fallbackOpenState: HistoryConversationOpenState = isCurrent ? 'current' : 'closed';
-    const { openState } = this.getHistoryConversationStatus(conversationId, fallbackOpenState, options);
-
-    if (openState !== 'current') {
-      if (openState === 'closed' && options.onOpenConversationInNewTab) {
-        menu.addItem((menuItem) => menuItem
-          .setTitle('Open in new tab')
-          .onClick(() => {
-            void this.runHistoryAction(
-              () => options.onOpenConversationInNewTab?.(conversationId, true),
-              'Failed to load conversation',
-            );
-          }));
-        menu.addItem((menuItem) => menuItem
-          .setTitle('Open in background tab')
-          .onClick(() => {
-            void this.runHistoryAction(
-              () => options.onOpenConversationInNewTab?.(conversationId, false),
-              'Failed to load conversation',
-            );
-          }));
-      } else if (openState === 'open') {
-        menu.addItem((menuItem) => menuItem
-          .setTitle('Switch to open session')
-          .onClick(() => {
-            void this.runHistoryAction(
-              () => options.onSelectConversation(conversationId),
-              'Failed to load conversation',
-            );
-          }));
-      }
-    }
-
-    menu.addItem((menuItem) => menuItem
-      .setTitle('Rename')
-      .onClick(() => {
-        this.showRenameInput(item, conversationId, title);
-      }));
-    menu.addItem((menuItem) => menuItem
-      .setTitle('Delete')
-      .onClick(() => {
-        void this.runHistoryAction(
-          () => this.deleteHistoryConversation(conversationId, options),
-          'Failed to delete conversation',
-        );
-      }));
-
-    menu.showAtMouseEvent(event);
-  }
-
-  private async deleteHistoryConversation(
-    conversationId: string,
-    options: HistoryRenderOptions,
-  ): Promise<void> {
-    const { plugin, state } = this.deps;
-    if (state.isStreaming) return;
-
-    await plugin.deleteConversation(conversationId);
-    options.onRerender();
-
-    if (conversationId === state.currentConversationId) {
-      await this.loadActive();
-    }
-  }
-
-  /** Shows inline rename input for a conversation. */
-  private showRenameInput(item: HTMLElement, convId: string, currentTitle: string): void {
-    const titleEl = item.querySelector('.claudian-history-item-title') as HTMLElement;
-    if (!titleEl) return;
-
-    const input = (item.ownerDocument ?? window.document).createElement('input');
-    input.type = 'text';
-    input.className = 'claudian-rename-input';
-    input.value = currentTitle;
-
-    titleEl.replaceWith(input);
-    input.focus();
-    input.select();
-
-    const finishRename = async () => {
-      try {
-        const newTitle = input.value.trim() || currentTitle;
-        await this.deps.plugin.renameConversation(convId, newTitle);
-        this.updateHistoryDropdown();
-      } catch {
-        new Notice('Failed to rename conversation');
-      }
-    };
-
-    input.addEventListener('blur', () => {
-      runConversationAction(finishRename, 'Failed to rename conversation');
-    });
-    input.addEventListener('keydown', (e) => {
-      // Check !e.isComposing for IME support (Chinese, Japanese, Korean, etc.)
-      if (e.key === 'Enter' && !e.isComposing) {
-        input.blur();
-      } else if (e.key === 'Escape' && !e.isComposing) {
-        input.value = currentTitle;
-        input.blur();
-      }
-    });
   }
 
   // ============================================
@@ -1024,14 +622,10 @@ export class ConversationController {
     const welcomeEl = this.deps.getWelcomeEl();
     if (!welcomeEl) return;
 
-    // Initialize file context to auto-attach the currently focused note
-    const fileCtx = this.deps.getFileContextManager();
-    fileCtx?.resetForNewConversation();
-    fileCtx?.autoAttachActiveFile();
-
     // Only add greeting if not already present
     if (!welcomeEl.querySelector('.claudian-welcome-greeting')) {
-      welcomeEl.createDiv({ cls: 'claudian-welcome-greeting', text: this.getGreeting() });
+      renderWelcomeContent(welcomeEl, this.getGreeting());
+      this.deps.setWelcomeEl(welcomeEl);
     }
 
     this.updateWelcomeVisibility();
@@ -1049,86 +643,4 @@ export class ConversationController {
     return `${autoTitle}${suffix}`;
   }
 
-  /** Regenerates AI title for a conversation. */
-  async regenerateTitle(conversationId: string): Promise<void> {
-    const { plugin } = this.deps;
-    if (!plugin.settings.enableAutoTitleGeneration) return;
-
-    // Title generation is delegated to the active provider service
-    const fullConv = await plugin.getConversationById(conversationId);
-    if (!fullConv || fullConv.messages.length < 1) return;
-
-    const titleService = this.deps.getTitleGenerationService();
-    if (!titleService) return;
-
-    // Find first user message by role (not by index)
-    const firstUserMsg = fullConv.messages.find(m => m.role === 'user');
-    if (!firstUserMsg) return;
-
-    const userContent = firstUserMsg.displayContent
-      ?? extractUserDisplayContent(firstUserMsg.content)
-      ?? firstUserMsg.content;
-
-    // Store current title to check if user renames during generation
-    const expectedTitle = fullConv.title;
-
-    // Set pending status before starting generation
-    await plugin.updateConversation(conversationId, { titleGenerationStatus: 'pending' });
-    this.updateHistoryDropdown();
-
-    // Fire async AI title generation
-    await titleService.generateTitle(
-      conversationId,
-      userContent,
-      async (convId, result) => {
-        // Check if conversation still exists and user hasn't manually renamed
-        const currentConv = await plugin.getConversationById(convId);
-        if (!currentConv) return;
-
-        // Only apply AI title if user hasn't manually renamed (title still matches expected)
-        const userManuallyRenamed = currentConv.title !== expectedTitle;
-
-        if (result.success && !userManuallyRenamed) {
-          await plugin.renameConversation(convId, result.title);
-          await plugin.updateConversation(convId, { titleGenerationStatus: 'success' });
-        } else if (!userManuallyRenamed) {
-          // Keep existing title, mark as failed (only if user hasn't renamed)
-          await plugin.updateConversation(convId, { titleGenerationStatus: 'failed' });
-        } else {
-          // User manually renamed, clear the status (user's choice takes precedence)
-          await plugin.updateConversation(convId, { titleGenerationStatus: undefined });
-        }
-        this.updateHistoryDropdown();
-      }
-    );
-  }
-
-  /** Formats a timestamp for display. */
-  formatDate(timestamp: number): string {
-    const date = new Date(timestamp);
-    const now = new Date();
-
-    if (date.toDateString() === now.toDateString()) {
-      return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
-    }
-    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  }
-
-  // ============================================
-  // History Dropdown Rendering (for ClaudianView)
-  // ============================================
-
-  /**
-   * Renders the history dropdown content to a provided container.
-   * Used by ClaudianView to render the dropdown with custom selection callback.
-   */
-  renderHistoryDropdown(
-    container: HTMLElement,
-    options: Omit<HistoryRenderOptions, 'onRerender'>,
-  ): void {
-    this.renderHistoryItems(container, {
-      ...options,
-      onRerender: () => this.renderHistoryDropdown(container, options),
-    });
-  }
 }

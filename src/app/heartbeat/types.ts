@@ -15,5 +15,3 @@ export interface HeartbeatState {
 export interface DaemonConfig {
   compaction_threshold: number;
 }
-
-export { type HeartbeatStatus, type HeartbeatSummary } from '../../core/types/heartbeat';

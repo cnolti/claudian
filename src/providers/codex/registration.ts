@@ -1,18 +1,17 @@
+import { NOOP_TASK_RESULT_INTERPRETER } from '../../core/providers/NoopTaskResultInterpreter';
 import type { ProviderModule } from '../../core/providers/types';
-import { codexWorkspaceRegistration } from './app/CodexWorkspaceServices';
-import { CodexInlineEditService } from './auxiliary/CodexInlineEditService';
-import { CodexInstructionRefineService } from './auxiliary/CodexInstructionRefineService';
-import { CodexTaskResultInterpreter } from './auxiliary/CodexTaskResultInterpreter';
-import { CodexTitleGenerationService } from './auxiliary/CodexTitleGenerationService';
+import {
+  codexWorkspaceRegistration,
+} from './app/CodexWorkspaceServices';
 import { CODEX_PROVIDER_CAPABILITIES } from './capabilities';
 import { codexSettingsReconciler } from './env/CodexSettingsReconciler';
+import { CodexExecutionBackend } from './execution/CodexExecutionBackend';
 import { CodexConversationHistoryService } from './history/CodexConversationHistoryService';
+import { findCodexModel } from './models';
 import { codexSubagentLifecycleAdapter } from './normalization/codexSubagentNormalization';
-import { CodexChatRuntime } from './runtime/CodexChatRuntime';
 import {
-  getCodexProviderSettings,
-  normalizeCodexStoredConfig,
-  updateCodexProviderSettings,
+  getCodexProviderSettings, getVisibleCodexModelIds,
+  normalizeCodexStoredConfig, projectCodexModelSettings, updateCodexProviderSettings
 } from './settings';
 import { codexChatUIConfig } from './ui/CodexChatUIConfig';
 
@@ -27,6 +26,12 @@ export const codexProviderRegistration: ProviderModule = {
   chatUIConfig: codexChatUIConfig,
   settingsReconciler: codexSettingsReconciler,
   settingsStorage: {
+    projectPersistedConfig: projectCodexModelSettings,
+    needsReasoningMetadata(settings) {
+      const current = getCodexProviderSettings(settings);
+      return getVisibleCodexModelIds(current.visibleModels, current.discoveredModels)
+        .some(id => !findCodexModel(current.discoveredModels, id)?.supportedReasoningEfforts.length);
+    },
     hostScopedFields: ['cliPathsByHost', 'installationMethodsByHost', 'wslDistroOverridesByHost'],
     legacyTopLevelFields: [
       'codexSafeMode',
@@ -36,20 +41,18 @@ export const codexProviderRegistration: ProviderModule = {
       'codexEnabled',
       'lastCodexEnvHash',
     ],
-    runtimeOnlyFields: ['discoveredModels'],
     normalizeStored(target, stored) {
       const normalization = normalizeCodexStoredConfig(stored);
+      normalization.config.visibleModels = getVisibleCodexModelIds(normalization.config.visibleModels, normalization.config.discoveredModels);
       target.providerConfigs ??= {};
       (target.providerConfigs as Record<string, unknown>).codex = normalization.config;
       return normalization.changed;
     },
   },
-  createRuntime: ({ plugin }) => new CodexChatRuntime(plugin),
-  createTitleGenerationService: (plugin) => new CodexTitleGenerationService(plugin),
-  createInstructionRefineService: (plugin) => new CodexInstructionRefineService(plugin),
-  createInlineEditService: (plugin) => new CodexInlineEditService(plugin),
+  createExecutionBackend: (plugin) => new CodexExecutionBackend(plugin),
+
   historyService: new CodexConversationHistoryService(),
-  taskResultInterpreter: new CodexTaskResultInterpreter(),
-  subagentLifecycleAdapter: codexSubagentLifecycleAdapter,
+  taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,
+  subagentAdapter: codexSubagentLifecycleAdapter,
   workspace: codexWorkspaceRegistration,
 };

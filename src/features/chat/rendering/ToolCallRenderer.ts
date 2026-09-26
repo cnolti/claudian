@@ -23,10 +23,9 @@ import {
   TOOL_WRITE,
   TOOL_WRITE_STDIN,
 } from '../../../core/tools/toolNames';
-import { extractToolResultContent } from '../../../core/tools/toolResultContent';
 import type { AskUserQuestionItem, AskUserQuestionOption, ToolCallInfo } from '../../../core/types';
 import type { DiffStats } from '../../../core/types/diff';
-import { appendMcpIcon } from '../../../shared/icons';
+import { appendMCPIcon } from '../../../shared/icons';
 import { parseApplyPatchDiffs, parseFileUpdateChangeDiffs } from '../../../utils/diff';
 import { setupCollapsible } from './collapsible';
 import { renderDiffContent, renderDiffStats } from './DiffRenderer';
@@ -35,7 +34,7 @@ import { renderTodoItems } from './todoUtils';
 export function setToolIcon(el: HTMLElement, name: string): void {
   const icon = getToolIcon(name);
   if (icon === MCP_ICON_MARKER) {
-    appendMcpIcon(el);
+    appendMCPIcon(el);
   } else {
     setIcon(el, icon);
   }
@@ -735,7 +734,7 @@ function getCurrentTask(input: Record<string, unknown>): TodoItem | undefined {
 
 function areAllTodosCompleted(input: Record<string, unknown>): boolean {
   const todos = getTodos(input);
-  if (!todos || todos.length === 0) return false;
+  if (!todos) return false;
   return todos.every(t => t.status === 'completed');
 }
 
@@ -789,12 +788,11 @@ function setGenericToolHeaderRight(statusEl: HTMLElement, toolCall: ToolCallInfo
   setToolStatus(statusEl, toolCall.status);
 }
 
-export function renderTodoWriteResult(
+function renderTodoWriteResult(
   container: HTMLElement,
   input: Record<string, unknown>
 ): void {
   container.empty();
-  container.addClass('claudian-todo-panel-content');
   container.addClass('claudian-todo-list-container');
 
   const todos = input.todos as TodoItem[] | undefined;
@@ -805,16 +803,6 @@ export function renderTodoWriteResult(
   }
 
   renderTodoItems(container, todos);
-}
-
-export function isBlockedToolResult(content: unknown, isError?: boolean): boolean {
-  const lower = extractToolResultContent(content, { fallbackIndent: 2 }).toLowerCase();
-  if (lower.includes('outside the vault')) return true;
-  if (lower.includes('access denied')) return true;
-  if (lower.includes('user denied')) return true;
-  if (lower.includes('approval')) return true;
-  if (isError && lower.includes('deny')) return true;
-  return false;
 }
 
 interface ToolElementStructure {
@@ -1147,13 +1135,24 @@ export function renderStoredToolCall(
     setGenericToolHeaderRight(statusEl, toolCall);
   }
 
-  renderToolContent(content, toolCall);
+  let contentRendered = false;
+  const renderContentOnce = () => {
+    if (contentRendered) return;
+    renderToolContent(content, toolCall);
+    contentRendered = true;
+  };
+  const deferContent = toolCall.status !== 'running'
+    && toolCall.name !== TOOL_ASK_USER_QUESTION
+    && toolCall.name !== TOOL_TODO_WRITE;
+  if (!deferContent || options.initiallyExpanded) renderContentOnce();
 
   const state = { isExpanded: false };
   const todoStatusEl = toolCall.name === TOOL_TODO_WRITE ? statusEl : null;
   setupCollapsible(toolEl, header, content, state, {
     initiallyExpanded: options.initiallyExpanded ?? false,
-    onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl),
+    onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl, (expanded) => {
+      if (expanded) renderContentOnce();
+    }),
     baseAriaLabel: getToolLabel(toolCall.name, toolCall.input)
   });
 

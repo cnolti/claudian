@@ -1,11 +1,21 @@
-import type { ChatRuntime } from '../runtime/ChatRuntime';
+import { getVaultPath } from '../../utils/path';
+import type { AuxiliaryExecutionContext } from '../auxiliary/AuxiliaryExecutionContext';
+import { InlineEditService as SharedInlineEditService } from '../auxiliary/InlineEditService';
+import { RoutedTitleGenerationService } from '../auxiliary/RoutedTitleGenerationService';
+import { TitleGenerationService as SharedTitleGenerationService } from '../auxiliary/TitleGenerationService';
+import type {
+  ProviderExecutionBackend,
+  ProviderInteractionPort,
+} from '../execution';
+import { resolveTitleGenerationLocale } from '../prompt/titleGeneration';
+import { findAvailableModelOption } from './models/modelOptions';
+import { ProviderModelUnavailableError } from './models/ProviderModelUnavailableError';
 import { decodeProviderModelSelectionId } from './modelSelection';
 import type { ProviderHost } from './ProviderHost';
+import { ProviderWorkspaceRegistry } from './ProviderWorkspaceRegistry';
 import {
-  type CreateChatRuntimeOptions,
   DEFAULT_CHAT_PROVIDER_ID,
   type InlineEditService,
-  type InstructionRefineService,
   type ProviderCapabilities,
   type ProviderChatUIConfig,
   type ProviderConversationHistoryService,
@@ -13,10 +23,10 @@ import {
   type ProviderRegistration,
   type ProviderSettingsReconciler,
   type ProviderSettingsStorageAdapter,
-  type ProviderSubagentLifecycleAdapter,
+  type ProviderSubagentAdapter,
+  type ProviderSubagentHistoryService,
   type ProviderTaskResultInterpreter,
   type ProviderUIOption,
-  type TitleGenerationCallback,
   type TitleGenerationService,
 } from './types';
 
@@ -45,39 +55,78 @@ export class ProviderRegistry {
     return registration;
   }
 
-  static createChatRuntime(options: CreateChatRuntimeOptions): ChatRuntime {
-    const providerId = options.providerId ?? DEFAULT_CHAT_PROVIDER_ID;
-    return this.getProviderRegistration(providerId).createRuntime(options);
+  static createExecutionBackend(
+    plugin: ProviderHost,
+    providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID,
+  ): ProviderExecutionBackend {
+    return this.getProviderRegistration(providerId).createExecutionBackend(plugin);
+  }
+
+  static createSubagentHistoryService(
+    plugin: ProviderHost,
+    providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID,
+  ): ProviderSubagentHistoryService | null {
+    const factory = this.getProviderRegistration(providerId).createSubagentHistoryService;
+    return factory?.(plugin) ?? null;
   }
 
   static createTitleGenerationService(plugin: ProviderHost, providerId?: ProviderId): TitleGenerationService {
     if (!providerId) {
-      return new RoutedTitleGenerationService(plugin);
+      return new RoutedTitleGenerationService({
+        resolveProviderId: () => this.resolveTitleGenerationSelection(plugin.settings)?.providerId ?? null,
+        initializeProvider: provider => ProviderWorkspaceRegistry.ensureInitialized(
+          plugin, provider, 'title-generation',
+        ),
+        createService: provider => this.createTitleGenerationService(plugin, provider),
+      });
     }
-    return this.getProviderRegistration(providerId).createTitleGenerationService(plugin);
-  }
-
-  static resolveTitleGenerationProviderId(settings: Record<string, unknown>): ProviderId {
-    const titleModel = typeof settings.titleGenerationModel === 'string'
-      ? settings.titleGenerationModel.trim()
-      : '';
-
-    if (!titleModel) {
-      return DEFAULT_CHAT_PROVIDER_ID;
-    }
-
-    return this.resolveProviderForModel(titleModel, settings, {
-      fallbackProviderId: DEFAULT_CHAT_PROVIDER_ID,
-      onlyEnabledProviders: true,
+    const registration = this.getProviderRegistration(providerId);
+    return new SharedTitleGenerationService({
+      ...this.createAuxiliaryExecutionContext(plugin, providerId),
+      resolveLocale: () => resolveTitleGenerationLocale(plugin.settings),
+      resolveModel: () => {
+        const selection = this.resolveTitleGenerationSelection(plugin.settings);
+        if (!selection || selection.providerId !== providerId) {
+          throw new ProviderModelUnavailableError(registration.displayName);
+        }
+        return selection.model;
+      },
     });
   }
 
-  static createInstructionRefineService(plugin: ProviderHost, providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID): InstructionRefineService {
-    return this.getProviderRegistration(providerId).createInstructionRefineService(plugin);
+  static resolveTitleGenerationSelection(settings: Record<string, unknown>): { providerId: ProviderId; model: string } | null {
+    const titleModel = typeof settings.titleGenerationModel === 'string'
+      ? settings.titleGenerationModel.trim()
+      : '';
+    if (!titleModel) return null;
+
+    const candidates = this.getRegisteredProviderIds().flatMap(providerId => {
+      if (!this.isEnabled(providerId, settings)) return [];
+      const model = findAvailableModelOption(providerId, this.getChatUIConfig(providerId), titleModel, settings);
+      return model ? [{ providerId, model }] : [];
+    });
+    return candidates.length === 1 ? candidates[0] : null;
   }
 
   static createInlineEditService(plugin: ProviderHost, providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID): InlineEditService {
-    return this.getProviderRegistration(providerId).createInlineEditService(plugin);
+    return new SharedInlineEditService(
+      this.createAuxiliaryExecutionContext(plugin, providerId),
+    );
+  }
+
+  private static createAuxiliaryExecutionContext(
+    plugin: ProviderHost,
+    providerId: ProviderId,
+  ): AuxiliaryExecutionContext {
+    return {
+      nativePersistence: this.getCapabilities(providerId).supportsEphemeralSessions
+        ? 'disabled-if-supported'
+        : 'provider-default',
+      backend: this.createExecutionBackend(plugin, providerId),
+      interactionPort: PASSIVE_AUXILIARY_INTERACTION_PORT,
+      lifecycleRegistry: plugin.executionLifecycleRegistry,
+      vaultWorkingDirectory: getVaultPath(plugin.app) ?? '.',
+    };
   }
 
   static getConversationHistoryService(
@@ -92,10 +141,10 @@ export class ProviderRegistry {
     return this.getProviderRegistration(providerId).taskResultInterpreter;
   }
 
-  static getSubagentLifecycleAdapter(
+  static getSubagentAdapter(
     providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID,
-  ): ProviderSubagentLifecycleAdapter | null {
-    return this.getProviderRegistration(providerId).subagentLifecycleAdapter ?? null;
+  ): ProviderSubagentAdapter | null {
+    return this.getProviderRegistration(providerId).subagentAdapter ?? null;
   }
 
   static getCapabilities(providerId: ProviderId = DEFAULT_CHAT_PROVIDER_ID): ProviderCapabilities {
@@ -126,7 +175,10 @@ export class ProviderRegistry {
           continue;
         }
         seenValues.add(option.value);
-        options.push(option);
+        options.push({
+          ...option,
+          label: `${this.getProviderDisplayName(providerId)}: ${option.label}`,
+        });
       }
     }
 
@@ -155,6 +207,11 @@ export class ProviderRegistry {
       .sort((a, b) => (
         this.getProviderRegistration(a).blankTabOrder - this.getProviderRegistration(b).blankTabOrder
       ));
+  }
+
+  /** Provider order as presented from top to bottom in the blank-tab model selector. */
+  static getBlankTabProviderIds(settings: Record<string, unknown>): ProviderId[] {
+    return this.getEnabledProviderIds(settings).reverse();
   }
 
   static getProviderDisplayName(providerId: ProviderId): string {
@@ -205,20 +262,11 @@ export class ProviderRegistry {
     settings: Record<string, unknown> = {},
     options: {
       onlyEnabledProviders?: boolean;
-      fallbackProviderId?: ProviderId;
     } = {},
-  ): ProviderId {
+  ): ProviderId | null {
     const providerIds = options.onlyEnabledProviders
       ? this.getEnabledProviderIds(settings)
       : this.getRegisteredProviderIds();
-    const fallbackProviderId = (
-      options.fallbackProviderId
-      && (!options.onlyEnabledProviders || this.isEnabled(options.fallbackProviderId, settings))
-    )
-      ? options.fallbackProviderId
-      : (options.onlyEnabledProviders
-        ? this.resolveSettingsProviderId(settings)
-        : DEFAULT_CHAT_PROVIDER_ID);
     const decodedSelection = decodeProviderModelSelectionId(model);
 
     if (
@@ -229,17 +277,9 @@ export class ProviderRegistry {
       return decodedSelection.providerId;
     }
 
-    for (const providerId of providerIds) {
-      if (providerId === fallbackProviderId) {
-        continue;
-      }
-
-      if (this.getChatUIConfig(providerId).ownsModel(model, settings)) {
-        return providerId;
-      }
-    }
-
-    return fallbackProviderId;
+    if (decodedSelection) return null;
+    const owners = providerIds.filter(providerId => this.getChatUIConfig(providerId).ownsModel(model, settings));
+    return owners.length === 1 ? owners[0] : null;
   }
 
   static getCustomModelIds(envVars: Record<string, string>): Set<string> {
@@ -253,51 +293,14 @@ export class ProviderRegistry {
   }
 }
 
-interface ActiveTitleGeneration {
-  service: TitleGenerationService;
-}
-
-class RoutedTitleGenerationService implements TitleGenerationService {
-  private readonly activeGenerations = new Map<string, ActiveTitleGeneration>();
-
-  constructor(private readonly plugin: ProviderHost) {}
-
-  async generateTitle(
-    conversationId: string,
-    userMessage: string,
-    callback: TitleGenerationCallback,
-  ): Promise<void> {
-    const providerId = ProviderRegistry.resolveTitleGenerationProviderId(
-      this.plugin.settings,
-    );
-    const service = ProviderRegistry.createTitleGenerationService(this.plugin, providerId);
-    const generation = { service };
-    const previous = this.activeGenerations.get(conversationId);
-
-    this.activeGenerations.set(conversationId, generation);
-    previous?.service.cancel();
-
-    try {
-      await service.generateTitle(conversationId, userMessage, async (convId, result) => {
-        if (this.activeGenerations.get(conversationId) !== generation) {
-          return;
-        }
-        await callback(convId, result);
-      });
-    } finally {
-      if (this.activeGenerations.get(conversationId) === generation) {
-        this.activeGenerations.delete(conversationId);
-      }
-    }
-  }
-
-  cancel(): void {
-    const services = new Set<TitleGenerationService>(
-      [...this.activeGenerations.values()].map(generation => generation.service),
-    );
-    this.activeGenerations.clear();
-    for (const service of services) {
-      service.cancel();
-    }
-  }
-}
+const PASSIVE_AUXILIARY_INTERACTION_PORT: ProviderInteractionPort = {
+  requestApproval: async request => ({
+    decision: 'cancel',
+    interactionId: request.interactionId,
+  }),
+  askUserQuestion: async request => ({
+    answers: null,
+    interactionId: request.interactionId,
+  }),
+  dismissInteraction: () => undefined,
+};

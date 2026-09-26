@@ -36,14 +36,10 @@ function findFirstExistingPath(entries: string[], candidates: string[]): string 
 
 function isExistingFile(filePath: string): boolean {
   try {
-    if (fs.existsSync(filePath)) {
-      const stat = fs.statSync(filePath);
-      return stat.isFile();
-    }
+    return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
   } catch {
-    // Inaccessible path
+    return false;
   }
-  return false;
 }
 
 function findClaudeCodeNodeEntrypoint(packageRoot: string): string | null {
@@ -103,7 +99,10 @@ function resolveClaudeFromPathEntries(
     return unixCandidate;
   }
 
-  const exeCandidate = findFirstExistingPath(entries, ['claude.exe', 'claude']);
+  // An extension-less `claude` on a Windows PATH entry is npm's POSIX sh shim, which
+  // cannot be spawned directly. Skip it like the .cmd shim and fall through to the
+  // Node-backed package entrypoint below.
+  const exeCandidate = findFirstExistingPath(entries, ['claude.exe']);
   if (exeCandidate) {
     return exeCandidate;
   }

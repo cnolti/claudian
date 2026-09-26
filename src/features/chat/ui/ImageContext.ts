@@ -1,8 +1,11 @@
 import { Notice } from 'obsidian';
 import * as path from 'path';
 
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
+
 import type { ImageAttachment, ImageMediaType } from '../../../core/types';
 import { ComposerContextTray } from './ComposerContextTray';
+import { ImagePreviewModal } from './ImagePreviewModal';
 
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 
@@ -15,7 +18,7 @@ const IMAGE_EXTENSIONS: Record<string, ImageMediaType> = {
 };
 
 export interface ImageContextCallbacks {
-  onImagesChanged?: () => void;
+  onUserImagesChanged?: () => void;
 }
 
 export class ImageContextManager {
@@ -23,14 +26,26 @@ export class ImageContextManager {
   private containerEl: HTMLElement;
   private contextTray: ComposerContextTray;
   private ownedContextTray: ComposerContextTray | null = null;
-  private inputEl: HTMLTextAreaElement;
+  private inputEl: ComposerInputElement;
   private dropOverlay: HTMLElement | null = null;
+  private dropZoneEl: HTMLElement | null = null;
   private attachedImages: Map<string, ImageAttachment> = new Map();
+  private readonly imagePreviewModal = new ImagePreviewModal();
+  private destroyed = false;
   private enabled = true;
+  private readonly dragEnterHandler = (event: DragEvent): void => this.handleDragEnter(event);
+  private readonly dragOverHandler = (event: DragEvent): void => this.handleDragOver(event);
+  private readonly dragLeaveHandler = (event: DragEvent): void => this.handleDragLeave(event);
+  private readonly dropHandler = (event: DragEvent): void => {
+    void this.handleDrop(event);
+  };
+  private readonly pasteHandler = (event: ClipboardEvent): void => {
+    void this.#handlePaste(event);
+  };
 
   constructor(
     containerEl: HTMLElement,
-    inputEl: HTMLTextAreaElement,
+    inputEl: ComposerInputElement,
     callbacks: ImageContextCallbacks,
     previewContainerEl?: HTMLElement,
     contextTray?: ComposerContextTray,
@@ -46,8 +61,13 @@ export class ImageContextManager {
       this.ownedContextTray = this.contextTray;
     }
 
-    this.setupDragAndDrop();
-    this.setupPasteHandler();
+    try {
+      this.#setupDragAndDrop();
+      this.#setupPasteHandler();
+    } catch (error) {
+      this.destroy();
+      throw error;
+    }
   }
 
   setEnabled(enabled: boolean): void {
@@ -68,7 +88,6 @@ export class ImageContextManager {
   clearImages() {
     this.attachedImages.clear();
     this.updateImagePreview();
-    this.callbacks.onImagesChanged?.();
   }
 
   /** Sets images directly (used for queued messages). */
@@ -78,55 +97,61 @@ export class ImageContextManager {
       this.attachedImages.set(image.id, image);
     }
     this.updateImagePreview();
-    this.callbacks.onImagesChanged?.();
   }
 
   destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.inputEl.removeEventListener('paste', this.pasteHandler, true);
+    if (this.dropZoneEl) {
+      this.dropZoneEl.removeEventListener('dragenter', this.dragEnterHandler);
+      this.dropZoneEl.removeEventListener('dragover', this.dragOverHandler);
+      this.dropZoneEl.removeEventListener('dragleave', this.dragLeaveHandler);
+      this.dropZoneEl.removeEventListener('drop', this.dropHandler);
+      this.dropZoneEl = null;
+    }
+    this.dropOverlay?.remove();
+    this.dropOverlay = null;
+    this.imagePreviewModal.close();
+    this.attachedImages.clear();
     this.contextTray.clearItems('images');
     this.ownedContextTray?.destroy();
     this.ownedContextTray = null;
   }
 
-  private setupDragAndDrop() {
+  #setupDragAndDrop() {
     const inputWrapper = this.containerEl.querySelector('.claudian-input-wrapper') as HTMLElement;
     if (!inputWrapper) return;
+    this.dropZoneEl = inputWrapper;
 
     this.dropOverlay = inputWrapper.createDiv({ cls: 'claudian-drop-overlay' });
     const dropContent = this.dropOverlay.createDiv({ cls: 'claudian-drop-content' });
-    const ownerDocument = inputWrapper.ownerDocument ?? window.document;
-    const svg = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const svg = dropContent.createSvg('svg');
     svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('width', '32');
     svg.setAttribute('height', '32');
     svg.setAttribute('fill', 'none');
     svg.setAttribute('stroke', 'currentColor');
     svg.setAttribute('stroke-width', '2');
-    const pathEl = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const pathEl = svg.createSvg('path');
     pathEl.setAttribute('d', 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4');
-    const polyline = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+    const polyline = svg.createSvg('polyline');
     polyline.setAttribute('points', '17 8 12 3 7 8');
-    const line = ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'line');
+    const line = svg.createSvg('line');
     line.setAttribute('x1', '12');
     line.setAttribute('y1', '3');
     line.setAttribute('x2', '12');
     line.setAttribute('y2', '15');
-    svg.appendChild(pathEl);
-    svg.appendChild(polyline);
-    svg.appendChild(line);
-    dropContent.appendChild(svg);
     dropContent.createSpan({ text: 'Drop image here' });
 
-    const dropZone = inputWrapper;
-
-    dropZone.addEventListener('dragenter', (e) => this.handleDragEnter(e));
-    dropZone.addEventListener('dragover', (e) => this.handleDragOver(e));
-    dropZone.addEventListener('dragleave', (e) => this.handleDragLeave(e));
-    dropZone.addEventListener('drop', (e) => {
-      void this.handleDrop(e);
-    });
+    inputWrapper.addEventListener('dragenter', this.dragEnterHandler);
+    inputWrapper.addEventListener('dragover', this.dragOverHandler);
+    inputWrapper.addEventListener('dragleave', this.dragLeaveHandler);
+    inputWrapper.addEventListener('drop', this.dropHandler);
   }
 
   private handleDragEnter(e: DragEvent) {
+    if (this.destroyed) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -136,11 +161,13 @@ export class ImageContextManager {
   }
 
   private handleDragOver(e: DragEvent) {
+    if (this.destroyed) return;
     e.preventDefault();
     e.stopPropagation();
   }
 
   private handleDragLeave(e: DragEvent) {
+    if (this.destroyed) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -162,6 +189,7 @@ export class ImageContextManager {
   }
 
   private async handleDrop(e: DragEvent) {
+    if (this.destroyed) return;
     e.preventDefault();
     e.stopPropagation();
     this.dropOverlay?.removeClass('visible');
@@ -177,25 +205,26 @@ export class ImageContextManager {
     }
   }
 
-  private setupPasteHandler() {
-    this.inputEl.addEventListener('paste', (e) => {
-      void (async (): Promise<void> => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
+  #setupPasteHandler() {
+    this.inputEl.addEventListener('paste', this.pasteHandler, true);
+  }
 
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        if (item.type.startsWith('image/')) {
-          e.preventDefault();
-          const file = item.getAsFile();
-          if (file) {
-            await this.addImageFromFile(file, 'paste');
-          }
-          return;
+  async #handlePaste(e: ClipboardEvent): Promise<void> {
+    if (this.destroyed) return;
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) {
+          await this.addImageFromFile(file, 'paste');
         }
+        return;
       }
-      })();
-    });
+    }
   }
 
   private isImageFile(file: File): boolean {
@@ -208,6 +237,7 @@ export class ImageContextManager {
   }
 
   private async addImageFromFile(file: File, source: 'paste' | 'drop'): Promise<boolean> {
+    if (this.destroyed) return false;
     if (!this.enabled) {
       new Notice('Image attachments are not supported by this provider.');
       return false;
@@ -226,6 +256,7 @@ export class ImageContextManager {
 
     try {
       const base64 = await this.fileToBase64(file);
+      if (this.destroyed) return false;
 
       const attachment: ImageAttachment = {
         id: this.generateId(),
@@ -238,9 +269,10 @@ export class ImageContextManager {
 
       this.attachedImages.set(attachment.id, attachment);
       this.updateImagePreview();
-      this.callbacks.onImagesChanged?.();
+      this.callbacks.onUserImagesChanged?.();
       return true;
     } catch (error) {
+      if (this.destroyed) return false;
       this.notifyImageError('Failed to attach image.', error);
       return false;
     }
@@ -273,42 +305,16 @@ export class ImageContextManager {
       onRemove: () => {
         this.attachedImages.delete(id);
         this.updateImagePreview();
-        this.callbacks.onImagesChanged?.();
+        this.callbacks.onUserImagesChanged?.();
       },
     })));
   }
 
   private showFullImage(image: ImageAttachment) {
+    if (this.destroyed) return;
+
     const ownerDocument = this.containerEl.ownerDocument ?? window.document;
-    const overlay = ownerDocument.body.createDiv({ cls: 'claudian-image-modal-overlay' });
-    const modal = overlay.createDiv({ cls: 'claudian-image-modal' });
-
-    modal.createEl('img', {
-      attr: {
-        src: `data:${image.mediaType};base64,${image.data}`,
-        alt: image.name,
-      },
-    });
-
-    const closeBtn = modal.createDiv({ cls: 'claudian-image-modal-close' });
-    closeBtn.setText('\u00D7');
-
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        close();
-      }
-    };
-
-    const close = () => {
-      ownerDocument.removeEventListener('keydown', handleEsc);
-      overlay.remove();
-    };
-
-    closeBtn.addEventListener('click', close);
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) close();
-    });
-    ownerDocument.addEventListener('keydown', handleEsc);
+    this.imagePreviewModal.open(ownerDocument, image);
   }
 
   private generateId(): string {

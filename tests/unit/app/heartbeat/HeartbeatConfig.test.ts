@@ -1,6 +1,6 @@
 import * as fs from 'fs/promises';
 
-import { loadConfig } from '../../../../src/app/heartbeat/HeartbeatConfig';
+import { loadConfig } from '@/app/heartbeat/HeartbeatConfig';
 
 jest.mock('fs/promises');
 

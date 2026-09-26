@@ -1,37 +1,10 @@
-# OpenCode Provider
+# OpenCode constraints
 
-`src/providers/opencode/` adapts OpenCode through Agent Client Protocol over an `opencode acp` subprocess.
-
-## Ownership
-
-- Runtime process management, ACP transport, prompt encoding, stream normalization, SQLite history hydration, model/mode discovery, command discovery, agent storage, settings UI, and OpenCode-specific settings reconciliation live here.
-- Shared code should consume OpenCode behavior through `ChatRuntime`, provider capabilities, and workspace-service contracts.
-
-## Protocol Rules
-
-- Live output comes from ACP session notifications and is normalized through `AcpSessionUpdateNormalizer` plus OpenCode tool normalization.
-- History hydration reads OpenCode's native SQLite database. Never mutate OpenCode native history from Claudian.
-- `providerState.databasePath` preserves the database used for a conversation. Keep it when building session updates.
-- `sessionCwds` maps ACP session IDs to vault working directories for read/write request path resolution.
-
-## Launch and Settings
-
-- `prepareOpencodeLaunchArtifacts()` writes managed config and system prompt files under `.claudian/opencode/`.
-- Preserve user OpenCode config by loading `OPENCODE_CONFIG` and layering Claudian-managed agent config over it.
-- Environment keys that affect config or data location invalidate OpenCode sessions: `OPENCODE_CONFIG`, `OPENCODE_DB`, `OPENCODE_DISABLE_PROJECT_CONFIG`, and `XDG_DATA_HOME`.
-- OpenCode mode IDs map to shared permission modes. Keep this mapping in `modes.ts`, not feature code.
-
-## Commands and Agents
-
-- Runtime commands are read from the OpenCode session and exposed through `OpencodeCommandCatalog`.
-- OpenCode runtime commands are not editable or deletable from Claudian.
-- Command discovery warmup for blank tabs should use the isolated metadata database, not a persisted conversation session.
-- Do not let command discovery create a real session for history-backed conversations that have messages but no provider session yet.
-- OpenCode agent definitions are stored under `.opencode/agent` and `.opencode/agents`; keep parsing and serialization in `OpencodeAgentStorage`.
-
-## Gotchas
-
-- `OpencodeAuxQueryRunner` owns its own process and session. It is independent from the chat runtime.
-- File read/write permission requests may target paths outside the session working directory. Preserve the existing approval mapping and path checks.
-- SQLite reading uses `OpencodeSqliteReader` fallbacks because runtime environments may not expose the same SQLite API.
-- OpenCode metadata warmup intentionally uses an in-memory or metadata database to avoid binding tab state to discovery work.
+- Managed launch artifacts may layer over user configuration, never replace it.
+- Preserve the conversation's trusted database path across session updates until a typed history/environment transition replaces it. Recovery locators cannot become live bindings.
+- File requests use the kernel's captured working directory and approval policy, including out-of-directory requests; feature code must not recreate that policy.
+- Session-based model/command probes use isolated metadata storage. V2 may query native catalog endpoints with the native database to retain saved credentials, but must never create a session. Discovery must not create a real chat session for history-backed conversations lacking a native binding.
+- Environment/CLI fingerprint changes invalidate native bindings and fence discovery publication; keep catalog rows until explicit refresh.
+- V2 keeps saved credentials in its native database, so executions that request in-memory storage run against the native database and delete their native session on disposal.
+- V2 consumers may share a process for a compatible environment and persistent database, including auxiliary sessions as an exception to independent process ownership. Sessions still own cancellation and interactions independently; in-memory execution and different database bindings require separate processes. Dynamic system instructions must use distinct agent definitions, never mutate an agent used by another session.
+- Preserve SQLite-reader fallbacks needed by different Obsidian runtime environments.

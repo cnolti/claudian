@@ -1,37 +1,53 @@
 # Claudian
 
-![GitHub stars](https://img.shields.io/github/stars/YishenTu/claudian?style=social)
-![GitHub release](https://img.shields.io/github/v/release/YishenTu/claudian)
-![License](https://img.shields.io/github/license/YishenTu/claudian)
+<p>
+  <a href="https://trendshift.io/repositories/21115?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-21115">
+    <img align="right" src="https://trendshift.io/api/badge/repositories/21115" alt="Claudian on Trendshift" width="180">
+  </a>
+  <img src="https://img.shields.io/github/stars/YishenTu/claudian" alt="GitHub stars" vspace="10">
+  <a href="https://community.obsidian.md/plugins/realclaudian">
+    <img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json&amp;query=%24%5B%22realclaudian%22%5D.downloads&amp;label=downloads&amp;logo=obsidian&amp;color=7C3AED" alt="Obsidian downloads" vspace="10">
+  </a>
+  <img src="https://img.shields.io/github/v/release/YishenTu/claudian" alt="GitHub release" vspace="10">
+  <img src="https://img.shields.io/github/license/YishenTu/claudian" alt="License" vspace="10">
+  <br clear="both">
+</p>
 
 ![Preview](assets/Preview.png)
 
-An Obsidian plugin that embeds AI coding agents (Claude Code, Codex, Opencode, Pi, and more to come) in your vault. Your vault becomes the agent's working directory — file read/write, search, bash, and multi-step workflows all work out of the box.
+An Obsidian plugin that embeds AI coding agents (Claude Code, Codex, Grok, Opencode, Pi, and more to come) in your vault. Your vault becomes the agent's working directory — file read/write, search, bash, and multi-step workflows all work out of the box.
 
 ## Features & Usage
 
-Open the chat sidebar from the ribbon icon or command palette. Select text and use the hotkey for inline edit. Everything works like your familiar coding agent, Claude Code, Codex, Opencode, and Pi — talk to the agent, and it reads, writes, edits, and searches files in your vault.
+Open the chat sidebar from the ribbon icon or command palette. Select text and use the shortcut for inline editing. Everything works like your familiar coding agent, Claude Code, Codex, Grok, Opencode, and Pi — talk to the agent, and it reads, writes, edits, and searches files in your vault.
 
 **Inline Edit** — Select text or start at the cursor position + hotkey to edit directly in notes with word-level diff preview.
 
 **Slash Commands & Skills** — Type `/` or `$` for reusable prompt templates or Skills from user- and vault-level scopes.
 
-**`@mention`** - Type `@` to mention anything you want the agent to work with, vault files, subagents, MCP servers, or files in external directories.
+**`@mention`** — Type `@` to reference vault files and folders.
 
-**Plan Mode** — Toggle via `Shift+Tab`. The agent explores and designs before implementing, then presents a plan for approval.
+**Side Chat (`/side` or `/btw`)** — Explore a separate, temporary conversation with follow-ups and tools while keeping the main chat unchanged.
 
-**Instruction Mode (`#`)** — Refined custom instructions added from the chat input.
+**MCP Servers** — Connect external tools through each coding agent's native CLI-managed MCP configuration.
 
-**MCP Servers** — Connect external tools via Model Context Protocol (stdio, SSE, HTTP). Claude manages vault MCP in-app; Codex uses its own CLI-managed MCP configuration.
+**Tabs & Session Management** — Use multiple tabs in single-panel mode or a persistent session manager beside the chat in dual-pane mode.
 
-**Multi-Tab & Conversations** — Multiple chat tabs, conversation history, fork, resume, and compact.
+**Collaboration** — Collab is now a standalone plugin. See [Claudian Collab](https://github.com/YishenTu/claudian-collab).
 
 ## Requirements
 
-- **Claude provider**: [Claude Code CLI](https://code.claude.com/docs/en/overview) installed (native install recommended). Claude subscription/API or compatible provider ([Openrouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.kimi.ai/docs/guide/claude-code-kimi), [GLM](https://docs.z.ai/devpack/tool/claude) etc.).
-- **Optional providers**: [Codex CLI](https://github.com/openai/codex), [Opencode](https://opencode.ai/), [Pi](https://github.com/earendil-works/pi).
-- Obsidian v1.7.2+
+- At least one of the following harnesses:
+  - [Claude Code CLI](https://code.claude.com/docs/en/overview)
+  - [Codex CLI](https://github.com/openai/codex)
+  - [Grok Build](https://github.com/xai-org/grok-build)
+  - [OpenCode](https://github.com/anomalyco/opencode)
+  - [Pi](https://github.com/earendil-works/pi)
+- A compatible subscription or API provider, such as [OpenRouter](https://openrouter.ai/docs/guides/guides/claude-code-integration), [Kimi](https://platform.kimi.ai/docs/guide/claude-code-kimi), [GLM](https://docs.z.ai/devpack/tool/claude), or [DeepSeek](https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code) etc.
+- Obsidian v1.13.0+
 - Desktop only (macOS, Linux, Windows)
+
+Claudian now supports OpenCode v2, OpenCode v1 support will end on October 30, 2026. See the [OpenCode v2 migration guide](https://opencode.ai/v2/docs/migrate-v1).
 
 ## Installation
 
@@ -42,17 +58,6 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 3. Enable the plugin
 
 Or install directly from the [community plugin page](https://community.obsidian.md/plugins/realclaudian).
-
-### From GitHub Release
-
-1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/YishenTu/claudian/releases/latest)
-2. Create a folder called `claudian` in your vault's plugins folder:
-   ```
-   /path/to/vault/.obsidian/plugins/claudian/
-   ```
-3. Copy the downloaded files into the `claudian` folder
-4. Enable the plugin in Obsidian:
-   - Settings → Community plugins → Enable "Claudian"
 
 ### From source (development)
 
@@ -84,19 +89,18 @@ npm run build
 
 ## Privacy & Data Use
 
-- **Sent to API**: Your input, attached files, images, and tool call outputs. Default: Anthropic (Claude), OpenAI (Codex), or the provider configured in Opencode/Pi; configurable via provider settings and environment variables.
-- **Local storage**: Claudian settings and session metadata in `vault/.claudian/`; Claude provider files in `vault/.claude/`; transcripts in `~/.claude/projects/` (Claude), `~/.codex/sessions/` (Codex), and `.pi/agent/sessions/` or `~/.pi/agent/sessions/` (Pi).
-- **Environment variables**: Provider subprocesses inherit the Obsidian process environment plus any variables you configure in Claudian. This is needed for CLI authentication, proxies, certificates, and PATH resolution.
-- **Device-specific paths**: Per-device CLI paths use an opaque local key stored in browser local storage, not your system hostname.
-- **Background activity**: Claudian does not run telemetry beacons. UI polling timers read local Obsidian/editor selection state only. Network activity is limited to explicit provider runtime work, configured MCP endpoints, and provider SDK/CLI calls needed to answer your requests.
+- **Sent to API**: Your input, attached files, images, and tool call outputs. Depending on the selected provider, data is sent to Anthropic (Claude), OpenAI (Codex), xAI (Grok), or the providers configured in OpenCode or Pi. The destination can be configured through provider settings and environment variables.
+- **No telemetry or unsolicited background activity**: Claudian does not run telemetry beacons. UI polling timers read local Obsidian/editor selection state only. Network activity is limited to explicit provider runtime work, configured MCP endpoints, provider SDK/CLI calls needed to answer your requests, and their configured services.
 
 ## Troubleshooting
 
-### Claude CLI not found
+The following sections use Claude Code as an example.
 
-If you encounter `spawn claude ENOENT` or `Claude CLI not found`, the plugin can't auto-detect your Claude installation. Common with Node version managers (nvm, fnm, volta).
+### Provider CLI not found
 
-**Solution**: Leave the setting empty first so Claudian can auto-detect Claude Code. If auto-detection fails, find your CLI path and set it in Settings → Advanced → Claude CLI path.
+If Claudian cannot auto-detect a provider CLI, verify that the CLI is installed and available to GUI applications through PATH. Typical errors include `spawn claude ENOENT` and `Claude CLI not found`. This issue is common with Node version managers (nvm, fnm, volta).
+
+Leave the CLI path setting empty first so Claudian can auto-detect the CLI. If auto-detection fails, find the executable path and set it in Settings → Advanced → Claude CLI path.
 
 | Platform | Command | Example Path |
 |----------|---------|--------------|
@@ -108,40 +112,43 @@ If you encounter `spawn claude ENOENT` or `Claude CLI not found`, the plugin can
 
 **Alternative**: Add your Node.js bin directory to PATH in Settings → Environment → Custom variables.
 
-### npm CLI and Node.js not in same directory
+### npm CLI and Node.js not in the same directory
 
-If using npm-installed CLI, check if `claude` and `node` are in the same directory:
+When using an npm-installed provider CLI, make sure its executable and Node.js are available from the same environment. Check their paths:
+
 ```bash
 dirname $(which claude)
 dirname $(which node)
 ```
 
-If different, GUI apps like Obsidian may not find Node.js.
+If the paths differ, GUI apps like Obsidian may not find Node.js.
 
-**Solutions**:
-1. Install native binary (recommended)
-2. Add Node.js path to Settings → Environment: `PATH=/path/to/node/bin`
+Either:
 
-### Other providers
+1. Install the native binary (recommended).
+2. Add the Node.js path in Settings → Environment: `PATH=/path/to/node/bin`.
 
-Codex, Opencode, and Pi support are live but features might be incomplete, and still need more testing across platforms and installation methods. If you have feature request or run into any bugs, please [submit a GitHub issue](https://github.com/YishenTu/claudian/issues).
+### More help
+
+For provider-specific installation and configuration guidance, refer to the provider documentation linked in the [Requirements](#requirements) section. If you have a feature request or run into a bug, please [submit a GitHub issue](https://github.com/YishenTu/claudian/issues).
 
 ## Architecture
 
 ```
 src/
 ├── main.ts                      # Plugin entry point
-├── app/                         # Shared defaults and plugin-level storage
-├── core/                        # Provider-neutral runtime, registry, and type contracts
-│   ├── runtime/                 # ChatRuntime interface and approval types
+├── app/                         # Application services, and storage
+├── core/                        # Provider-neutral execution, registry, and type contracts
+│   ├── execution/               # Provider execution, session lifecycle, and interaction contracts
 │   ├── providers/               # Provider registry and workspace services
 │   ├── auxiliary/               # Shared provider auxiliary services
 │   ├── bootstrap/               # Plugin bootstrap wiring
 │   ├── security/                # Approval utilities
-│   └── ...                      # commands, mcp, prompt, storage, tools, types
+│   └── ...                      # commands, prompt, storage, tools, types
 ├── providers/
 │   ├── claude/                  # Claude SDK adaptor, prompt encoding, storage, MCP, plugins
 │   ├── codex/                   # Codex app-server adaptor, JSON-RPC transport, JSONL history
+│   ├── grok/                    # Grok Build ACP adaptor, native history, models, and tools
 │   ├── opencode/                # Opencode adaptor
 │   ├── pi/                      # Pi RPC adaptor, model discovery, JSONL history
 │   └── acp/                     # Agent Client Protocol shared transport
@@ -156,35 +163,45 @@ src/
 └── style/                       # Modular CSS
 ```
 
-## License
+## Contributing
 
-Licensed under the [MIT License](LICENSE).
+Issues and focused pull requests are welcome. Issues are the preferred starting point: describe the problem, reproduction steps, and environment clearly so it can be investigated.
 
-## Sponsorship
-
-### Ke Holdings Inc. (BEIKE)
-
-<img src="assets/sponsors/MOMA.png" alt="MOMA" width="90%">
-
-Claudian is proudly sponsored by Ke Holdings Inc. (BEIKE) and the MOMA team. Their support helps Claudian continue to
-improve through ongoing development and maintenance.
-
-> Want to support Claudian or appear here? Contact me: [tysk01213@gmail.com](mailto:tysk01213@gmail.com).
+Before opening a pull request, please read the [contribution guide](CONTRIBUTING.md). Pull requests must explain the problem, the proposed solution, why the approach is appropriate, and how the change was validated. Pull requests that add a new provider are not accepted; the guide explains this maintenance and product-quality boundary in detail.
 
 ## Star History
 
 <a href="https://www.star-history.com/?repos=YishenTu%2Fclaudian&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&theme=dark&legend=top-left&sealed_token=gXv_vWhYBwlA0DehVo1Lwkf2jquI2mMAgmTawJA0nVFNaSdTkokMxxdjqk3zfUqWZKVuPlPi9e5hzWb3265cHWdgwm8Y-n3D7X4pyPM6w0sKWGE_WlHHTO-Gf3zoeP3XG8p3cHVEg_7oq3rhjLXpNFrluGUDWtFP3bwenzBJhHvoLmJaHUPD6KGHLqyO" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&legend=top-left&sealed_token=gXv_vWhYBwlA0DehVo1Lwkf2jquI2mMAgmTawJA0nVFNaSdTkokMxxdjqk3zfUqWZKVuPlPi9e5hzWb3265cHWdgwm8Y-n3D7X4pyPM6w0sKWGE_WlHHTO-Gf3zoeP3XG8p3cHVEg_7oq3rhjLXpNFrluGUDWtFP3bwenzBJhHvoLmJaHUPD6KGHLqyO" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&legend=top-left&sealed_token=gXv_vWhYBwlA0DehVo1Lwkf2jquI2mMAgmTawJA0nVFNaSdTkokMxxdjqk3zfUqWZKVuPlPi9e5hzWb3265cHWdgwm8Y-n3D7X4pyPM6w0sKWGE_WlHHTO-Gf3zoeP3XG8p3cHVEg_7oq3rhjLXpNFrluGUDWtFP3bwenzBJhHvoLmJaHUPD6KGHLqyO" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&theme=dark&legend=top-left&sealed_token=UAS9n3qO4GyhCCkOr9kcAl7msVtDEz-DoQTkpFuPrAELxMEK9PQWj9zG566afbx0CkF5OoIbLRkxiDIoMRCK5Q-HXbLUiimg1lT8wKDdcc_eP48_EodHFrR6UtY8jS7Mzik4lLd_sY8oVj2I42lISFB1tSlr4gnXwOCNwtTn6iQakbru7yKPIO3uVYpP" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&legend=top-left&sealed_token=UAS9n3qO4GyhCCkOr9kcAl7msVtDEz-DoQTkpFuPrAELxMEK9PQWj9zG566afbx0CkF5OoIbLRkxiDIoMRCK5Q-HXbLUiimg1lT8wKDdcc_eP48_EodHFrR6UtY8jS7Mzik4lLd_sY8oVj2I42lISFB1tSlr4gnXwOCNwtTn6iQakbru7yKPIO3uVYpP" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=YishenTu/claudian&type=date&legend=top-left&sealed_token=UAS9n3qO4GyhCCkOr9kcAl7msVtDEz-DoQTkpFuPrAELxMEK9PQWj9zG566afbx0CkF5OoIbLRkxiDIoMRCK5Q-HXbLUiimg1lT8wKDdcc_eP48_EodHFrR6UtY8jS7Mzik4lLd_sY8oVj2I42lISFB1tSlr4gnXwOCNwtTn6iQakbru7yKPIO3uVYpP" />
  </picture>
 </a>
 
-## Acknowledgments
+## Sponsorship
 
-- [Obsidian](https://obsidian.md) for the plugin API
-- [Anthropic](https://anthropic.com) for Claude and the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)
-- [OpenAI](https://openai.com) for [Codex](https://github.com/openai/codex)
-- [Opencode](https://opencode.ai/) 
-- [Pi](https://github.com/earendil-works/pi)
+### Kimi (Moonshot AI)
+
+<img src="https://gcdn.moonshot.cn/growth-cdn/sponsor/kimi-en.png" alt="Kimi (Moonshot AI)" width="90%">
+
+Thanks to Kimi (Moonshot AI), our Open Source Friend, for supporting Claudian! With 2.8T parameters, native vision, and a
+1-million-token context window, Kimi K3 delivers frontier performance across long-horizon coding, knowledge work, and
+reasoning.
+
+New users receive bonus API credits equal to 10% of their first successful top-up. Use the discount link for the
+[CN](https://platform.kimi.com?track_id=track-1f391886e67141d4866ff9d261767ee7&aff=claudian) or
+[Global](https://platform.kimi.ai?track_id=track-9800ef0cb7f444b1b33371617443c186&aff=claudian) platform. This offer
+ends September 30, 2026. Claudian receives no affiliate commission from these links.
+
+### Ke Holdings Inc. (BEIKE)
+
+<img src="assets/sponsors/MOMA.png" alt="MOMA" width="90%">
+
+Claudian is proudly sponsored by Ke Holdings Inc. (BEIKE) and the MOMA team. Their support helps Claudian continue to improve through ongoing development and maintenance.
+
+> Want to support Claudian or appear here? Contact me: [tysk01213@gmail.com](mailto:tysk01213@gmail.com).
+
+## License
+
+Licensed under the [MIT License](LICENSE).

@@ -1,20 +1,47 @@
-import type { ChatTurnRequest } from '../../../core/runtime/types';
-import type { ChatMessage } from '../../../core/types';
-import { appendBrowserContext } from '../../../utils/browser';
-import { appendCanvasContext } from '../../../utils/canvas';
-import { appendCurrentNote } from '../../../utils/context';
-import { appendEditorContext } from '../../../utils/editor';
+import type { ProviderLinkedContentContext } from '../../../core/execution';
+import type { ChatMessage, ImageAttachment } from '../../../core/types';
+import {
+  appendBrowserContext,
+  type BrowserSelectionContext,
+} from '../../../utils/browser';
+import {
+  appendCanvasContext,
+  type CanvasSelectionContext,
+} from '../../../utils/canvas';
+import {
+  appendLinkedContent,
+  appendLinkedContentBody,
+} from '../../../utils/context';
+import {
+  appendEditorContext,
+  type EditorSelectionContext,
+} from '../../../utils/editor';
 import { buildContextFromHistory, buildPromptWithHistoryContext } from '../../../utils/session';
-import type { AcpContentBlock } from '../../acp';
+import type { ACPContentBlock } from '../../acp';
+
+export interface OpencodePromptRequest {
+  text: string;
+  images?: ImageAttachment[];
+  linkedContent?: ProviderLinkedContentContext;
+  editorSelection?: EditorSelectionContext | null;
+  browserSelection?: BrowserSelectionContext | null;
+  canvasSelection?: CanvasSelectionContext | null;
+}
 
 export function buildOpencodePromptText(
-  request: ChatTurnRequest,
+  request: OpencodePromptRequest,
   conversationHistory: ChatMessage[] = [],
 ): string {
   let prompt = request.text;
 
-  if (request.currentNotePath) {
-    prompt = appendCurrentNote(prompt, request.currentNotePath);
+  if (request.linkedContent) {
+    prompt = request.linkedContent.content === undefined
+      ? appendLinkedContent(prompt, request.linkedContent.path)
+      : appendLinkedContentBody(
+        prompt,
+        request.linkedContent.path,
+        request.linkedContent.content,
+      );
   }
 
   if (request.editorSelection && request.editorSelection.mode !== 'none') {
@@ -43,10 +70,10 @@ export function buildOpencodePromptText(
 }
 
 export function buildOpencodePromptBlocks(
-  request: ChatTurnRequest,
+  request: OpencodePromptRequest,
   conversationHistory: ChatMessage[] = [],
-): AcpContentBlock[] {
-  const blocks: AcpContentBlock[] = [
+): ACPContentBlock[] {
+  const blocks: ACPContentBlock[] = [
     { type: 'text', text: buildOpencodePromptText(request, conversationHistory) },
   ];
 

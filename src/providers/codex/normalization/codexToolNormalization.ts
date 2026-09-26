@@ -1,7 +1,7 @@
 /**
  * Shared Codex tool normalization layer.
  *
- * Used by both CodexChatRuntime (live streaming) and CodexHistoryStore (history reload)
+ * Used by both live execution normalization and CodexHistoryStore (history reload)
  * to ensure tool identity parity between live and restored conversations.
  */
 
@@ -45,6 +45,11 @@ export interface NormalizedCodexToolCall {
   input: Record<string, unknown>;
 }
 
+export interface DecodedCodexExecEnvelopeCall extends NormalizedCodexToolCall {
+  rawName: string;
+  rawInput: Record<string, unknown>;
+}
+
 export function normalizeCodexToolCall(
   rawName: string | undefined,
   rawInput: Record<string, unknown>,
@@ -63,6 +68,15 @@ export function normalizeCodexToolCall(
 export function decodeCodexExecEnvelope(
   input: Record<string, unknown>,
 ): NormalizedCodexToolCall[] | null {
+  return decodeCodexExecEnvelopeCalls(input)?.map(({ name, input: normalizedInput }) => ({
+    name,
+    input: normalizedInput,
+  })) ?? null;
+}
+
+export function decodeCodexExecEnvelopeCalls(
+  input: Record<string, unknown>,
+): DecodedCodexExecEnvelopeCall[] | null {
   const source = firstNonEmptyString(input.raw, input.value);
   if (!source) return null;
 
@@ -72,11 +86,13 @@ export function decodeCodexExecEnvelope(
   const calls = findExecEnvelopeToolCalls(tokens);
   if (!calls || calls.length === 0) return null;
 
-  const decodedCalls: NormalizedCodexToolCall[] = [];
+  const decodedCalls: DecodedCodexExecEnvelopeCall[] = [];
   for (const call of calls) {
     const rawInput = decodeExecEnvelopeToolInput(tokens, call);
     if (!rawInput) return null;
     decodedCalls.push({
+      rawName: call.name,
+      rawInput,
       name: normalizeCodexToolName(call.name),
       input: normalizeCodexToolInput(call.name, rawInput),
     });
@@ -618,30 +634,30 @@ function normalizeStringArray(value: unknown): string[] {
 // MCP tool normalization
 // ---------------------------------------------------------------------------
 
-interface CodexMcpResultPart {
+interface CodexMCPResultPart {
   type?: string;
   text?: string;
 }
 
-interface CodexMcpResultPayload {
-  content?: CodexMcpResultPart[] | null;
+interface CodexMCPResultPayload {
+  content?: CodexMCPResultPart[] | null;
 }
 
-export interface NormalizedCodexMcpToolState {
+export interface NormalizedCodexMCPToolState {
   isTerminal: boolean;
   isError: boolean;
   status: 'running' | 'completed' | 'error';
   result?: string;
 }
 
-export function normalizeCodexMcpToolName(server: unknown, tool: unknown): string {
+export function normalizeCodexMCPToolName(server: unknown, tool: unknown): string {
   const serverName = typeof server === 'string' ? server : '';
   const toolName = typeof tool === 'string' ? tool : '';
   if (!serverName && !toolName) return 'tool';
   return `mcp__${serverName}__${toolName}`;
 }
 
-export function normalizeCodexMcpToolInput(rawArguments: unknown): Record<string, unknown> {
+export function normalizeCodexMCPToolInput(rawArguments: unknown): Record<string, unknown> {
   if (typeof rawArguments === 'string') {
     return parseCodexArguments(rawArguments);
   }
@@ -653,14 +669,14 @@ export function normalizeCodexMcpToolInput(rawArguments: unknown): Record<string
   return {};
 }
 
-export function normalizeCodexMcpToolState(
+export function normalizeCodexMCPToolState(
   rawStatus: unknown,
   resultPayload?: unknown,
   rawError?: unknown,
-): NormalizedCodexMcpToolState {
+): NormalizedCodexMCPToolState {
   const status = typeof rawStatus === 'string' ? rawStatus : '';
   const error = typeof rawError === 'string' ? rawError : '';
-  const resultText = extractCodexMcpResultText(resultPayload);
+  const resultText = extractCodexMCPResultText(resultPayload);
   const isTerminalStatus = status === 'completed'
     || status === 'failed'
     || status === 'error'
@@ -681,10 +697,10 @@ export function normalizeCodexMcpToolState(
   };
 }
 
-function extractCodexMcpResultText(resultPayload?: unknown): string {
+function extractCodexMCPResultText(resultPayload?: unknown): string {
   if (!resultPayload || typeof resultPayload !== 'object') return '';
 
-  const content = (resultPayload as CodexMcpResultPayload).content;
+  const content = (resultPayload as CodexMCPResultPayload).content;
   if (!Array.isArray(content)) return '';
 
   return content

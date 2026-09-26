@@ -1,8 +1,24 @@
 import {
+  type CodexDiscoveredModel,
   findCodexModel,
   getDefaultCodexModel,
   normalizeCodexDiscoveredModels,
+  resolveCodexModelServiceTier,
 } from '@/providers/codex/models';
+
+function createFastModel(defaultServiceTier: string | null = null): CodexDiscoveredModel {
+  return {
+    model: 'gpt-5.6-sol',
+    displayName: 'GPT-5.6-Sol',
+    description: 'Latest frontier agentic coding model.',
+    supportedReasoningEfforts: [{ value: 'low', description: 'Fast responses' }],
+    defaultReasoningEffort: 'low',
+    serviceTiers: [{ id: 'priority', name: 'Fast', description: '1.5x speed' }],
+    defaultServiceTier,
+    inputModalities: ['text', 'image'],
+    isDefault: true,
+  };
+}
 
 describe('Codex models', () => {
   const rawModels = [
@@ -45,7 +61,7 @@ describe('Codex models', () => {
     },
   ];
 
-  it('normalizes app-server model metadata while excluding ultra', () => {
+  it('normalizes all app-server reasoning efforts without changing model capabilities', () => {
     expect(normalizeCodexDiscoveredModels(rawModels)).toEqual([
       {
         model: 'gpt-5.6-sol',
@@ -54,6 +70,7 @@ describe('Codex models', () => {
         supportedReasoningEfforts: [
           { value: 'low', description: 'Fast responses' },
           { value: 'max', description: 'Maximum reasoning' },
+          { value: 'ultra', description: 'Automatic task delegation' },
         ],
         defaultReasoningEffort: 'low',
         serviceTiers: [
@@ -80,7 +97,7 @@ describe('Codex models', () => {
     ]);
   });
 
-  it('keeps a model when its excluded app-server default is ultra', () => {
+  it('preserves an app-server default of ultra in the discovered catalog', () => {
     expect(normalizeCodexDiscoveredModels([{
       ...rawModels[0],
       defaultReasoningEffort: 'ultra',
@@ -92,10 +109,11 @@ describe('Codex models', () => {
     }])).toEqual([
       expect.objectContaining({
         model: 'gpt-5.6-sol',
-        defaultReasoningEffort: 'high',
+        defaultReasoningEffort: 'ultra',
         supportedReasoningEfforts: [
           { value: 'low', description: 'Fast responses' },
           { value: 'high', description: 'Deep reasoning' },
+          { value: 'ultra', description: 'Automatic task delegation' },
         ],
       }),
     ]);
@@ -119,6 +137,41 @@ describe('Codex models', () => {
 
     expect(getDefaultCodexModel(models)?.model).toBe('gpt-5.6-sol');
     expect(findCodexModel(models, 'gpt-5.6-luna')?.displayName).toBe('GPT-5.6-Luna');
+  });
+
+  it.each([
+    {
+      caseName: 'returns no tier without a model',
+      model: null,
+      selectedServiceTier: 'priority',
+      expectedServiceTier: null,
+    },
+    {
+      caseName: 'preserves explicit Standard when the catalog defaults to Fast',
+      model: createFastModel('priority'),
+      selectedServiceTier: 'default',
+      expectedServiceTier: 'default',
+    },
+    {
+      caseName: 'preserves an advertised tier id',
+      model: createFastModel(),
+      selectedServiceTier: 'priority',
+      expectedServiceTier: 'priority',
+    },
+    {
+      caseName: 'maps the legacy Fast value to the advertised tier id',
+      model: createFastModel(),
+      selectedServiceTier: 'fast',
+      expectedServiceTier: 'priority',
+    },
+    {
+      caseName: 'uses the catalog default for an invalid selection',
+      model: createFastModel('priority'),
+      selectedServiceTier: 'unsupported',
+      expectedServiceTier: 'priority',
+    },
+  ])('$caseName', ({ model, selectedServiceTier, expectedServiceTier }) => {
+    expect(resolveCodexModelServiceTier(model, selectedServiceTier)).toBe(expectedServiceTier);
   });
 
   it('rejects malformed entries, hidden entries, duplicate models, and invalid defaults', () => {

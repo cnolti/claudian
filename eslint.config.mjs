@@ -1,4 +1,5 @@
 import js from '@eslint/js';
+import eslintComments from '@eslint-community/eslint-plugin-eslint-comments';
 import tseslint from '@typescript-eslint/eslint-plugin';
 import jestPlugin from 'eslint-plugin-jest';
 import obsidianmd from 'eslint-plugin-obsidianmd';
@@ -11,7 +12,87 @@ import { fileURLToPath } from 'node:url';
 
 const jestRecommended = jestPlugin.configs['flat/recommended'];
 const tsconfigRootDir = dirname(fileURLToPath(import.meta.url));
-const obsidianRuleSeverity = 'warn';
+const obsidianRuleSeverity = 'error';
+
+// Keep acronym boundaries explicit so ordinary words such as Client stay intact.
+const filenameAcronyms = [
+  'ACP', 'API', 'CLI', 'CSS', 'DOM', 'HTML', 'HTTP', 'HTTPS', 'ID', 'JS',
+  'JSON', 'JSONL', 'LAN', 'MCP', 'RPC', 'SDK', 'SQL', 'TLS', 'UI', 'URI', 'URL', 'XML',
+];
+const acronymSpellings = new Map(filenameAcronyms.map(acronym => [
+  acronym[0] + acronym.slice(1).toLowerCase(), acronym,
+]));
+const acronymWords = new RegExp(`(${[...acronymSpellings.keys()].sort((a, b) => b.length - a.length).join('|')})(s?)(?=[A-Z0-9]|$)`, 'g');
+const preserveAcronyms = name => name.replace(acronymWords, (_, word, plural) => acronymSpellings.get(word) + plural);
+
+// Enforces the file naming conventions from AGENTS.md without extra dependencies.
+// Exported so scripts/check-eslint-config.test.mjs can exercise it directly.
+export const fileNamingRule = {
+  meta: {
+    type: 'suggestion',
+    docs: { description: 'Enforce the file naming conventions from AGENTS.md' },
+    messages: {
+      invalidCase:
+        "Filename '{{name}}' must use camelCase, PascalCase, or kebab-case (see AGENTS.md naming conventions).",
+      acronymCase:
+        "Filename '{{name}}' must preserve acronym capitals ('{{expected}}').",
+      conceptMismatch:
+        "File '{{name}}' exports '{{concept}}'; modules with a primary named concept use a PascalCase filename ('{{concept}}.ts').",
+    },
+  },
+  create(context) {
+    const filename = context.physicalFilename ?? context.filename;
+    const base = filename.split(/[\\/]/).pop() ?? '';
+    if (!base.endsWith('.ts')) return {};
+    const first = base.split('.')[0];
+    if (first === 'index' || first === 'types') return {};
+    const isCamel = /^[a-z][a-zA-Z0-9]*$/.test(first);
+    const isPascal = /^[A-Z][a-zA-Z0-9]*$/.test(first);
+    const isKebab = /^[a-z0-9]+(-[a-z0-9]+)*$/.test(first);
+    return {
+      Program(node) {
+        if (!isCamel && !isPascal && !isKebab) {
+          context.report({ node, messageId: 'invalidCase', data: { name: base } });
+          return;
+        }
+        const expected = preserveAcronyms(first);
+        if (expected !== first) {
+          context.report({ node, messageId: 'acronymCase', data: {
+            name: base, expected: expected + base.slice(first.length),
+          } });
+          return;
+        }
+        if (!isCamel) return;
+        const concept = preserveAcronyms(first.charAt(0).toUpperCase() + first.slice(1));
+        for (const statement of node.body) {
+          if (statement.type !== 'ExportNamedDeclaration' || !statement.declaration) continue;
+          const declaration = statement.declaration;
+          const declared =
+            declaration.type === 'VariableDeclaration'
+              ? declaration.declarations.map((d) => d.id).filter((id) => id.type === 'Identifier')
+              : declaration.id
+                ? [declaration.id]
+                : [];
+          if (declared.some((id) => id.name === concept)) {
+            context.report({ node: statement, messageId: 'conceptMismatch', data: { name: base, concept } });
+            return;
+          }
+        }
+      },
+    };
+  },
+};
+
+const localPlugin = { rules: { 'file-naming': fileNamingRule } };
+
+// Hard-coded ISO timestamps for expiries or injected clocks make tests depend on the date they run.
+const ISO_TIMESTAMP = "/^\\d{4}-\\d{2}-\\d{2}T/";
+const TIME_KEY = '/^now$|[eE]xpiresAt$/';
+const hardCodedTestTimeSelectors = [
+  `Property[key.name=${TIME_KEY}] > Literal[value=${ISO_TIMESTAMP}]`,
+  `Property[key.name=${TIME_KEY}] NewExpression[callee.name='Date'] > Literal[value=${ISO_TIMESTAMP}]`,
+  `AssignmentExpression[left.property.name=${TIME_KEY}] NewExpression[callee.name='Date'] > Literal[value=${ISO_TIMESTAMP}]`,
+];
 
 const stagedObsidianRules = {
   'obsidianmd/commands/no-command-in-command-id': obsidianRuleSeverity,
@@ -40,6 +121,7 @@ const stagedObsidianRules = {
   'obsidianmd/prefer-window-timers': obsidianRuleSeverity,
   'obsidianmd/regex-lookbehind': obsidianRuleSeverity,
   'obsidianmd/sample-names': obsidianRuleSeverity,
+  'obsidianmd/settings-tab/no-deprecated-display': obsidianRuleSeverity,
   'obsidianmd/settings-tab/no-manual-html-headings': obsidianRuleSeverity,
   'obsidianmd/settings-tab/no-problematic-settings-headings': obsidianRuleSeverity,
   'obsidianmd/ui/sentence-case': [
@@ -53,6 +135,25 @@ const stagedObsidianRules = {
     },
   ],
   'obsidianmd/vault/iterate': obsidianRuleSeverity,
+};
+
+const strictTypeAwareRules = {
+  'prefer-promise-reject-errors': 'off',
+  '@typescript-eslint/await-thenable': 'error',
+  '@typescript-eslint/no-deprecated': 'error',
+  '@typescript-eslint/no-duplicate-type-constituents': 'error',
+  '@typescript-eslint/no-floating-promises': 'error',
+  '@typescript-eslint/no-misused-promises': 'error',
+  '@typescript-eslint/no-redundant-type-constituents': 'error',
+  '@typescript-eslint/no-unsafe-argument': 'error',
+  '@typescript-eslint/no-unsafe-assignment': 'error',
+  '@typescript-eslint/no-unsafe-call': 'error',
+  '@typescript-eslint/no-unsafe-member-access': 'error',
+  '@typescript-eslint/no-unsafe-return': 'error',
+  '@typescript-eslint/no-unnecessary-type-assertion': 'error',
+  '@typescript-eslint/only-throw-error': 'error',
+  '@typescript-eslint/prefer-promise-reject-errors': 'error',
+  '@typescript-eslint/unbound-method': 'error',
 };
 
 export default defineConfig([
@@ -75,8 +176,10 @@ export default defineConfig([
     files: ['src/**/*.ts', 'tests/**/*.ts'],
     plugins: {
       'simple-import-sort': simpleImportSort,
+      local: localPlugin,
     },
     rules: {
+      'local/file-naming': 'error',
       '@typescript-eslint/consistent-type-imports': [
         'error',
         { prefer: 'type-imports', fixStyle: 'separate-type-imports' },
@@ -86,6 +189,7 @@ export default defineConfig([
         { args: 'none', ignoreRestSiblings: true },
       ],
       '@typescript-eslint/no-explicit-any': 'off',
+      'prefer-promise-reject-errors': 'error',
       'simple-import-sort/imports': 'error',
       'simple-import-sort/exports': 'error',
     },
@@ -99,40 +203,32 @@ export default defineConfig([
       },
     },
     plugins: {
+      'eslint-comments': eslintComments,
       obsidianmd,
+    },
+    linterOptions: {
+      reportUnusedDisableDirectives: 'error',
+      reportUnusedInlineConfigs: 'error',
     },
     rules: {
       ...stagedObsidianRules,
-      '@typescript-eslint/no-unsafe-argument': 'error',
-      '@typescript-eslint/no-unnecessary-type-assertion': 'error',
-    },
-  },
-  {
-    files: [
-      'src/ClaudianService.ts',
-      'src/InlineEditService.ts',
-      'src/InstructionRefineService.ts',
-      'src/images/**/*.ts',
-      'src/prompt/**/*.ts',
-      'src/sdk/**/*.ts',
-      'src/security/**/*.ts',
-      'src/tools/**/*.ts',
-    ],
-    rules: {
-      'no-restricted-imports': [
+      ...strictTypeAwareRules,
+      'eslint-comments/no-restricted-disable': [
         'error',
-        {
-          patterns: [
-            {
-              group: ['./ui', './ui/*', '../ui', '../ui/*'],
-              message: 'Service and shared modules must not import UI modules.',
-            },
-            {
-              group: ['./ClaudianView', '../ClaudianView'],
-              message: 'Service and shared modules must not import the view.',
-            },
-          ],
-        },
+        'obsidianmd/*',
+      ],
+      'eslint-comments/require-description': 'error',
+      'obsidianmd/prefer-create-el': 'error',
+      '@typescript-eslint/naming-convention': [
+        'error',
+        { selector: 'default', format: ['camelCase'], leadingUnderscore: 'allow', trailingUnderscore: 'allow' },
+        { selector: 'variable', format: ['camelCase', 'UPPER_CASE', 'PascalCase'], leadingUnderscore: 'allow' },
+        { selector: 'typeLike', format: ['PascalCase'] },
+        { selector: 'enumMember', format: ['PascalCase'] },
+        { selector: 'classProperty', format: ['camelCase', 'UPPER_CASE'], leadingUnderscore: 'allow', trailingUnderscore: 'allow' },
+        { selector: 'import', format: ['camelCase', 'PascalCase'] },
+        { selector: 'objectLiteralProperty', format: null },
+        { selector: 'typeProperty', format: null },
       ],
     },
   },
@@ -142,6 +238,30 @@ export default defineConfig([
     rules: {
       ...jestRecommended.rules,
       '@typescript-eslint/no-explicit-any': 'off',
+      'no-restricted-syntax': [
+        'error',
+        ...hardCodedTestTimeSelectors.map(selector => ({
+          selector,
+          message: 'Express expiries and clocks with testTime/testDate/testClock from @test/helpers/testClock.',
+        })),
+      ],
+    },
+  },
+  {
+    files: ['tests/helpers/testClock.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        ...[
+          'Literal[value=/\\d{4}-\\d{2}-\\d{2}T/]',
+          'TemplateElement[value.raw=/\\d{4}-\\d{2}-\\d{2}T/]',
+          "NewExpression[callee.name='Date'][arguments.length>1][arguments.0.type='Literal']",
+          "CallExpression[callee.object.name='Date'][callee.property.name='UTC'][arguments.0.type='Literal']",
+        ].map(selector => ({
+          selector,
+          message: 'Derive fixture timestamps from @test/helpers/testClock instead of a fixed calendar date.',
+        })),
+      ],
     },
   },
 ]);

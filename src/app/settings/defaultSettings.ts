@@ -1,3 +1,4 @@
+
 import { getDefaultHiddenProviderCommands } from '../../core/providers/commands/hiddenCommands';
 import { DEFAULT_REASONING_VALUE } from '../../core/providers/reasoning';
 import { type ClaudianSettings } from '../../core/types/settings';
@@ -13,17 +14,16 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   effortLevel: DEFAULT_REASONING_VALUE,
   serviceTier: 'default',
   enableAutoTitleGeneration: true,
+  titleGenerationLocale: '',
   titleGenerationModel: '',
 
   excludedTags: [],
   mediaFolder: '',
   systemPrompt: '',
-  persistentExternalContextPaths: [],
 
   sharedEnvironmentVariables: '',
   envSnippets: [],
   customContextLimits: {},
-  customModelAliases: {},
 
   keyboardNavigation: {
     scrollUpKey: 'w',
@@ -45,19 +45,26 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   providerConfigs: getBuiltInProviderDefaultConfigs(),
 
   settingsProvider: 'claude',
+  lastSelectedChatModel: null,
   savedProviderModel: {},
   savedProviderEffort: {},
   savedProviderServiceTier: {},
   savedProviderThinkingBudget: {},
   savedProviderPermissionMode: {},
+  pendingProviderSessionInvalidations: {},
 
-  lastCustomModel: '',
-
-  maxTabs: 3,
+  maxWarmAgentProcesses: 5,
   enableAutoScroll: true,
+  showMessageTimestamps: false,
   deferMathRenderingDuringStreaming: true,
   expandFileEditsByDefault: false,
   chatViewPlacement: 'right-sidebar',
+  enableDualPane: true,
+  dualPaneSide: 'right',
+  restoreTabsOnStartup: true,
+  sessionManagerOrganization: 'list',
+  sessionManagerSort: 'last-updated',
+  pinnedLinkedContentPaths: [],
 
   hiddenProviderCommands: getDefaultHiddenProviderCommands(),
 };

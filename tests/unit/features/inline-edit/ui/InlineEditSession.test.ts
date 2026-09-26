@@ -1,5 +1,5 @@
 import { Text } from '@codemirror/state';
-import { createMockEl } from '@test/helpers/mockElement';
+import { createMockEl } from '@test/helpers/MockElement';
 import { Notice } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
@@ -60,8 +60,8 @@ function createSession() {
     editor as any,
     { mode: 'selection', selectedText: 'hello' },
     'note.md',
-    () => [],
     resolve,
+    { providerId: 'claude' },
   );
   Object.assign(session as any, {
     editedText: 'world',
@@ -140,11 +140,9 @@ describe('InlineEditSession', () => {
     const { editorView, resolve, service, session } = createSession();
     const result = createDeferred<{ success: true; editedText: string }>();
     service.editText.mockReturnValue(result.promise);
-    const showDiff = jest.fn();
     Object.assign(session as any, {
       editedText: null,
       inputEl: Object.assign(createMockEl('input'), { value: 'rewrite' }),
-      showDiffInPlace: showDiff,
       spinnerEl: createMockEl(),
     });
 
@@ -154,10 +152,34 @@ describe('InlineEditSession', () => {
     result.resolve({ success: true, editedText: 'world' });
     await generation;
 
-    expect(showDiff).not.toHaveBeenCalled();
     expect(resolve).toHaveBeenCalledWith({ decision: 'reject' });
     expect(Notice).toHaveBeenCalledWith(
       'Inline edit was not applied because the source document or selection changed.',
     );
+  });
+
+  it('leaves clarification mode after provider continuity is invalidated', async () => {
+    const { service, session } = createSession();
+    service.continueConversation.mockResolvedValue({
+      error: 'The provider environment changed. Start a new inline edit.',
+      resetRequired: true,
+      success: false,
+    });
+    const inputEl = Object.assign(createMockEl('input'), {
+      disabled: false,
+      focus: jest.fn(),
+      placeholder: '',
+      value: 'continue',
+    });
+    Object.assign(session as any, {
+      inputEl,
+      isConversing: true,
+      spinnerEl: createMockEl(),
+    });
+
+    await (session as any).generate();
+
+    expect((session as any).isConversing).toBe(false);
+    expect(inputEl.placeholder).toContain('provider environment changed');
   });
 });

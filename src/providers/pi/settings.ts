@@ -1,29 +1,28 @@
+import { selectModelMetadata } from '../../core/providers/models/selectedModelMetadata';
 import { getProviderConfig, setProviderConfig } from '../../core/providers/providerConfig';
 import { getProviderEnvironmentVariables } from '../../core/providers/providerEnvironment';
-import type { HostnameCliPaths } from '../../core/types/settings';
+import { normalizeHostnameStringMap } from '../../core/providers/settings/HostnameStringMap';
 import {
-  getHostnameKey,
-  getLegacyHostnameKey,
-  migrateLegacyHostnameKeyedMap,
-} from '../../utils/env';
-import { ensureProviderProjectionMap } from './internal/providerProjection';
+  readStoredBoolean,
+  readStoredString,
+} from '../../core/providers/settings/storedSettings';
+import type { HostnameCLIPaths } from '../../core/types/settings';
+import { getHostnameKey } from '../../utils/env';
 import {
   clampPiThinkingLevel,
   decodePiModelId,
   findPiModel,
-  isPiModelSelectionId,
   normalizePiDiscoveredModels,
   normalizePiThinkingLevel,
-  PI_DEFAULT_THINKING_LEVEL,
   type PiDiscoveredModel,
-  type PiThinkingLevel,
+  type PiThinkingLevel
 } from './models';
 
 export type PiToolMode = 'all' | 'readonly';
 
 export interface PersistedPiProviderSettings {
   cliPath: string;
-  cliPathsByHost: HostnameCliPaths;
+  cliPathsByHost: HostnameCLIPaths;
   discoveredModels: PiDiscoveredModel[];
   enabled: boolean;
   environmentHash: string;
@@ -49,20 +48,6 @@ export const DEFAULT_PI_PROVIDER_SETTINGS: Readonly<PersistedPiProviderSettings>
   visibleModels: [],
 });
 
-function normalizeHostnameCliPaths(value: unknown): HostnameCliPaths {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const result: HostnameCliPaths = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === 'string' && entry.trim()) {
-      result[key] = entry.trim();
-    }
-  }
-  return result;
-}
-
 export function normalizePiVisibleModels(
   value: unknown,
   discoveredModels: PiDiscoveredModel[] = [],
@@ -71,7 +56,6 @@ export function normalizePiVisibleModels(
     return [];
   }
 
-  const knownIds = new Set(discoveredModels.map(model => model.encodedId));
   const normalized: string[] = [];
   const seen = new Set<string>();
   for (const entry of value) {
@@ -81,9 +65,6 @@ export function normalizePiVisibleModels(
 
     const trimmed = entry.trim();
     if (!trimmed || !decodePiModelId(trimmed)) {
-      continue;
-    }
-    if (knownIds.size > 0 && !knownIds.has(trimmed)) {
       continue;
     }
     if (seen.has(trimmed)) {
@@ -97,85 +78,27 @@ export function normalizePiVisibleModels(
   return normalized;
 }
 
-export function normalizePiModelAliases(
-  value: unknown,
-  discoveredModels: PiDiscoveredModel[] = [],
-): Record<string, string> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const normalized: Record<string, string> = {};
-  for (const [encodedId, alias] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof alias !== 'string') {
-      continue;
-    }
-
-    const normalizedEncodedId = normalizePiEncodedId(encodedId, discoveredModels);
-    const normalizedAlias = alias.trim();
-    if (!normalizedEncodedId || !normalizedAlias) {
-      continue;
-    }
-
-    normalized[normalizedEncodedId] = normalizedAlias;
-  }
-
-  return normalized;
-}
-
-export function normalizePiPreferredThinkingByModel(
-  value: unknown,
-  discoveredModels: PiDiscoveredModel[] = [],
-): Record<string, PiThinkingLevel> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const normalized: Record<string, PiThinkingLevel> = {};
-  for (const [encodedId, thinkingLevel] of Object.entries(value as Record<string, unknown>)) {
-    const normalizedEncodedId = normalizePiEncodedId(encodedId, discoveredModels);
-    const normalizedThinkingLevel = normalizePiThinkingLevel(thinkingLevel);
-    if (!normalizedEncodedId || !normalizedThinkingLevel) {
-      continue;
-    }
-
-    const discoveredModel = discoveredModels.find(model => model.encodedId === normalizedEncodedId);
-    if (discoveredModel && !discoveredModel.thinkingLevels.includes(normalizedThinkingLevel)) {
-      continue;
-    }
-
-    normalized[normalizedEncodedId] = normalizedThinkingLevel;
-  }
-
-  return normalized;
-}
-
 export function getPiProviderSettings(settings: Record<string, unknown>): PiProviderSettings {
   const config = getProviderConfig(settings, 'pi');
-  const normalizedCliPathsByHost = normalizeHostnameCliPaths(config.cliPathsByHost);
-  const cliPathsByHost = Object.keys(normalizedCliPathsByHost).length > 0
-    ? migrateLegacyHostnameKeyedMap(
-      normalizedCliPathsByHost,
-      getHostnameKey(),
-      getLegacyHostnameKey(),
-    )
-    : normalizedCliPathsByHost;
-  const discoveredModels = normalizePiDiscoveredModels(config.discoveredModels);
+  const cliPathsByHost = normalizeHostnameStringMap(config.cliPathsByHost);
+  const discoveredModels = normalizePiDiscoveredModels(config.discoveredModels ?? config.selectedModels);
   const visibleModels = normalizePiVisibleModels(config.visibleModels, discoveredModels);
   const persistableIds = getPersistablePiModelIds(settings, visibleModels);
 
   return {
-    cliPath: (config.cliPath as string | undefined)
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.cliPath,
+    cliPath: readStoredString(config.cliPath, DEFAULT_PI_PROVIDER_SETTINGS.cliPath),
     cliPathsByHost,
     discoveredModels,
-    enabled: (config.enabled as boolean | undefined)
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.enabled,
-    environmentHash: (config.environmentHash as string | undefined)
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.environmentHash,
-    environmentVariables: (config.environmentVariables as string | undefined)
-      ?? getProviderEnvironmentVariables(settings, 'pi')
-      ?? DEFAULT_PI_PROVIDER_SETTINGS.environmentVariables,
+    enabled: readStoredBoolean(config.enabled, DEFAULT_PI_PROVIDER_SETTINGS.enabled),
+    environmentHash: readStoredString(
+      config.environmentHash,
+      DEFAULT_PI_PROVIDER_SETTINGS.environmentHash,
+    ),
+    environmentVariables: readStoredString(
+      config.environmentVariables,
+      getProviderEnvironmentVariables(settings, 'pi')
+        ?? DEFAULT_PI_PROVIDER_SETTINGS.environmentVariables,
+    ),
     modelAliases: normalizePiModelAliasesForPersistableIds(
       config.modelAliases,
       discoveredModels,
@@ -222,7 +145,7 @@ export function updatePiProviderSettings(
     persistableIds,
   );
   const nextCliPathsByHost = 'cliPathsByHost' in updates
-    ? normalizeHostnameCliPaths(updates.cliPathsByHost)
+    ? normalizeHostnameStringMap(updates.cliPathsByHost)
     : { ...current.cliPathsByHost };
   let nextCliPath = 'cliPathsByHost' in updates
     ? (
@@ -255,7 +178,6 @@ export function updatePiProviderSettings(
   };
 
   if (updates.visibleModels !== undefined) {
-    retargetRemovedPiSelections(settings, next);
     const retargetedPersistableIds = getPersistablePiModelIds(settings, next.visibleModels);
     next.modelAliases = pruneMapToPersistableIds(next.modelAliases, retargetedPersistableIds);
     next.preferredThinkingByModel = pruneMapToPersistableIds(
@@ -316,60 +238,48 @@ function normalizePiPreferredThinkingForPersistableIds(
   discoveredModels: PiDiscoveredModel[],
   persistableIds: Set<string>,
 ): Record<string, PiThinkingLevel> {
+  return normalizePiPreferredThinkingEntries(
+    value,
+    discoveredModels,
+    encodedId => normalizePiPersistableEncodedId(
+      encodedId,
+      discoveredModels,
+      persistableIds,
+    ),
+  );
+}
+
+function normalizePiPreferredThinkingEntries(
+  value: unknown,
+  discoveredModels: PiDiscoveredModel[],
+  normalizeEncodedId: (encodedId: string) => string,
+): Record<string, PiThinkingLevel> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
   }
 
   const normalized: Record<string, PiThinkingLevel> = {};
   for (const [encodedId, thinkingLevel] of Object.entries(value as Record<string, unknown>)) {
-    const normalizedEncodedId = normalizePiPersistableEncodedId(
-      encodedId,
-      discoveredModels,
-      persistableIds,
-    );
+    const normalizedEncodedId = normalizeEncodedId(encodedId);
     const normalizedThinkingLevel = normalizePiThinkingLevel(thinkingLevel);
     if (!normalizedEncodedId || !normalizedThinkingLevel) {
       continue;
     }
 
     const discoveredModel = discoveredModels.find(model => model.encodedId === normalizedEncodedId);
-    if (discoveredModel && !discoveredModel.thinkingLevels.includes(normalizedThinkingLevel)) {
-      continue;
-    }
-
-    normalized[normalizedEncodedId] = normalizedThinkingLevel;
+    normalized[normalizedEncodedId] = discoveredModel
+      ? clampPiThinkingLevel(normalizedThinkingLevel, discoveredModel.thinkingLevels)
+      : normalizedThinkingLevel;
   }
 
   return normalized;
 }
 
-export function resolvePiModelAlias(
-  settings: PiProviderSettings,
-  encodedId: string,
-): string | null {
-  return settings.modelAliases[encodedId] ?? null;
-}
-
 function normalizePiToolMode(value: unknown): PiToolMode {
-  return value === 'readonly' ? 'readonly' : 'all';
-}
-
-function normalizePiEncodedId(
-  value: string,
-  discoveredModels: PiDiscoveredModel[],
-): string {
-  const trimmed = value.trim();
-  const decoded = decodePiModelId(trimmed);
-  if (!decoded) {
-    return '';
+  if (value === undefined) {
+    return 'all';
   }
-
-  if (discoveredModels.length === 0) {
-    return trimmed;
-  }
-
-  const discoveredModel = findPiModel({ discoveredModels }, trimmed);
-  return discoveredModel ? discoveredModel.encodedId : '';
+  return value === 'all' || value === 'readonly' ? value : 'readonly';
 }
 
 function normalizePiPersistableEncodedId(
@@ -426,48 +336,17 @@ function pruneMapToPersistableIds<T extends string>(
   return pruned;
 }
 
-function retargetRemovedPiSelections(
-  settings: Record<string, unknown>,
-  next: PiProviderSettings,
-): void {
-  if (next.visibleModels.length === 0) {
-    if (typeof settings.titleGenerationModel === 'string' && isPiModelSelectionId(settings.titleGenerationModel)) {
-      settings.titleGenerationModel = '';
-    }
-    return;
-  }
-
-  const visibleSet = new Set(next.visibleModels);
-  const fallbackModelId = next.visibleModels[0];
-  const fallbackModel = findPiModel(next, fallbackModelId);
-  const fallbackEffort = next.preferredThinkingByModel[fallbackModelId]
-    ?? (fallbackModel
-      ? clampPiThinkingLevel(PI_DEFAULT_THINKING_LEVEL, fallbackModel.thinkingLevels)
-      : PI_DEFAULT_THINKING_LEVEL);
-
-  const maybeRetargetModel = (value: unknown): string | null => {
-    if (typeof value !== 'string' || !isPiModelSelectionId(value) || value === 'pi') {
-      return null;
-    }
-
-    return visibleSet.has(value) ? null : fallbackModelId;
+export function projectPiModelSettings(settings: Record<string, unknown>): Record<string, unknown> {
+  const current = getPiProviderSettings(settings);
+  const visibleModels = current.visibleModels;
+  const selected = new Set(visibleModels);
+  const config = {
+    ...getProviderConfig(settings, 'pi'),
+    visibleModels,
+    modelAliases: selectModelMetadata(current.modelAliases, selected),
+    preferredThinkingByModel: selectModelMetadata(current.preferredThinkingByModel, selected),
+    selectedModels: current.discoveredModels.filter(model => selected.has(model.encodedId)),
   };
-
-  const savedProviderModel = ensureProviderProjectionMap(settings, 'savedProviderModel');
-  const nextSavedModel = maybeRetargetModel(savedProviderModel.pi);
-  if (nextSavedModel) {
-    savedProviderModel.pi = nextSavedModel;
-    ensureProviderProjectionMap(settings, 'savedProviderEffort').pi = fallbackEffort;
-  }
-
-  const nextTopLevelModel = maybeRetargetModel(settings.model);
-  if (nextTopLevelModel) {
-    settings.model = nextTopLevelModel;
-    settings.effortLevel = fallbackEffort;
-  }
-
-  const nextTitleGenerationModel = maybeRetargetModel(settings.titleGenerationModel);
-  if (nextTitleGenerationModel) {
-    settings.titleGenerationModel = nextTitleGenerationModel;
-  }
+  for (const key of ['discoveredModels', 'catalogTimestamp', 'catalogFingerprint', 'availableModes']) delete (config as Record<string, unknown>)[key];
+  return config;
 }

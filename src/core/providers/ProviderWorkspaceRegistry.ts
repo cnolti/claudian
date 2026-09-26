@@ -1,12 +1,11 @@
-import { HomeFileAdapter } from '../storage/HomeFileAdapter';
+import { StartupProfiler } from '../performance/StartupProfiler';
 import type { ProviderCommandCatalog } from './commands/ProviderCommandCatalog';
 import type { ProviderHost } from './ProviderHost';
+import { ProviderInitializationBoundary } from './ProviderInitializationBoundary';
 import type {
-  AgentMentionProvider,
-  ProviderCliResolver,
+  ProviderCLIResolver,
+  ProviderCommandLoader,
   ProviderId,
-  ProviderModelCatalogRefreshResult,
-  ProviderRuntimeCommandLoader,
   ProviderSettingsTabRenderer,
   ProviderTabWarmupPolicy,
   ProviderWorkspaceRegistration,
@@ -17,63 +16,65 @@ import type {
  * Registry for provider-owned workspace/bootstrap services.
  *
  * Unlike `ProviderRegistry`, this boundary owns app-level provider services such
- * as command catalogs, mention providers, MCP/plugin/agent managers, and
+ * as command catalogs, CLI resolvers, and
  * provider-specific storage adaptors.
+ *
+ * Initialization is lazy: providers are only initialized when something first
+ * asks for them via `ensureInitialized`. `getServices` returns already-initialized
+ * services (or null) so callers can keep synchronous access patterns after they
+ * have awaited initialization.
  */
 export class ProviderWorkspaceRegistry {
-  private static registrations: Partial<Record<ProviderId, ProviderWorkspaceRegistration>> = {};
-  private static services: Partial<Record<ProviderId, ProviderWorkspaceServices>> = {};
+  private static boundary = new ProviderInitializationBoundary();
 
   static register(
     providerId: ProviderId,
     registration: ProviderWorkspaceRegistration,
   ): void {
-    this.registrations[providerId] = registration;
+    this.boundary.register(providerId, registration);
   }
 
-  private static getWorkspaceRegistration(providerId: ProviderId): ProviderWorkspaceRegistration {
-    const registration = this.registrations[providerId];
-    if (!registration) {
-      throw new Error(`Provider workspace "${providerId}" is not registered.`);
+  static async ensureInitialized(
+    plugin: ProviderHost,
+    providerId: ProviderId,
+    reason: string,
+  ): Promise<void> {
+    const span = StartupProfiler.start(`provider-init:${providerId}`);
+    try {
+      await this.boundary.ensureInitialized(plugin, providerId, reason);
+    } catch (error) {
+      StartupProfiler.increment('provider-init-failures');
+      throw error;
+    } finally {
+      StartupProfiler.finish(span);
     }
-    return registration;
   }
 
-  static async initializeAll(plugin: ProviderHost): Promise<void> {
-    const providerIds = Object.keys(this.registrations);
-    const storage = plugin.storage;
-    const vaultAdapter = storage.getAdapter();
-    const homeAdapter = new HomeFileAdapter();
+  static getIfInitialized(
+    providerId: ProviderId,
+  ): ProviderWorkspaceServices | null {
+    return this.boundary.getIfInitialized(providerId);
+  }
 
-    for (const providerId of providerIds) {
-      this.services[providerId] = await this.getWorkspaceRegistration(providerId).initialize({
-        plugin,
-        storage,
-        vaultAdapter,
-        homeAdapter,
-      });
-    }
+  static async disposeInitialized(): Promise<void> {
+    await this.boundary.disposeInitialized();
   }
 
   static setServices(
     providerId: ProviderId,
     services: ProviderWorkspaceServices | undefined,
   ): void {
-    if (services) {
-      this.services[providerId] = services;
-    } else {
-      delete this.services[providerId];
-    }
+    this.boundary.setServices(providerId, services);
   }
 
   static clear(): void {
-    this.services = {};
+    this.boundary = new ProviderInitializationBoundary();
   }
 
   static getServices(
     providerId: ProviderId,
   ): ProviderWorkspaceServices | null {
-    return this.services[providerId] ?? null;
+    return this.getIfInitialized(providerId);
   }
 
   static requireServices(
@@ -90,34 +91,16 @@ export class ProviderWorkspaceRegistry {
     return this.getServices(providerId)?.commandCatalog ?? null;
   }
 
-  static getAgentMentionProvider(providerId: ProviderId): AgentMentionProvider | null {
-    return this.getServices(providerId)?.agentMentionProvider ?? null;
-  }
-
-  static async refreshAgentMentions(providerId: ProviderId): Promise<void> {
-    await this.getServices(providerId)?.refreshAgentMentions?.();
-  }
-
-  static async refreshModelCatalog(
-    providerId: ProviderId,
-  ): Promise<ProviderModelCatalogRefreshResult> {
-    return await this.getServices(providerId)?.refreshModelCatalog?.() ?? { changed: false };
-  }
-
-  static getCliResolver(providerId: ProviderId): ProviderCliResolver | null {
+  static getCliResolver(providerId: ProviderId): ProviderCLIResolver | null {
     return this.getServices(providerId)?.cliResolver ?? null;
   }
 
-  static getRuntimeCommandLoader(providerId: ProviderId): ProviderRuntimeCommandLoader | null {
-    return this.getServices(providerId)?.runtimeCommandLoader ?? null;
+  static getCommandLoader(providerId: ProviderId): ProviderCommandLoader | null {
+    return this.getServices(providerId)?.commandLoader ?? null;
   }
 
   static getTabWarmupPolicy(providerId: ProviderId): ProviderTabWarmupPolicy | null {
     return this.getServices(providerId)?.tabWarmupPolicy ?? null;
-  }
-
-  static getMcpServerManager(providerId: ProviderId) {
-    return this.getServices(providerId)?.mcpServerManager ?? null;
   }
 
   static getSettingsTabRenderer(providerId: ProviderId): ProviderSettingsTabRenderer | null {

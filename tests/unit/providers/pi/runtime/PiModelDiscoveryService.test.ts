@@ -12,8 +12,8 @@ const mockProcessOnClose = jest.fn();
 const mockGetStderrSnapshot = jest.fn(() => '');
 let mockEventHandler: ((event: Record<string, unknown>) => void) | null = null;
 
-jest.mock('@/providers/pi/runtime/PiRpcTransport', () => ({
-  PiRpcTransport: jest.fn().mockImplementation(() => ({
+jest.mock('@/providers/pi/runtime/PiRPCTransport', () => ({
+  PiRPCTransport: jest.fn().mockImplementation(() => ({
     dispose: mockTransportDispose,
     onEvent: mockTransportOnEvent,
     request: mockTransportRequest,
@@ -89,6 +89,9 @@ describe('PiModelDiscoveryService', () => {
         name: 'GPT-5',
         provider: 'openai',
         reasoning: true,
+        thinkingLevelMap: {
+          max: 'max',
+        },
       }],
     });
 
@@ -108,7 +111,7 @@ describe('PiModelDiscoveryService', () => {
       maxTokens: 8192,
       provider: 'openai',
       reasoning: true,
-      thinkingLevels: ['off', 'minimal', 'low', 'medium', 'high'],
+      thinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'max'],
     }]);
     expect(mockProcessStart).toHaveBeenCalled();
     expect(mockTransportStart).toHaveBeenCalled();

@@ -1,107 +1,50 @@
 # AGENTS.md
 
-## Project
+## Loading and verification
 
-Claudian is an Obsidian plugin that embeds provider-backed coding agents in a sidebar and inline-edit flow. Claude is the default provider. Codex, OpenCode, and Pi are optional providers that plug into the same conversation model through `Conversation.providerId` and opaque provider-owned `providerState`.
-
-Do not assume provider parity. Check each provider's `capabilities.ts`, `registration.ts`, and UI config before wiring shared behavior.
-
-## Instruction Map
-
-- This file is the canonical cross-agent guide. Keep shared instructions here.
-- `CLAUDE.md` files should import the nearest `AGENTS.md`; do not duplicate shared guidance there.
-- Before editing a scoped area, read its nearest scoped guide:
-  - `src/core/AGENTS.md`
-  - `src/features/chat/AGENTS.md`
-  - `src/providers/claude/AGENTS.md`
-  - `src/providers/codex/AGENTS.md`
-  - `src/providers/opencode/AGENTS.md`
-  - `src/providers/pi/AGENTS.md`
-  - `src/style/AGENTS.md`
-
-## Commands
+- Tests follow the guides of the source they cover; they do not inherit `src/` instructions automatically.
+- Build, dependency, lockfile, locale/static-asset import, and `esbuild.config.mjs` changes also require `scripts/AGENTS.md`. Composition changes require the guides of the services being wired.
+- Use the Node version in `.node-version`. For code changes, the full verification command is:
 
 ```bash
-npm run dev
-npm run build
-npm run typecheck
-npm run lint
-npm run lint:fix
-npm run test
-npm run test:watch
-npm run test:coverage
+npm run typecheck && npm run lint && npm run test && npm run build && npm run check:performance
 ```
 
-Use focused commands while iterating. Before handing off code changes, run the narrowest meaningful verification plus broader checks when the change touches shared behavior. The default full check is:
+- For focused changes, `npm run test:affected -- --base origin/main` selects related tests; it does not replace typecheck, lint, build, or performance checks. Documentation-only changes need `git diff --check` (CI enforces it on every pull request) and their affected documentation tests, not a production build.
+- Dev and production builds load `.env.local` and may copy artifacts into the configured `OBSIDIAN_VAULT`, including removal of its old `.codex-vendor`. Check that destination before building; clearing the shell variable does not prevent reloading it from the file.
 
-```bash
-npm run typecheck && npm run lint && npm run test && npm run build
-```
+## Architectural constraints
 
-Tests mirror `src/` under `tests/unit/` and `tests/integration/`.
+- `src/main.ts` is the sole concrete composition root and lifecycle publisher. App subcomposition returns complete domains, never a second root or service locator.
+- `src/composition/` holds main-owned wiring that must reach both `app/` and `features/`. Only `main.ts` and other composition modules import it; it never imports `main.ts` or concrete providers, and `main.ts` still constructs, registers, and tears it down.
+- App repositories/settings/storage depend on core contracts, not feature orchestration or provider-native protocols. Concrete provider imports are confined to `main.ts` and provider-default assembly.
+- Features use `FeatureHost` and core registries, never concrete app/provider implementations. `FeatureHost` stays feature-neutral; chat-only capabilities belong in chat's `ChatFeatureHost` extension. Providers use `ProviderHost`, never feature orchestration. Core imports none of these implementations.
+- Shared ACP code contains protocol mechanics and protocol-level normalization only; provider launch policy, extensions, provider-specific normalization, and history stay provider-owned.
 
-## Architecture
+## Local conventions
 
-| Area | Ownership |
-| --- | --- |
-| `src/app/` | Shared settings defaults and plugin-level storage helpers |
-| `src/core/` | Provider-neutral runtime, registry, storage, tool, and type contracts |
-| `src/providers/*/` | Provider adaptors, provider-owned runtime protocol, history, storage, settings, and UI |
-| `src/features/chat/` | Sidebar chat orchestration against provider-neutral contracts |
-| `src/features/inline-edit/` | Inline edit modal and provider-backed edit services |
-| `src/features/settings/` | Shared settings shell and provider tab assembly |
-| `src/shared/` | Reusable UI components |
-| `src/style/` | Modular CSS built into `styles.css` |
+- Use English for code/comments/identifiers/commits/code blocks. Soft-wrap Markdown. Put uncommitted notes, traces, and throwaway scripts in `.context/`. No production `console.*`.
+- TypeScript files use PascalCase for their main concept, camelCase for utility bags, and kebab-case for external package names. Preserve `index.ts` barrels, `types.ts` buckets, and source-mirrored test names; this does not require creating new barrels or type buckets. No interface `I` prefix. Preserve acronym capitals in filenames and matching owned identifiers (`ACPClientConnection`, `buildACPUsageInfo`, `URLs`); leading acronyms remain lowercase in camelCase (`acpConnection`). Preserve external API names and serialized keys. Folders use kebab-case; imports omit `.ts` and prefer `@/`.
+- UI actions use native controls. Buttons that do not submit a form declare `type="button"`; non-native controls need equivalent accessible names, roles, and keyboard behavior.
 
-The feature layer depends on `core/` contracts, not provider internals. Provider-specific session fields belong behind typed helpers in the owning provider directory.
+## Regression verification
 
-## Provider Rules
+- For behavior changes, demonstrate the intended failing regression before implementation and rerun it afterward. Documentation/mechanical changes are exempt; when automation is infeasible, record a repeatable reproduction and verify the nearest stable contract.
 
-- Prefer provider-native behavior over local reimplementation. Adapt provider output at the boundary instead of shadowing provider features.
-- Keep live streaming and history replay responsibilities separate. Live output should come from the provider runtime protocol when available; provider transcript files are the replay source.
-- New provider behavior must be expressed through registries and capabilities: `ProviderRegistry`, `ProviderWorkspaceRegistry`, `ProviderChatUIConfig`, provider capabilities, and provider-owned settings reconciliation.
-- Model, permission, plan-mode, command, MCP, skill, and subagent behavior is provider-specific unless the core contract explicitly makes it shared.
-- When provider behavior is uncertain, inspect real runtime output first. Put throwaway scripts, traces, and handoff notes in `.context/`.
+## Instruction maintenance
 
-## Storage
+- Keep non-obvious constraints at their narrowest common scope, with one authoritative home and explicit exceptions. Remove implementation inventories, generic advice, inherited duplicates, and retired decisions.
+- Each guide has a sibling `CLAUDE.md` containing only `@AGENTS.md`.
 
-| Path | Contents |
-| --- | --- |
-| `.claudian/claudian-settings.json` | Shared Claudian settings and provider-specific configuration |
-| `.claudian/sessions/*.meta.json` | Provider-neutral session metadata |
-| `.claude/settings.json` | Claude Code-compatible project settings, permissions, and plugin overrides |
-| `.claude/mcp.json` | Claudian-managed MCP servers for Claude |
-| `.claude/commands/**/*.md` | Claude slash commands |
-| `.claude/skills/*/SKILL.md` | Claude skills |
-| `.claude/agents/*.md` | Claude vault agents |
-| `.codex/skills/*/SKILL.md` | Codex vault skills |
-| `.agents/skills/*/SKILL.md` | Alternate Codex vault skill root |
-| `.codex/agents/*.toml` | Codex vault subagent definitions |
-| `.opencode/agent`, `.opencode/agents` | OpenCode agent definitions |
-| `.pi/agent/sessions/` | Pi vault-local sessions |
-| `~/.claude/projects/{vault}/*.jsonl` | Claude-native transcripts |
-| `~/.codex/sessions/**/*.jsonl` | Codex-native transcripts |
-| `~/.pi/agent/sessions/` | Pi user-level sessions |
+## Fork notes (cnolti)
 
-## Development Rules
+This is the `cnolti/claudian` fork of `YishenTu/claudian`, re-ported onto upstream 2.3.4. Fork-only surface:
 
-- Use `rg` or `rg --files` for repo searches.
-- Write code, comments, identifiers, commit messages, and code blocks in English.
-- Keep comments sparse. Explain non-obvious intent, protocol constraints, or invariants; do not narrate obvious code.
-- Do not use `console.*` in production code.
-- Preserve user data and provider-native files. Settings writers should merge with existing provider-owned data instead of clobbering it.
-- Put non-committed notes, handoff files, traces, and throwaway scripts in `.context/`.
-- Do not add new production dependencies without a clear need and an explicit tradeoff.
+- **Heartbeat**: background vault daemon. Contract in `src/core/types/heartbeat.ts`; scheduling/state in `src/app/heartbeat/` behind a narrow `HeartbeatManagerHost` (no `main` import); the Claude turn runs provider-owned in `src/providers/claude/heartbeat/`; `main.ts` wires both and exposes `FeatureHost.heartbeat`. UI: `features/chat/ui/HeartbeatStatusControl.ts` (nav row) and `features/settings/HeartbeatSettingsSection.ts`; `heartbeat*` settings keys.
+- **Tool-call grouping**: `features/chat/rendering/toolCallGrouping.ts` collapses runs of at least 2 consecutive tool/thinking blocks. While streaming, `StreamController` caps the trailing run at `STREAMING_TRAILING_VISIBLE` (after pending-tool flushes and after every tool result); `InputController` groups a finished assistant message when the next one starts; `MessageRenderer.finalizeResponse` and replay run the final pass before upstream's "Worked for" collapse. Running tools/subagents never group.
+- **Branding/deploy**: manifest id stays `claudian` (upstream uses `realclaudian`); `npm run deploy` bumps the `-fork.N` version, builds, copies to the vault (`OBSIDIAN_VAULT` in `.env.local`), commits, and pushes to all non-upstream remotes (`--skip-bump`, `--skip-git`).
+- **Test locale**: `scripts/run-jest.js` pins `en_US.UTF-8` so `toLocaleString` assertions pass on German hosts.
 
-## TDD Workflow
+Retired with 2.3.4 because upstream now covers them: external-context merging (upstream removed external context, #1283) and the onunload runtime cleanup (`executionLifecycleRegistry.dispose()`).
 
-- For new behavior or bug fixes, write or update the failing test first in the mirrored `tests/` path.
-- Make the narrowest implementation change that passes the focused test.
-- Refactor after the test is green, preserving the provider and feature ownership boundaries above.
-- If a change cannot be tested directly, document why and cover the closest stable contract instead.
-
-## Review Expectations
-
-- Findings first: correctness, regression risk, API or contract ambiguity, and missing tests.
-- Treat maintainability issues as real findings when they increase future change cost or failure risk.
-- Call out duplicated logic, unclear ownership, and tight coupling with a concrete refactoring direction.
+When merging upstream again, re-port this surface onto a fresh upstream base instead of conflict-merging, then land it on `main` via `merge -s ours` plus `git read-tree -u --reset <port-branch>`.

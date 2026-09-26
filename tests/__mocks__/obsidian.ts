@@ -13,6 +13,7 @@ export class Plugin {
   addCommand = jest.fn();
   addSettingTab = jest.fn();
   registerView = jest.fn();
+  registerEvent = jest.fn();
   loadData = jest.fn().mockResolvedValue({});
   saveData = jest.fn().mockResolvedValue(undefined);
 }
@@ -20,6 +21,7 @@ export class Plugin {
 export class PluginSettingTab {
   app: any;
   plugin: any;
+  settingItems: any[] = [];
   containerEl: any = {
     empty: jest.fn(),
     createEl: jest.fn().mockReturnValue({ createEl: jest.fn(), createDiv: jest.fn() }),
@@ -31,13 +33,20 @@ export class PluginSettingTab {
     this.plugin = plugin;
   }
 
-  display() {}
+  getSettingDefinitions(): any[] {
+    return [];
+  }
+
+  update() {
+    this.settingItems = this.getSettingDefinitions();
+  }
 }
 
 export class ItemView {
-  app: any;
+  app: any = { workspace: { on: jest.fn(), offref: jest.fn() } };
   leaf: any;
   containerEl: any = {
+    isShown: () => true,
     children: [{}, { empty: jest.fn(), addClass: jest.fn(), createDiv: jest.fn().mockReturnValue({
       createEl: jest.fn().mockReturnValue({ addEventListener: jest.fn(), setAttribute: jest.fn() }),
       createDiv: jest.fn().mockReturnValue({ createEl: jest.fn().mockReturnValue({ addEventListener: jest.fn() }) }),
@@ -59,6 +68,12 @@ export class ItemView {
   getIcon(): string {
     return '';
   }
+}
+
+export class FileView extends ItemView {
+  allowNoFile = false;
+  file: any = null;
+  navigation = true;
 }
 
 export class WorkspaceLeaf {}
@@ -137,31 +152,6 @@ export class Setting {
   addTextArea = jest.fn().mockReturnThis();
 }
 
-export class TextAreaComponent {
-  inputEl: any;
-  private _value = '';
-
-  constructor(_container?: any) {
-    this.inputEl = {
-      addClass: jest.fn(),
-      rows: 0,
-      placeholder: '',
-      focus: jest.fn(),
-      addEventListener: jest.fn(),
-      removeEventListener: jest.fn(),
-    };
-  }
-
-  setValue(value: string): this {
-    this._value = value;
-    return this;
-  }
-
-  getValue(): string {
-    return this._value;
-  }
-}
-
 export class Modal {
   app: any;
   containerEl: any = {
@@ -211,6 +201,8 @@ class MockMenuItem {
   title = '';
   icon = '';
   disabled = false;
+  checked: boolean | null = null;
+  isLabel = false;
   clickHandler: (() => void) | null = null;
 
   setTitle = jest.fn((title: string) => {
@@ -228,6 +220,18 @@ class MockMenuItem {
     return this;
   });
 
+  setChecked = jest.fn((checked: boolean | null) => {
+    this.checked = checked;
+    return this;
+  });
+
+  setIsLabel = jest.fn((isLabel: boolean) => {
+    this.isLabel = isLabel;
+    return this;
+  });
+
+  setWarning = jest.fn((_isWarning: boolean) => this);
+
   onClick = jest.fn((handler: () => void) => {
     this.clickHandler = handler;
     return this;
@@ -238,7 +242,9 @@ export class Menu {
   static instances: Menu[] = [];
 
   items: MockMenuItem[] = [];
+  useNativeMenu: boolean | null = null;
   showAtMouseEvent = jest.fn();
+  showAtPosition = jest.fn();
 
   constructor() {
     Menu.instances.push(this);
@@ -250,6 +256,15 @@ export class Menu {
     this.items.push(item);
     return this;
   }
+
+  addSeparator(): this {
+    return this;
+  }
+
+  setUseNativeMenu = jest.fn((useNativeMenu: boolean) => {
+    this.useNativeMenu = useNativeMenu;
+    return this;
+  });
 }
 
 const renderMarkdownMock = jest.fn<Promise<void>, [string, unknown, string, unknown]>().mockResolvedValue(undefined);
@@ -260,6 +275,12 @@ export const MarkdownRenderer = {
   ),
   renderMarkdown: renderMarkdownMock,
 };
+
+export const loadMermaid = jest.fn();
+
+export const loadPrism = jest.fn().mockResolvedValue({
+  highlightElement: jest.fn(),
+});
 
 export const setIcon = jest.fn();
 

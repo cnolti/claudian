@@ -1,7 +1,5 @@
 import type { EditorView } from '@codemirror/view';
 
-import type { ChatRuntimeQueryOptions, ChatTurnRequest } from '../../../core/runtime/types';
-import type { TodoItem } from '../../../core/tools/todo';
 import type {
   ChatMessage,
   ImageAttachment,
@@ -14,6 +12,15 @@ import type { CanvasSelectionContext } from '../../../utils/canvas';
 import type { EditorSelectionContext } from '../../../utils/editor';
 import type { ThinkingBlockState } from '../rendering/ThinkingBlockRenderer';
 import type { WriteEditState } from '../rendering/WriteEditRenderer';
+
+export interface ChatTurnRequest {
+  text: string;
+  images?: ImageAttachment[];
+  linkedContentPath?: string;
+  editorSelection?: EditorSelectionContext | null;
+  browserSelection?: BrowserSelectionContext | null;
+  canvasSelection?: CanvasSelectionContext | null;
+}
 
 /** Queued message waiting to be sent after current streaming completes. */
 export interface QueuedMessage {
@@ -31,6 +38,22 @@ export interface PendingToolCall {
   toolCall: ToolCallInfo;
   parentEl: HTMLElement | null;
 }
+
+export type TabAttentionKind = 'review' | 'action-required';
+
+export type TabReviewOutcome = 'completed' | 'error';
+
+export type TabAttention =
+  | {
+      kind: 'review';
+      outcome: TabReviewOutcome;
+      since: number;
+    }
+  | {
+      kind: 'action-required';
+      since: number;
+    }
+  | null;
 
 /** Stored selection state from editor polling. */
 export interface StoredSelection {
@@ -57,6 +80,8 @@ export interface ChatStateData {
   isCreatingConversation: boolean;
   /** Guards against concurrent operations during conversation switching. */
   isSwitchingConversation: boolean;
+  /** Guards the destructive rewind transaction from overlapping tab actions. */
+  isRewinding: boolean;
   /** Local tab state is ahead of persisted conversation metadata. */
   hasPendingConversationSave: boolean;
 
@@ -87,11 +112,8 @@ export interface ChatStateData {
   // Flag to ignore usage updates (during session reset)
   ignoreUsageUpdates: boolean;
 
-  // Current todo items for the persistent bottom panel
-  currentTodos: TodoItem[] | null;
-
-  // Attention state (approval pending, error, etc.)
-  needsAttention: boolean;
+  // Runtime-only attention state
+  attention: TabAttention;
 
   // Auto-scroll control during streaming
   autoScrollEnabled: boolean;
@@ -99,30 +121,17 @@ export interface ChatStateData {
   // Response timer state
   responseStartTime: number | null;
   flavorTimerInterval: number | null;
-
-  // Pending plan content for approve-new-session (auto-sends in new session after stream ends)
-  pendingNewSessionPlan: string | null;
-
-  // Plan file path captured from Write tool calls to provider plan directory during plan mode
-  planFilePath: string | null;
-
-  // Saved permission mode before entering plan mode (for Shift+Tab toggle restore)
-  prePlanPermissionMode: string | null;
 }
 
 /** Callbacks for ChatState changes. */
 export interface ChatStateCallbacks {
-  onMessagesChanged?: () => void;
   onStreamingStateChanged?: (isStreaming: boolean) => void;
+  onRewindingStateChanged?: (isRewinding: boolean) => void;
   onConversationChanged?: (id: string | null) => void;
   onUsageChanged?: (usage: UsageInfo | null) => void;
-  onTodosChanged?: (todos: TodoItem[] | null) => void;
-  onAttentionChanged?: (needsAttention: boolean) => void;
+  onAttentionChanged?: (attention: TabAttention) => void;
   onAutoScrollChanged?: (enabled: boolean) => void;
 }
-
-/** Options for query execution. */
-export type QueryOptions = ChatRuntimeQueryOptions;
 
 // Re-export types that are used across the chat feature
 export type {
@@ -131,7 +140,6 @@ export type {
   ImageAttachment,
   SubagentInfo,
   ThinkingBlockState,
-  TodoItem,
   ToolCallInfo,
   UsageInfo,
   WriteEditState,

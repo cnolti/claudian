@@ -1,12 +1,22 @@
+import type * as childProcessType from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import type * as environmentModule from '@/utils/env';
+
 import type { Conversation } from '../../../../src/core/types';
 import { OpencodeConversationHistoryService } from '../../../../src/providers/opencode/history/OpencodeConversationHistoryService';
 
+// Exercise real SQLite subprocesses without discovering the runner's other Node installations.
+jest.mock('@/utils/env', () => ({
+  ...jest.requireActual<typeof environmentModule>('@/utils/env'),
+  findNodeExecutables: () => [process.execPath],
+}));
+
 describe('OpencodeConversationHistoryService', () => {
+  const originalPlatform = process.platform;
   let tmpRoot: string;
 
   beforeEach(() => {
@@ -14,8 +24,44 @@ describe('OpencodeConversationHistoryService', () => {
   });
 
   afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
     rmSync(tmpRoot, { force: true, recursive: true });
   });
+
+  // This case loads an isolated provider graph and runs a native child with a 10-second deadline.
+  it('passes the configured environment to the external history reader', async () => {
+    const dbPath = path.join(tmpRoot, 'opencode.db');
+    seedDatabase(dbPath, 'session-env', 'Configured history');
+    const conversation = createConversation('session-env', dbPath);
+    const childProcess = jest.requireActual<typeof childProcessType>('node:child_process');
+    const realSpawn = childProcess.spawn;
+    const environmentMarkers: Array<string | undefined> = [];
+    jest.spyOn(childProcess, 'spawn').mockImplementation((command, args, options) => {
+      environmentMarkers.push(options?.env?.CLAUDIAN_HISTORY_TEST);
+      return realSpawn(command, args, options!);
+    });
+    jest.doMock('node:sqlite', () => ({}));
+    try {
+      await jest.isolateModulesAsync(async () => {
+        const { OpencodeConversationHistoryService: HistoryService } = await import(
+          '../../../../src/providers/opencode/history/OpencodeConversationHistoryService'
+        );
+        await new HistoryService().hydrateConversationHistory(conversation, null, {
+          environment: {
+            ...process.env,
+            OPENCODE_DB: dbPath,
+            CLAUDIAN_HISTORY_TEST: 'configured',
+            PATH: path.dirname(process.execPath),
+          },
+        });
+      });
+      expect(conversation.messages.map(message => message.content)).toEqual(['Configured history']);
+      expect(environmentMarkers).toContain('configured');
+    } finally {
+      jest.dontMock('node:sqlite');
+      jest.restoreAllMocks();
+    }
+  }, 20_000);
 
   it('retries after a session-level hydration diagnostic', async () => {
     const dbPath = path.join(tmpRoot, 'opencode.db');
@@ -86,6 +132,45 @@ describe('OpencodeConversationHistoryService', () => {
         userMessageId: 'msg-user',
       },
     ]);
+  }, 15_000);
+
+  it('recovers the last OpenCode model from native message metadata', async () => {
+    const dbPath = path.join(tmpRoot, 'model-history.db');
+    const sessionId = 'session-model';
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        create table message (
+          id text primary key,
+          session_id text not null,
+          time_created integer not null,
+          data text not null
+        );
+        create table part (
+          id text primary key,
+          session_id text not null,
+          message_id text not null,
+          data text not null
+        );
+      `);
+      db.prepare('insert into message (id, session_id, time_created, data) values (?, ?, ?, ?)').run(
+        'assistant-1',
+        sessionId,
+        1_000,
+        JSON.stringify({
+          modelID: 'gemini-3.5-flash',
+          providerID: 'google',
+          role: 'assistant',
+        }),
+      );
+    } finally {
+      db.close();
+    }
+    const conversation = createConversation(sessionId, dbPath);
+
+    await expect(new OpencodeConversationHistoryService()
+      .recoverConversationModelSelection?.(conversation, null))
+      .resolves.toBe('opencode:google/gemini-3.5-flash');
   });
 
   it('does not open an out-of-root metadata database and uses the current local database', async () => {
@@ -96,6 +181,7 @@ describe('OpencodeConversationHistoryService', () => {
     seedDatabase(trustedPath, sessionId, 'Trusted prompt');
     seedDatabase(outsidePath, sessionId, 'Outside prompt');
     const conversation = createConversation(sessionId, outsidePath);
+    conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
 
     await new OpencodeConversationHistoryService().hydrateConversationHistory(
       conversation,
@@ -104,7 +190,114 @@ describe('OpencodeConversationHistoryService', () => {
     );
 
     expect(conversation.messages.map(message => message.content)).toEqual(['Trusted prompt']);
-    expect(conversation.providerState).toEqual({ databasePath: trustedPath });
+    expect(conversation.providerState).toEqual({
+      databasePath: trustedPath,
+      futureResumeCursor: { token: 'cursor-1' },
+    });
+  });
+
+  it('replaces a legacy Windows AppData database hint with the home database', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const sessionId = 'session-windows-home';
+    const home = path.join(tmpRoot, 'home');
+    const appData = path.join(home, 'AppData', 'Roaming');
+    const legacyPath = path.join(appData, 'opencode', 'opencode.db');
+    const homePath = path.join(home, '.local', 'share', 'opencode', 'opencode.db');
+    seedDatabase(legacyPath, sessionId, 'Legacy AppData prompt');
+    seedDatabase(homePath, sessionId, 'Current home prompt');
+    const conversation = createConversation(sessionId, legacyPath);
+    conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+
+    await new OpencodeConversationHistoryService().hydrateConversationHistory(
+      conversation,
+      null,
+      {
+        environment: {
+          APPDATA: appData,
+          HOME: home,
+          LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+        },
+      },
+    );
+
+    expect(conversation.messages.map(message => message.content)).toEqual(['Current home prompt']);
+    expect(conversation.providerState).toEqual({
+      databasePath: homePath,
+      futureResumeCursor: { token: 'cursor-1' },
+    });
+  });
+
+  it('sanitizes known fields while preserving unknown provider state', () => {
+    const conversation = createConversation('session-1', '/tmp/opencode.db');
+    conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+
+    expect(
+      new OpencodeConversationHistoryService().buildPersistedProviderState(conversation),
+    ).toEqual({
+      databasePath: '/tmp/opencode.db',
+      futureResumeCursor: { token: 'cursor-1' },
+    });
+  });
+
+  describe('resolveMissingConversationSession', () => {
+    it('clears a confirmed stale resume ID while preserving provider-owned state', async () => {
+      const conversation = createConversation('missing-session', '/tmp/opencode.db');
+      conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+      const service = new OpencodeConversationHistoryService();
+
+      await expect(service.resolveMissingConversationSession(
+        conversation,
+        null,
+        'missing-session',
+      )).resolves.toBe('reset');
+
+      expect(conversation.sessionId).toBeNull();
+      expect(conversation.providerState).toEqual({
+        databasePath: '/tmp/opencode.db',
+        futureResumeCursor: { token: 'cursor-1' },
+        nativeConversationContextEstablished: false,
+      });
+    });
+
+    it('preserves a newer resume ID when the failure identifies another session', async () => {
+      const conversation = createConversation('current-session', '/tmp/opencode.db');
+      conversation.providerState!.futureResumeCursor = { token: 'cursor-1' };
+      const service = new OpencodeConversationHistoryService();
+
+      await expect(service.resolveMissingConversationSession(
+        conversation,
+        null,
+        'stale-session',
+      )).resolves.toBe('preserve');
+
+      expect(conversation.sessionId).toBe('current-session');
+      expect(conversation.providerState).toEqual({
+        databasePath: '/tmp/opencode.db',
+        futureResumeCursor: { token: 'cursor-1' },
+      });
+    });
+  });
+
+  it('marks native context established when read-only hydration proves history exists', async () => {
+    const dbPath = path.join(tmpRoot, 'opencode.db');
+    seedDatabase(dbPath, 'session-established', 'Accepted prompt');
+    const conversation = createConversation('session-established', dbPath);
+    conversation.providerState = {
+      ...conversation.providerState,
+      futureResumeCursor: { token: 'cursor-1' },
+      nativeConversationContextEstablished: false,
+    };
+
+    await new OpencodeConversationHistoryService().hydrateConversationHistory(
+      conversation,
+      null,
+    );
+
+    expect(conversation.providerState).toEqual({
+      databasePath: dbPath,
+      futureResumeCursor: { token: 'cursor-1' },
+      nativeConversationContextEstablished: true,
+    });
   });
 
   it('accepts an explicitly configured local database path', async () => {
@@ -185,6 +378,6 @@ function createConversation(sessionId: string, databasePath: string): Conversati
     providerState: { databasePath },
     sessionId,
     title: 'OpenCode conversation',
-    updatedAt: 1,
+    lastActivityAt: 1,
   };
 }

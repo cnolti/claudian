@@ -1,5 +1,7 @@
-import type { App, Plugin } from 'obsidian';
+import type { App, Plugin, SettingDefinitionItem } from 'obsidian';
 import { Notice, Platform, PluginSettingTab, Setting } from 'obsidian';
+
+import { frameSettingsGroups } from '@/shared/settings/SettingsGroups';
 
 import {
   getHiddenProviderCommands,
@@ -8,16 +10,27 @@ import {
 import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../core/providers/ProviderWorkspaceRegistry';
-import type { ProviderId } from '../../core/providers/types';
-import type { ChatViewPlacement } from '../../core/types/settings';
+import type { ProviderId, ProviderSettingsTabRenderHandle } from '../../core/providers/types';
+import { AgentSkillRepository } from '../../core/skills/AgentSkillRepository';
+import type {
+  ChatViewPlacement,
+  DualPaneSide,
+} from '../../core/types/settings';
 import { getAvailableLocales, getLocaleDisplayName, setLocale, t } from '../../i18n/i18n';
 import type { Locale, TranslationKey } from '../../i18n/types';
 import { renderEnvironmentSettingsSection } from '../../shared/settings/EnvironmentSettingsSection';
 import { formatContextLimit, parseContextLimit, parseEnvironmentVariables } from '../../utils/env';
+import {
+  MAX_WARM_AGENT_PROCESSES,
+  MIN_WARM_AGENT_PROCESSES,
+} from '../chat/execution/WarmExecutionPool';
 import type { FeatureHost } from '../FeatureHost';
+import { AgentSkillManagementCoordinator } from './AgentSkillManagementCoordinator';
+import { AgentSkillSettings } from './AgentSkillSettings';
+import { renderHeartbeatSettingsSection } from './HeartbeatSettingsSection';
 import { buildNavMappingText, parseNavMappings } from './keyboardNavigation';
 
-type SettingsTabId = string;
+type SettingsTabId = 'general' | 'providers';
 type ObsidianHotkey = { modifiers: string[]; key: string };
 type ObsidianHotkeyManager = {
   customKeys?: Record<string, ObsidianHotkey[] | undefined>;
@@ -108,35 +121,126 @@ function addHotkeySettingRow(
 export class ClaudianSettingTab extends PluginSettingTab {
   plugin: FeatureHost;
   private activeTab: SettingsTabId = 'general';
+  private activeProviderTab: ProviderId | null = null;
   private refreshTitleModelOptions: (() => void) | null = null;
+  private renderGeneration = 0;
+  private readonly providerSettingsRenders = new Map<ProviderId, ProviderSettingsTabRenderHandle>();
+  private readonly agentSkillCoordinator: AgentSkillManagementCoordinator;
 
   constructor(app: App, plugin: FeatureHost & Plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.agentSkillCoordinator = new AgentSkillManagementCoordinator(
+      new AgentSkillRepository(plugin.storage.getAdapter()),
+      () => plugin.notifyAgentSkillsChanged(),
+    );
   }
 
-  display(): void {
-    const { containerEl } = this;
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [{
+      name: 'Claudian',
+      searchable: false,
+      render: setting => this.renderSettings(setting.settingEl),
+    }];
+  }
+
+  private renderSettings(containerEl: HTMLElement): () => void {
+    this.disposeProviderSettingsRenders();
+    const renderGeneration = ++this.renderGeneration;
+    this.agentSkillCoordinator.resetSubscriptions();
     containerEl.empty();
     containerEl.addClass('claudian-settings');
+    const settingItems = containerEl.parentElement;
+    if (settingItems?.classList.contains('setting-items')) {
+      settingItems.classList.add('claudian-settings-items');
+    }
     this.refreshTitleModelOptions = null;
 
     setLocale(this.plugin.settings.locale as Locale);
 
     const providerTabs = ProviderRegistry.getRegisteredProviderIds();
-    const tabIds: SettingsTabId[] = ['general', ...providerTabs];
-    if (!tabIds.includes(this.activeTab)) {
-      this.activeTab = 'general';
+    const tabIds: SettingsTabId[] = ['general', 'providers'];
+    const preferredProvider = providerTabs.includes(this.plugin.settings.settingsProvider)
+      ? this.plugin.settings.settingsProvider
+      : providerTabs[0] ?? null;
+    if (!this.activeProviderTab || !providerTabs.includes(this.activeProviderTab)) {
+      this.activeProviderTab = preferredProvider;
     }
 
     const tabBar = containerEl.createDiv({ cls: 'claudian-settings-tabs' });
     const tabButtons = new Map<SettingsTabId, HTMLButtonElement>();
     const tabContents = new Map<SettingsTabId, HTMLDivElement>();
+    const providersContent = containerEl.createDiv({
+      cls: `claudian-settings-tab-content${this.activeTab === 'providers' ? ' claudian-settings-tab-content--active' : ''}`,
+    });
+    tabContents.set('providers', providersContent);
+    const providerTabBar = providersContent.createDiv({
+      cls: 'claudian-settings-provider-tabs',
+    });
+    const providerContentHost = providersContent.createDiv({
+      cls: 'claudian-settings-provider-content-host',
+    });
+    const providerButtons = new Map<ProviderId, HTMLButtonElement>();
+    const providerContents = new Map<ProviderId, HTMLDivElement>();
+    const renderedProviderIds = new Set<ProviderId>();
+
+    const renderProviderTab = async (providerId: ProviderId): Promise<void> => {
+      if (renderedProviderIds.has(providerId)) return;
+      const providerContent = providerContents.get(providerId);
+      if (!providerContent) return;
+      renderedProviderIds.add(providerId);
+      providerContent.empty();
+      providerContent.createDiv({
+        cls: 'claudian-settings-provider-loading',
+        text: `Loading ${ProviderRegistry.getProviderDisplayName(providerId)} settings...`,
+      });
+
+      try {
+        await ProviderWorkspaceRegistry.ensureInitialized(
+          this.plugin.providerHost,
+          providerId,
+          'settings-tab',
+        );
+        if (renderGeneration !== this.renderGeneration) return;
+        providerContent.empty();
+        const renderer = ProviderWorkspaceRegistry.getSettingsTabRenderer(providerId);
+        if (!renderer) {
+          providerContent.createDiv({ text: 'Provider settings are unavailable.' });
+          return;
+        }
+        const handle = renderer.render(providerContent, {
+          plugin: this.plugin.providerHost,
+          renderAgentSkillSettings: (target, _targetProviderId) => {
+            new AgentSkillSettings(target, this.agentSkillCoordinator, this.app);
+          },
+          renderHiddenProviderCommandSetting: (
+            target,
+            targetProviderId,
+            copy,
+          ) => this.renderHiddenProviderCommandSetting(target, targetProviderId, copy),
+          notifyProviderModelOptionsChanged: (changedProviderId) => {
+            this.notifyProviderModelOptionsChanged(changedProviderId);
+          },
+          renderCustomContextLimits: (target, targetProviderId) => (
+            this.renderCustomContextLimits(target, targetProviderId)
+          ),
+        });
+        if (handle) this.providerSettingsRenders.set(providerId, handle);
+        frameSettingsGroups(providerContent);
+      } catch (error) {
+        if (renderGeneration !== this.renderGeneration) return;
+        renderedProviderIds.delete(providerId);
+        providerContent.empty();
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        providerContent.createDiv({
+          cls: 'claudian-setting-validation claudian-setting-validation-error',
+          text: `Could not load provider settings: ${message}`,
+        });
+      }
+    };
 
     for (const id of tabIds) {
-      const label = id === 'general'
-        ? t('settings.tabs.general')
-        : ProviderRegistry.getProviderDisplayName(id);
+      const label = t(`settings.tabs.${id}`);
       const button = tabBar.createEl('button', {
         cls: `claudian-settings-tab${id === this.activeTab ? ' claudian-settings-tab--active' : ''}`,
         text: label,
@@ -147,41 +251,61 @@ export class ClaudianSettingTab extends PluginSettingTab {
           tabButtons.get(tabId)?.toggleClass('claudian-settings-tab--active', tabId === id);
           tabContents.get(tabId)?.toggleClass('claudian-settings-tab-content--active', tabId === id);
         }
+        if (id === 'providers' && this.activeProviderTab) {
+          void renderProviderTab(this.activeProviderTab);
+        }
       });
       tabButtons.set(id, button);
     }
 
-    for (const id of tabIds) {
+    for (const id of tabIds.filter(id => id !== 'providers')) {
       const content = containerEl.createDiv({
-        cls: `claudian-settings-tab-content${id === this.activeTab ? ' claudian-settings-tab-content--active' : ''}`,
+        cls: `claudian-settings-tab-content claudian-settings-${id}${id === this.activeTab ? ' claudian-settings-tab-content--active' : ''}`,
       });
       tabContents.set(id, content);
     }
 
     this.renderGeneralTab(tabContents.get('general')!);
+    frameSettingsGroups(tabContents.get('general')!);
 
     for (const providerId of providerTabs) {
-      const content = tabContents.get(providerId);
-      if (!content) {
-        continue;
-      }
-
-      ProviderWorkspaceRegistry.getSettingsTabRenderer(providerId)?.render(content, {
-        plugin: this.plugin.providerHost,
-        renderHiddenProviderCommandSetting: (
-          target,
-          targetProviderId,
-          copy,
-        ) => this.renderHiddenProviderCommandSetting(target, targetProviderId, copy),
-        refreshModelSelectors: () => {
-          for (const view of this.plugin.getAllViews()) {
-            view.refreshModelSelector();
-          }
-        },
-        refreshTitleGenerationModelOptions: () => this.refreshTitleModelOptions?.(),
-        renderCustomContextLimits: (target, providerId) => this.renderCustomContextLimits(target, providerId),
+      const content = providerContentHost.createDiv({
+        cls: `claudian-settings-provider-content${providerId === this.activeProviderTab ? ' claudian-settings-provider-content--active' : ''}`,
       });
+      providerContents.set(providerId, content);
+      const button = providerTabBar.createEl('button', {
+        cls: `claudian-settings-provider-tab${providerId === this.activeProviderTab ? ' claudian-settings-provider-tab--active' : ''}`,
+        text: ProviderRegistry.getProviderDisplayName(providerId),
+      });
+      button.addEventListener('click', () => {
+        this.activeProviderTab = providerId;
+        for (const candidate of providerTabs) {
+          providerButtons.get(candidate)?.toggleClass(
+            'claudian-settings-provider-tab--active',
+            candidate === providerId,
+          );
+          providerContents.get(candidate)?.toggleClass(
+            'claudian-settings-provider-content--active',
+            candidate === providerId,
+          );
+        }
+        void renderProviderTab(providerId);
+      });
+      providerButtons.set(providerId, button);
     }
+
+    if (this.activeTab === 'providers' && this.activeProviderTab) {
+      void renderProviderTab(this.activeProviderTab);
+    }
+
+    return () => {
+      if (renderGeneration !== this.renderGeneration) return;
+      settingItems?.classList.remove('claudian-settings-items');
+      this.renderGeneration += 1;
+      this.disposeProviderSettingsRenders();
+      this.agentSkillCoordinator.resetSubscriptions();
+      this.refreshTitleModelOptions = null;
+    };
   }
 
   private renderGeneralTab(container: HTMLElement): void {
@@ -204,43 +328,13 @@ export class ClaudianSettingTab extends PluginSettingTab {
             await this.plugin.mutateSettings((settings) => {
               settings.locale = locale;
             });
-            this.display();
+            this.update();
           });
       });
 
     // --- Display ---
 
     new Setting(container).setName(t('settings.display')).setHeading();
-
-    const maxTabsSetting = new Setting(container)
-      .setName(t('settings.maxTabs.name'))
-      .setDesc(t('settings.maxTabs.desc'));
-
-    const maxTabsWarningEl = container.createDiv({
-      cls: 'claudian-max-tabs-warning claudian-setting-validation claudian-setting-validation-warning claudian-hidden',
-    });
-    maxTabsWarningEl.setText(t('settings.maxTabs.warning'));
-
-    const updateMaxTabsWarning = (value: number): void => {
-      maxTabsWarningEl.toggleClass('claudian-hidden', value <= 5);
-    };
-
-    maxTabsSetting.addSlider((slider) => {
-      slider
-        .setLimits(3, 10, 1)
-        .setValue(this.plugin.settings.maxTabs ?? 3)
-        .setDynamicTooltip()
-        .onChange(async (value) => {
-          await this.plugin.mutateSettings((settings) => {
-            settings.maxTabs = value;
-          });
-          updateMaxTabsWarning(value);
-          for (const view of this.plugin.getAllViews()) {
-            view.refreshTabControls();
-          }
-        });
-      updateMaxTabsWarning(this.plugin.settings.maxTabs ?? 3);
-    });
 
     new Setting(container)
       .setName(t('settings.chatViewPlacement.name'))
@@ -259,6 +353,53 @@ export class ClaudianSettingTab extends PluginSettingTab {
       });
 
     new Setting(container)
+      .setName(t('settings.enableDualPane.name'))
+      .setDesc(t('settings.enableDualPane.desc'))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.enableDualPane ?? true)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.enableDualPane = value;
+            });
+            this.refreshDualPaneLayouts();
+            this.update();
+          })
+      );
+
+    if (this.plugin.settings.enableDualPane ?? true) {
+      new Setting(container)
+        .setName(t('settings.dualPaneSide.name'))
+        .setDesc(t('settings.dualPaneSide.desc'))
+        .addDropdown((dropdown) => {
+          dropdown
+            .addOption('left', t('settings.dualPaneSide.left'))
+            .addOption('right', t('settings.dualPaneSide.right'))
+            .setValue(this.plugin.settings.dualPaneSide ?? 'right')
+            .onChange(async (value) => {
+              await this.plugin.mutateSettings((settings) => {
+                settings.dualPaneSide = value as DualPaneSide;
+              });
+              this.refreshDualPaneLayouts();
+            });
+        });
+
+    }
+
+    new Setting(container)
+      .setName(t('settings.restoreTabsOnStartup.name'))
+      .setDesc(t('settings.restoreTabsOnStartup.desc'))
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.restoreTabsOnStartup)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.restoreTabsOnStartup = value;
+            });
+          });
+      });
+
+    new Setting(container)
       .setName(t('settings.enableAutoScroll.name'))
       .setDesc(t('settings.enableAutoScroll.desc'))
       .addToggle((toggle) =>
@@ -268,6 +409,22 @@ export class ClaudianSettingTab extends PluginSettingTab {
             await this.plugin.mutateSettings((settings) => {
               settings.enableAutoScroll = value;
             });
+          })
+      );
+
+    new Setting(container)
+      .setName(t('settings.showMessageTimestamps.name'))
+      .setDesc(t('settings.showMessageTimestamps.desc'))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.showMessageTimestamps === true)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.showMessageTimestamps = value;
+            });
+            for (const view of this.plugin.getAllViews()) {
+              view.refreshMessageTimestamps();
+            }
           })
       );
 
@@ -311,22 +468,54 @@ export class ClaudianSettingTab extends PluginSettingTab {
             await this.plugin.mutateSettings((settings) => {
               settings.enableAutoTitleGeneration = value;
             });
-            this.display();
+            this.update();
           })
       );
 
     if (this.plugin.settings.enableAutoTitleGeneration) {
       new Setting(container)
+        .setName(t('settings.titleLanguage.name'))
+        .setDesc(t('settings.titleLanguage.desc'))
+        .addDropdown((dropdown) => {
+          dropdown.addOption('', t('settings.titleLanguage.followInterface'));
+          for (const locale of getAvailableLocales()) {
+            dropdown.addOption(locale, getLocaleDisplayName(locale));
+          }
+          dropdown
+            .setValue(this.plugin.settings.titleGenerationLocale || '')
+            .onChange(async (value) => {
+              await this.plugin.mutateSettings((settings) => {
+                settings.titleGenerationLocale = value;
+              });
+            });
+        });
+
+      new Setting(container)
         .setName(t('settings.titleModel.name'))
         .setDesc(t('settings.titleModel.desc'))
         .addDropdown((dropdown) => {
+          dropdown.selectEl.setAttribute('aria-label', t('settings.titleModel.name'));
+          const warning = dropdown.selectEl.parentElement!.createDiv();
+          warning.className = 'claudian-setting-validation claudian-setting-validation-warning';
+          warning.setAttribute('role', 'status');
+          warning.setAttribute('aria-live', 'polite');
+          warning.textContent = t('settings.titleModel.unavailableWarning');
+          dropdown.selectEl.insertAdjacentElement('afterend', warning);
           const refreshOptions = (): void => {
             dropdown.selectEl.replaceChildren();
-            dropdown.addOption('', t('settings.titleModel.auto'));
+            dropdown.addOption('', t('settings.titleModel.select'));
+            dropdown.selectEl.options[0].disabled = true;
+            dropdown.selectEl.required = true;
 
             const settingsBag = this.plugin.settings as unknown as Record<string, unknown>;
+            warning.hidden = ProviderRegistry.resolveTitleGenerationSelection(settingsBag) !== null;
             for (const model of ProviderRegistry.getTitleGenerationModelOptions(settingsBag)) {
               dropdown.addOption(model.value, model.label);
+            }
+            const selected = this.plugin.settings.titleGenerationModel;
+            if (selected && !Array.from(dropdown.selectEl.options).some(option => option.value === selected)) {
+              dropdown.addOption(selected, `Unavailable: ${selected}`);
+              dropdown.selectEl.options[dropdown.selectEl.options.length - 1].disabled = true;
             }
             dropdown.setValue(this.plugin.settings.titleGenerationModel || '');
           };
@@ -337,6 +526,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
             await this.plugin.mutateSettings((settings) => {
               ProviderSettingsCoordinator.applyTitleGenerationModelSelection(settings, value);
             });
+            refreshOptions();
           });
         });
     }
@@ -365,6 +555,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName(t('settings.systemPrompt.name'))
       .setDesc(t('settings.systemPrompt.desc'))
+      .setClass('claudian-settings-textarea')
       .addTextArea((text) => {
         text
           .setPlaceholder(t('settings.systemPrompt.name'))
@@ -384,6 +575,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName(t('settings.excludedTags.name'))
       .setDesc(t('settings.excludedTags.desc'))
+      .setClass('claudian-settings-textarea')
       .addTextArea((text) => {
         text
           .setPlaceholder('System\nprivate\ndraft')
@@ -438,6 +630,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName(t('settings.navMappings.name'))
       .setDesc(t('settings.navMappings.desc'))
+      .setClass('claudian-settings-textarea')
       .addTextArea((text) => {
         let pendingValue = buildNavMappingText(this.plugin.settings.keyboardNavigation);
         let saveTimeout: number | null = null;
@@ -503,113 +696,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
 
     // --- Heartbeat (fork-only) ---
 
-    new Setting(container).setName('Heartbeat').setHeading();
-
-    new Setting(container)
-      .setName('Enable heartbeat')
-      .setDesc('Periodically wake Claude in the background to update the vault daemon state.')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.heartbeatEnabled)
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatEnabled = value;
-            });
-            if (value) {
-              this.plugin.heartbeat.start();
-            } else {
-              this.plugin.heartbeat.stop();
-            }
-          }),
-      );
-
-    new Setting(container)
-      .setName('Interval (minutes)')
-      .setDesc('How often the heartbeat fires.')
-      .addSlider((slider) =>
-        slider
-          .setLimits(5, 120, 5)
-          .setValue(this.plugin.settings.heartbeatIntervalMinutes)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatIntervalMinutes = value;
-            });
-            if (this.plugin.settings.heartbeatEnabled) {
-              this.plugin.heartbeat.restart();
-            }
-          }),
-      );
-
-    new Setting(container)
-      .setName('Max turns')
-      .setDesc('Maximum SDK turns the heartbeat can take per tick before terminating.')
-      .addSlider((slider) =>
-        slider
-          .setLimits(1, 40, 1)
-          .setValue(this.plugin.settings.heartbeatMaxTurns)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatMaxTurns = value;
-            });
-          }),
-      );
-
-    new Setting(container)
-      .setName('Model')
-      .setDesc('Model used by the heartbeat (defaults to haiku for low cost).')
-      .addText((text) =>
-        text
-          // eslint-disable-next-line obsidianmd/ui/sentence-case -- literal model id
-          .setPlaceholder('haiku')
-          .setValue(this.plugin.settings.heartbeatModel)
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatModel = value.trim() || 'haiku';
-            });
-          }),
-      );
-
-    new Setting(container)
-      .setName('Quiet hours start (hh:mm)')
-      .setDesc('Heartbeat is suppressed between quiet-start and quiet-end (24h format).')
-      .addText((text) =>
-        text
-          .setPlaceholder('22:00')
-          .setValue(this.plugin.settings.heartbeatQuietStart)
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatQuietStart = value.trim() || '22:00';
-            });
-          }),
-      );
-
-    new Setting(container)
-      .setName('Quiet hours end (hh:mm)')
-      .addText((text) =>
-        text
-          .setPlaceholder('06:00')
-          .setValue(this.plugin.settings.heartbeatQuietEnd)
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatQuietEnd = value.trim() || '06:00';
-            });
-          }),
-      );
-
-    new Setting(container)
-      .setName('Pause while streaming')
-      .setDesc('Skip the heartbeat when any tab is actively streaming a response.')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.heartbeatPauseOnStreaming)
-          .onChange(async (value) => {
-            await this.plugin.mutateSettings((settings) => {
-              settings.heartbeatPauseOnStreaming = value;
-            });
-          }),
-      );
+    renderHeartbeatSettingsSection(container, this.plugin);
 
     // --- Environment ---
 
@@ -621,8 +708,61 @@ export class ClaudianSettingTab extends PluginSettingTab {
       name: 'Shared environment',
       desc: 'Provider-neutral runtime variables shared across all providers. Use this for PATH, proxy, cert, and temp variables.',
       placeholder: 'PATH=/opt/homebrew/bin:/usr/local/bin\nHTTPS_PROXY=http://proxy.example.com:8080\nSSL_CERT_FILE=/path/to/cert.pem',
-      renderCustomContextLimits: (target) => this.renderCustomContextLimits(target),
     });
+
+    // --- Advanced ---
+
+    new Setting(container).setName(t('common.advanced')).setHeading();
+
+    new Setting(container)
+      .setName(t('settings.maxWarmAgentProcesses.name'))
+      .setDesc(t('settings.maxWarmAgentProcesses.desc'))
+      .addSlider((slider) => {
+        slider
+          .setLimits(MIN_WARM_AGENT_PROCESSES, MAX_WARM_AGENT_PROCESSES, 1)
+          .setValue(this.plugin.settings.maxWarmAgentProcesses ?? 5)
+          .onChange(async (value) => {
+            await this.plugin.mutateSettings((settings) => {
+              settings.maxWarmAgentProcesses = value;
+            });
+            try {
+              const reconciled = await this.plugin.warmExecutionPool.reconcileLimit();
+              if (!reconciled) {
+                new Notice(
+                  'The new concurrent running session limit will apply as busy sessions become idle.',
+                );
+              }
+            } catch (error) {
+              new Notice(
+                error instanceof Error
+                  ? error.message
+                  : 'Failed to release excess warm agent processes.',
+              );
+            }
+          });
+      });
+
+  }
+
+  private disposeProviderSettingsRenders(): void {
+    for (const handle of this.providerSettingsRenders.values()) handle.dispose();
+    this.providerSettingsRenders.clear();
+  }
+
+  refreshModelOptions(): void {
+    for (const handle of this.providerSettingsRenders.values()) handle.refresh();
+    this.refreshTitleModelOptions?.();
+  }
+
+  private notifyProviderModelOptionsChanged(providerId: ProviderId): void {
+    this.plugin.notifyProviderChatOptionsChanged(providerId);
+    this.refreshTitleModelOptions?.();
+  }
+
+  private refreshDualPaneLayouts(): void {
+    for (const view of this.plugin.getAllViews()) {
+      view.refreshDualPaneLayout();
+    }
   }
 
   private renderHiddenProviderCommandSetting(
@@ -633,6 +773,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName(copy.name)
       .setDesc(copy.desc)
+      .setClass('claudian-settings-textarea')
       .addTextArea((text) => {
         text
           .setPlaceholder(copy.placeholder)
@@ -651,21 +792,16 @@ export class ClaudianSettingTab extends PluginSettingTab {
       });
   }
 
-  private renderCustomContextLimits(container: HTMLElement, providerId?: ProviderId): void {
+  private renderCustomContextLimits(container: HTMLElement, providerId: ProviderId): void {
     container.empty();
 
+    const modelAliases = ProviderRegistry.getChatUIConfig(providerId).customModelAliases;
     const uniqueModelIds = new Set<string>();
-    const providerIds = providerId
-      ? [providerId]
-      : ProviderRegistry.getRegisteredProviderIds();
-
-    for (const targetProviderId of providerIds) {
-      const envVars = parseEnvironmentVariables(
-        this.plugin.getActiveEnvironmentVariables(targetProviderId),
-      );
-      for (const modelId of ProviderRegistry.getChatUIConfig(targetProviderId).getCustomModelIds(envVars)) {
-        uniqueModelIds.add(modelId);
-      }
+    const envVars = parseEnvironmentVariables(
+      this.plugin.getActiveEnvironmentVariables(providerId),
+    );
+    for (const modelId of ProviderRegistry.getChatUIConfig(providerId).getCustomModelIds(envVars)) {
+      uniqueModelIds.add(modelId);
     }
 
     if (uniqueModelIds.size === 0) {
@@ -685,7 +821,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
 
     for (const modelId of uniqueModelIds) {
       const currentValue = this.plugin.settings.customContextLimits?.[modelId];
-      const currentAlias = this.plugin.settings.customModelAliases?.[modelId] ?? '';
+      const currentAlias = (modelAliases?.get(this.plugin.settings) ?? {})[modelId] ?? '';
 
       const itemEl = listEl.createDiv({ cls: 'claudian-context-limits-item' });
       const nameEl = itemEl.createDiv({ cls: 'claudian-context-limits-model' });
@@ -712,7 +848,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
       const validationEl = inputWrapper.createDiv({ cls: 'claudian-context-limit-validation claudian-hidden' });
 
       const saveAlias = async (): Promise<void> => {
-        const existing = this.plugin.settings.customModelAliases[modelId] ?? '';
+        const existing = (modelAliases?.get(this.plugin.settings) ?? {})[modelId] ?? '';
         const trimmed = aliasInputEl.value.trim();
         if (trimmed === existing) {
           aliasInputEl.value = existing;
@@ -720,16 +856,15 @@ export class ClaudianSettingTab extends PluginSettingTab {
         }
 
         await this.plugin.mutateSettings((settings) => {
-          settings.customModelAliases ??= {};
+          const aliases = (modelAliases?.get(settings) ?? {});
           if (trimmed) {
-            settings.customModelAliases[modelId] = trimmed;
+            aliases[modelId] = trimmed;
           } else {
-            delete settings.customModelAliases[modelId];
+            delete aliases[modelId];
           }
+          modelAliases?.update(settings, aliases);
         });
-        for (const view of this.plugin.getAllViews()) {
-          view.refreshModelSelector();
-        }
+        this.notifyProviderModelOptionsChanged(providerId);
       };
 
       const saveContextLimit = async (): Promise<void> => {
@@ -758,6 +893,9 @@ export class ClaudianSettingTab extends PluginSettingTab {
             settings.customContextLimits[modelId] = parseContextLimit(trimmed)!;
           }
         });
+        for (const view of this.plugin.getAllViews()) {
+          view.refreshModelSelector(providerId);
+        }
       };
 
       inputEl.addEventListener('input', () => {
@@ -772,7 +910,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
           aliasInputEl.blur();
         } else if (event.key === 'Escape') {
           event.preventDefault();
-          aliasInputEl.value = this.plugin.settings.customModelAliases?.[modelId] ?? '';
+          aliasInputEl.value = (modelAliases?.get(this.plugin.settings) ?? {})[modelId] ?? '';
           aliasInputEl.blur();
         }
       });
@@ -780,16 +918,13 @@ export class ClaudianSettingTab extends PluginSettingTab {
   }
 
   private async restartServiceForPromptChange(): Promise<void> {
-    const view = this.plugin.getView();
-    const tabManager = view?.getTabManager();
-    if (!tabManager) return;
-
     try {
-      await tabManager.broadcastToAllTabs(
-        async (service) => { await service.ensureReady({ force: true }); }
+      await this.plugin.providerHost.runProviderExecutionTransition(
+        ProviderRegistry.getRegisteredProviderIds(),
+        async () => undefined,
       );
     } catch {
-      // Changes will apply on the next conversation if the restart fails.
+      // Changes will apply when the next provider execution starts.
     }
   }
 }

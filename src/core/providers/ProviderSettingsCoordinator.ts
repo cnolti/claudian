@@ -1,11 +1,23 @@
 import type { Conversation } from '../types';
 import { toProviderRuntimeModelId } from './modelSelection';
 import { ProviderRegistry } from './ProviderRegistry';
+import {
+  ensureProviderProjectionMap,
+  normalizeProviderProjectionMap,
+  type ProviderProjectionKey,
+  type ProviderProjectionMap,
+} from './settings/ProviderProjectionMap';
 import type { ProviderChatUIConfig, ProviderId } from './types';
 
 export interface SettingsReconciliationResult {
   changed: boolean;
+  environmentChangedProviderIds: ProviderId[];
+  sessionInvalidationProviderIds: ProviderId[];
   invalidatedConversations: Conversation[];
+}
+
+export interface ReconcileProviderSettingsOptions {
+  invalidateConversations?: boolean;
 }
 
 const PROJECTION_KEYS = new Set([
@@ -16,39 +28,18 @@ const PROJECTION_KEYS = new Set([
   'permissionMode',
 ]);
 
-type ProviderProjectionMap = Partial<Record<string, string>>;
-
 function getSettingsProviderId(settings: Record<string, unknown>): ProviderId {
   return ProviderRegistry.resolveSettingsProviderId(settings);
-}
-
-function ensureProjectionMap(
-  settings: Record<string, unknown>,
-  key:
-  | 'savedProviderModel'
-  | 'savedProviderEffort'
-  | 'savedProviderServiceTier'
-  | 'savedProviderThinkingBudget'
-  | 'savedProviderPermissionMode',
-): ProviderProjectionMap {
-  const current = settings[key];
-  if (current && typeof current === 'object') {
-    return current;
-  }
-
-  const next: ProviderProjectionMap = {};
-  settings[key] = next;
-  return next;
 }
 
 function cloneProviderSettings(settings: Record<string, unknown>): Record<string, unknown> {
   return {
     ...settings,
-    savedProviderModel: { ...(settings.savedProviderModel as ProviderProjectionMap | undefined) },
-    savedProviderEffort: { ...(settings.savedProviderEffort as ProviderProjectionMap | undefined) },
-    savedProviderServiceTier: { ...(settings.savedProviderServiceTier as ProviderProjectionMap | undefined) },
-    savedProviderThinkingBudget: { ...(settings.savedProviderThinkingBudget as ProviderProjectionMap | undefined) },
-    savedProviderPermissionMode: { ...(settings.savedProviderPermissionMode as ProviderProjectionMap | undefined) },
+    savedProviderModel: normalizeProviderProjectionMap(settings.savedProviderModel),
+    savedProviderEffort: normalizeProviderProjectionMap(settings.savedProviderEffort),
+    savedProviderServiceTier: normalizeProviderProjectionMap(settings.savedProviderServiceTier),
+    savedProviderThinkingBudget: normalizeProviderProjectionMap(settings.savedProviderThinkingBudget),
+    savedProviderPermissionMode: normalizeProviderProjectionMap(settings.savedProviderPermissionMode),
   };
 }
 
@@ -99,6 +90,16 @@ function normalizeProviderModel(
   return uiConfig.normalizeModelVariant(model, settings);
 }
 
+function normalizeServiceTier(
+  uiConfig: ProviderChatUIConfig,
+  settings: Record<string, unknown>,
+): void {
+  const toggle = uiConfig.getServiceTierToggle?.(settings) ?? null;
+  settings.serviceTier = toggle
+    ? (toggle.isActive ? toggle.activeValue : toggle.inactiveValue)
+    : 'default';
+}
+
 function normalizeModelDependentSettings(
   uiConfig: ProviderChatUIConfig,
   settings: Record<string, unknown>,
@@ -120,48 +121,15 @@ function normalizeModelDependentSettings(
     );
   }
 
-  const serviceTierToggle = uiConfig.getServiceTierToggle?.(settings) ?? null;
-  if (!serviceTierToggle) {
-    settings.serviceTier = 'default';
-    return;
-  }
-
-  const currentServiceTier = typeof settings.serviceTier === 'string'
-    ? settings.serviceTier
-    : undefined;
-  if (currentServiceTier === 'fast') {
-    settings.serviceTier = serviceTierToggle.activeValue;
-    return;
-  }
-  if (
-    currentServiceTier !== serviceTierToggle.inactiveValue
-    && currentServiceTier !== serviceTierToggle.activeValue
-  ) {
-    settings.serviceTier = serviceTierToggle.inactiveValue;
-  }
+  normalizeServiceTier(uiConfig, settings);
 }
 
 export class ProviderSettingsCoordinator {
-  static applyModelSelection(
-    settings: Record<string, unknown>,
-    providerId: ProviderId,
-    model: string,
-  ): void {
-    const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
-    settings.model = model;
-    uiConfig.applyModelDefaults(model, settings);
-    normalizeModelDependentSettings(uiConfig, settings, model);
-  }
-
   static applyTitleGenerationModelSelection(
     settings: Record<string, unknown>,
     model: string,
   ): void {
     settings.titleGenerationModel = model;
-    for (const providerId of ProviderRegistry.getRegisteredProviderIds()) {
-      ProviderRegistry.getChatUIConfig(providerId)
-        .applyTitleGenerationModelSelection?.(model, settings);
-    }
   }
 
   static projectModelSelection(
@@ -197,35 +165,12 @@ export class ProviderSettingsCoordinator {
       return false;
     }
 
-    for (const providerId of ProviderRegistry.getRegisteredProviderIds()) {
-      if (!ProviderRegistry.isEnabled(providerId, settings)) {
-        continue;
-      }
-
-      const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
-      if (!uiConfig.ownsModel(currentModel, settings)) {
-        continue;
-      }
-
-      const normalizedModel = normalizeProviderModel(uiConfig, settings, currentModel);
-      const currentRuntimeModel = toProviderRuntimeModelId(providerId, currentModel);
-      const isValid = normalizedModel !== undefined
-        && uiConfig.getModelOptions(settings).some((option) =>
-          option.value === normalizedModel
-          && toProviderRuntimeModelId(providerId, option.value) === currentRuntimeModel
-        );
-      if (!isValid) {
-        continue;
-      }
-
-      if (normalizedModel !== currentModel) {
-        settings.titleGenerationModel = normalizedModel;
-        return true;
-      }
-      return false;
-    }
-
-    settings.titleGenerationModel = '';
+    const selection = ProviderRegistry.resolveTitleGenerationSelection(settings);
+    if (!selection) return false;
+    const { providerId, model: normalizedModel } = selection;
+    if (normalizedModel === currentModel
+      || toProviderRuntimeModelId(providerId, normalizedModel) !== toProviderRuntimeModelId(providerId, currentModel)) return false;
+    settings.titleGenerationModel = normalizedModel;
     return true;
   }
 
@@ -240,14 +185,36 @@ export class ProviderSettingsCoordinator {
     return true;
   }
 
+  static canApplyProviderEnablement(
+    settings: Record<string, unknown>,
+    providerId: ProviderId,
+    enabled: boolean,
+  ): boolean {
+    return enabled
+      || !ProviderRegistry.isEnabled(providerId, settings)
+      || ProviderRegistry.getEnabledProviderIds(settings).length > 1;
+  }
+
   static applyProviderEnablement(
     settings: Record<string, unknown>,
     providerId: ProviderId,
     enabled: boolean,
-  ): void {
+  ): boolean {
+    if (!this.canApplyProviderEnablement(settings, providerId, enabled)) {
+      return false;
+    }
+
+    const previousProviderId = getSettingsProviderId(settings);
+    if (!enabled && previousProviderId === providerId) {
+      this.persistProjectedProviderState(settings, providerId);
+    }
+
     ProviderRegistry.setEnabled(providerId, settings, enabled);
-    this.normalizeProviderSelection(settings);
+    if (this.normalizeProviderSelection(settings)) {
+      this.projectActiveProviderState(settings);
+    }
     this.reconcileTitleGenerationModelSelection(settings);
+    return true;
   }
 
   static getProviderSettingsSnapshot<T extends Record<string, unknown>>(
@@ -278,11 +245,11 @@ export class ProviderSettingsCoordinator {
     settings: Record<string, unknown>,
     providerId: ProviderId = getSettingsProviderId(settings),
   ): void {
-    const savedModel = ensureProjectionMap(settings, 'savedProviderModel');
-    const savedEffort = ensureProjectionMap(settings, 'savedProviderEffort');
-    const savedServiceTier = ensureProjectionMap(settings, 'savedProviderServiceTier');
-    const savedBudget = ensureProjectionMap(settings, 'savedProviderThinkingBudget');
-    const savedPermissionMode = ensureProjectionMap(settings, 'savedProviderPermissionMode');
+    const savedModel = ensureProviderProjectionMap(settings, 'savedProviderModel');
+    const savedEffort = ensureProviderProjectionMap(settings, 'savedProviderEffort');
+    const savedServiceTier = ensureProviderProjectionMap(settings, 'savedProviderServiceTier');
+    const savedBudget = ensureProviderProjectionMap(settings, 'savedProviderThinkingBudget');
+    const savedPermissionMode = ensureProviderProjectionMap(settings, 'savedProviderPermissionMode');
     const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
     const normalizedModel = normalizeProviderModel(
       uiConfig,
@@ -298,6 +265,8 @@ export class ProviderSettingsCoordinator {
     }
     if (typeof settings.effortLevel === 'string') {
       savedEffort[providerId] = settings.effortLevel;
+    } else {
+      delete savedEffort[providerId];
     }
     const serviceTierToggle = uiConfig.getServiceTierToggle?.(projectedSettings) ?? null;
     if (serviceTierToggle && typeof settings.serviceTier === 'string') {
@@ -320,11 +289,14 @@ export class ProviderSettingsCoordinator {
     providerId: ProviderId,
   ): void {
     const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
-    const savedModel = settings.savedProviderModel as ProviderProjectionMap | undefined;
-    const savedEffort = settings.savedProviderEffort as ProviderProjectionMap | undefined;
-    const savedServiceTier = settings.savedProviderServiceTier as ProviderProjectionMap | undefined;
-    const savedBudget = settings.savedProviderThinkingBudget as ProviderProjectionMap | undefined;
-    const savedPermissionMode = settings.savedProviderPermissionMode as ProviderProjectionMap | undefined;
+    const projection = (key: ProviderProjectionKey): ProviderProjectionMap => (
+      normalizeProviderProjectionMap(settings[key])
+    );
+    const savedModel = projection('savedProviderModel');
+    const savedEffort = projection('savedProviderEffort');
+    const savedServiceTier = projection('savedProviderServiceTier');
+    const savedBudget = projection('savedProviderThinkingBudget');
+    const savedPermissionMode = projection('savedProviderPermissionMode');
 
     const shouldPreferCurrentProjection = providerId === getSettingsProviderId(settings);
     const currentModelRaw = typeof settings.model === 'string' ? settings.model : '';
@@ -354,9 +326,7 @@ export class ProviderSettingsCoordinator {
       ? currentModel
       : (validProviderDefaultModel ?? modelOptions[0]?.value ?? currentModel);
     const savedModelValue = normalizeProviderModel(uiConfig, settings, savedModel?.[providerId]);
-    const isSavedModelValid = savedModelValue !== undefined
-      && modelOptions.some(option => option.value === savedModelValue);
-    const model = (isSavedModelValid ? savedModelValue : undefined) ?? fallbackModel;
+    const model = savedModelValue ?? fallbackModel;
     const canReuseCurrentProjection = canReuseCurrentModel && model === currentModel;
 
     if (model) {
@@ -374,17 +344,23 @@ export class ProviderSettingsCoordinator {
     }) ?? null;
 
     const isAdaptive = Boolean(model) && uiConfig.isAdaptiveReasoningModel(model, settings);
+    const acceptsEffortProjection = isAdaptive
+      || Object.prototype.hasOwnProperty.call(settings, 'effortLevel');
 
-    if (savedEffort?.[providerId] !== undefined) {
-      settings.effortLevel = savedEffort[providerId];
-    } else if (canReuseCurrentProjection && currentEffort !== undefined) {
-      settings.effortLevel = currentEffort;
-    } else if (isAdaptive) {
-      settings.effortLevel = uiConfig.getDefaultReasoningValue(model, settings);
-    }
+    if (acceptsEffortProjection) {
+      if (savedEffort?.[providerId] !== undefined) {
+        settings.effortLevel = savedEffort[providerId];
+      } else if (canReuseCurrentProjection && currentEffort !== undefined) {
+        settings.effortLevel = currentEffort;
+      } else if (isAdaptive) {
+        settings.effortLevel = uiConfig.getDefaultReasoningValue(model, settings);
+      }
 
-    if (isAdaptive) {
-      settings.effortLevel = normalizeReasoningValue(uiConfig, settings, model, settings.effortLevel);
+      if (isAdaptive) {
+        settings.effortLevel = normalizeReasoningValue(uiConfig, settings, model, settings.effortLevel);
+      }
+    } else {
+      delete settings.effortLevel;
     }
 
     if (savedServiceTier?.[providerId] !== undefined) {
@@ -416,9 +392,9 @@ export class ProviderSettingsCoordinator {
     const allowedPermissionModes = new Set([
       permissionToggle.inactiveValue,
       permissionToggle.activeValue,
-      ...(permissionToggle.planValue ? [permissionToggle.planValue] : []),
     ]);
-    const currentPermissionMode = normalizeToggleValue(settings.permissionMode, allowedPermissionModes);
+    const currentPermissionMode = normalizeToggleValue(settings.permissionMode, allowedPermissionModes)
+      ?? (settings.permissionMode !== undefined ? permissionToggle.inactiveValue : undefined);
     const derivedPermissionMode = normalizeToggleValue(
       uiConfig.resolvePermissionMode?.(settings),
       allowedPermissionModes,
@@ -426,7 +402,7 @@ export class ProviderSettingsCoordinator {
     const savedPermissionModeValue = normalizeToggleValue(
       savedPermissionMode?.[providerId],
       allowedPermissionModes,
-    );
+    ) ?? (savedPermissionMode?.[providerId] !== undefined ? permissionToggle.inactiveValue : undefined);
 
     const projectedPermissionMode = savedPermissionModeValue
       ?? derivedPermissionMode
@@ -438,30 +414,24 @@ export class ProviderSettingsCoordinator {
     }
   }
 
-  /** Each provider's reconciler only processes its own conversations. */
-  static reconcileAllProviders(
-    settings: Record<string, unknown>,
-    conversations: Conversation[],
-  ): SettingsReconciliationResult {
-    return this.reconcileProviders(
-      settings,
-      conversations,
-      ProviderRegistry.getRegisteredProviderIds(),
-    );
-  }
-
   static reconcileProviders(
     settings: Record<string, unknown>,
     conversations: Conversation[],
     providerIds: ProviderId[],
+    options: ReconcileProviderSettingsOptions = {},
   ): SettingsReconciliationResult {
     let anyChanged = false;
     const allInvalidated: Conversation[] = [];
+    const environmentChangedProviderIds: ProviderId[] = [];
+    const sessionInvalidationProviderIds: ProviderId[] = [];
     const settingsProvider = getSettingsProviderId(settings);
 
     for (const providerId of providerIds) {
       const reconciler = ProviderRegistry.getSettingsReconciler(providerId);
       const providerConversations = conversations.filter(c => c.providerId === providerId);
+      const reconciliationConversations = options.invalidateConversations === false
+        ? []
+        : providerConversations;
       const targetSettings = providerId === settingsProvider
         ? settings
         : cloneProviderSettings(settings);
@@ -472,24 +442,50 @@ export class ProviderSettingsCoordinator {
 
       const { changed, invalidatedConversations } = reconciler.reconcileModelWithEnvironment(
         targetSettings,
-        providerConversations,
+        reconciliationConversations,
       );
 
       if (changed) {
         anyChanged = true;
+        environmentChangedProviderIds.push(providerId);
+        if ((reconciler.environmentSessionPolicy ?? 'invalidate') === 'invalidate') {
+          sessionInvalidationProviderIds.push(providerId);
+        }
         this.persistProjectedProviderState(targetSettings, providerId);
         if (providerId !== settingsProvider) {
           mergeProviderSettings(settings, targetSettings);
         }
       }
-      allInvalidated.push(...invalidatedConversations);
+      if (options.invalidateConversations !== false) {
+        allInvalidated.push(...invalidatedConversations);
+      }
     }
 
     if (this.reconcileTitleGenerationModelSelection(settings)) {
       anyChanged = true;
     }
 
-    return { changed: anyChanged, invalidatedConversations: allInvalidated };
+    return {
+      changed: anyChanged,
+      environmentChangedProviderIds,
+      sessionInvalidationProviderIds,
+      invalidatedConversations: allInvalidated,
+    };
+  }
+
+  static invalidateConversationSessions(
+    conversations: Conversation[],
+    providerIds: ProviderId[],
+  ): Conversation[] {
+    const invalidatedConversations: Conversation[] = [];
+    for (const providerId of new Set(providerIds)) {
+      const providerConversations = conversations.filter(c => c.providerId === providerId);
+      invalidatedConversations.push(
+        ...ProviderRegistry.getSettingsReconciler(providerId)
+          .invalidateConversationSessions(providerConversations),
+      );
+    }
+    return invalidatedConversations;
   }
 
   static normalizeAllModelVariants(settings: Record<string, unknown>): boolean {

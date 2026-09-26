@@ -1,4 +1,7 @@
-import { DEFAULT_REASONING_VALUE } from '../../../core/providers/reasoning';
+import {
+  DEFAULT_REASONING_VALUE,
+  formatReasoningValueLabel,
+} from '../../../core/providers/reasoning';
 import type {
   ProviderChatUIConfig,
   ProviderPermissionModeToggleConfig,
@@ -9,15 +12,19 @@ import type {
 import { OPENAI_PROVIDER_ICON } from '../../../shared/icons';
 import { getCodexModelOptions } from '../modelOptions';
 import {
+  CODEX_DEFAULT_SERVICE_TIER,
+  CODEX_FALLBACK_REASONING_EFFORT_VALUES,
   findCodexModel,
   getCodexDefaultReasoningEffort,
   getCodexFastServiceTier,
-  getDefaultCodexModel,
+  getCodexReasoningEffortOptions,
+  isCodexModelAvailable,
+  resolveCodexModelServiceTier
 } from '../models';
 import {
-  isCodexModelSelectionId,
+  encodeCodexModelSelectionId, isCodexModelSelectionId,
   looksLikeCodexModel,
-  toCodexRuntimeModelId,
+  toCodexRuntimeModelId
 } from '../modelSelection';
 import {
   applyCodexModelDefaults,
@@ -26,33 +33,18 @@ import {
 } from '../settings';
 
 const EFFORT_LEVELS: ProviderReasoningOption[] = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'xhigh', label: 'XHigh' },
-  { value: 'max', label: 'Max' },
-];
-
-function formatEffortLabel(value: string): string {
-  if (value.toLowerCase() === 'xhigh') {
-    return 'XHigh';
-  }
-  return value.charAt(0).toUpperCase() + value.slice(1);
-}
+  ...CODEX_FALLBACK_REASONING_EFFORT_VALUES,
+].map(value => ({ value, label: formatReasoningValueLabel(value) }));
 
 const CODEX_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
   inactiveValue: 'normal',
   inactiveLabel: 'Safe',
   activeValue: 'yolo',
   activeLabel: 'YOLO',
-  planValue: 'plan',
-  planLabel: 'Plan',
 };
 
-const DEFAULT_SERVICE_TIER_VALUE = 'default';
 const DEFAULT_SERVICE_TIER_LABEL = 'Standard';
 
-const DEFAULT_CONTEXT_WINDOW = 200_000;
 
 function getVisibleDiscoveredModels(settings: Record<string, unknown>) {
   const codexSettings = getCodexProviderSettings(settings);
@@ -60,7 +52,10 @@ function getVisibleDiscoveredModels(settings: Record<string, unknown>) {
     codexSettings.visibleModels,
     codexSettings.discoveredModels,
   ));
-  return codexSettings.discoveredModels.filter(model => visibleModelIds.has(model.model));
+  return codexSettings.discoveredModels.filter(model =>
+    visibleModelIds.has(model.model)
+    && isCodexModelAvailable(model, codexSettings.enableUltraEffort)
+  );
 }
 
 export const codexChatUIConfig: ProviderChatUIConfig = {
@@ -69,7 +64,12 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getDefaultModel(settings: Record<string, unknown>): string | null {
-    return getDefaultCodexModel(getVisibleDiscoveredModels(settings))?.model ?? null;
+    const codexSettings = getCodexProviderSettings(settings);
+    const firstVisibleModel = getVisibleCodexModelIds(
+      codexSettings.visibleModels,
+      codexSettings.discoveredModels,
+    ).find(modelId => getVisibleDiscoveredModels(settings).some(model => model.model === modelId));
+    return firstVisibleModel ? encodeCodexModelSelectionId(firstVisibleModel) : getCodexModelOptions(settings)[0]?.value ?? null;
   },
 
   ownsModel(model: string, settings: Record<string, unknown>): boolean {
@@ -78,13 +78,8 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
     }
 
     const runtimeModel = toCodexRuntimeModelId(model);
-    if (getCodexModelOptions(settings).some((option: ProviderUIOption) =>
-      option.value === model || toCodexRuntimeModelId(option.value) === runtimeModel
-    )) {
-      return true;
-    }
-
-    return looksLikeCodexModel(runtimeModel);
+    return getCodexProviderSettings(settings).discoveredModels.some(candidate => candidate.model === runtimeModel)
+      || looksLikeCodexModel(runtimeModel);
   },
 
   isAdaptiveReasoningModel(_model: string, _settings: Record<string, unknown>): boolean {
@@ -92,31 +87,34 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
   },
 
   getReasoningOptions(modelId: string, settings: Record<string, unknown>): ProviderReasoningOption[] {
+    const codexSettings = getCodexProviderSettings(settings);
     const model = findCodexModel(
-      getCodexProviderSettings(settings).discoveredModels,
+      codexSettings.discoveredModels,
       modelId,
     );
     if (!model) {
       return [...EFFORT_LEVELS];
     }
 
-    return model.supportedReasoningEfforts.map(option => ({
+    const options = getCodexReasoningEffortOptions(model, codexSettings.enableUltraEffort);
+    if (options.every(option => option.value === 'none')) return [];
+    return options.map(option => ({
       value: option.value,
-      label: formatEffortLabel(option.value),
+      label: formatReasoningValueLabel(option.value),
       ...(option.description ? { description: option.description } : {}),
     }));
   },
 
   getDefaultReasoningValue(modelId: string, settings: Record<string, unknown>): string {
+    const codexSettings = getCodexProviderSettings(settings);
     const model = findCodexModel(
-      getCodexProviderSettings(settings).discoveredModels,
+      codexSettings.discoveredModels,
       modelId,
     );
-    return model ? getCodexDefaultReasoningEffort(model) : DEFAULT_REASONING_VALUE;
-  },
-
-  getContextWindowSize(): number {
-    return DEFAULT_CONTEXT_WINDOW;
+    return model
+      ? getCodexDefaultReasoningEffort(model, codexSettings.enableUltraEffort)
+        ?? DEFAULT_REASONING_VALUE
+      : DEFAULT_REASONING_VALUE;
   },
 
   isDefaultModel(model: string): boolean {
@@ -140,21 +138,12 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
       return option.value;
     }
 
-    const codexSettings = getCodexProviderSettings(settings);
-    const discoveredModels = codexSettings.discoveredModels;
-    if (discoveredModels.length === 0) {
-      return model;
-    }
-
-    return getDefaultCodexModel(getVisibleDiscoveredModels(settings))?.model ?? model;
+    return this.ownsModel(model, settings) && !looksLikeCodexModel(runtimeModel)
+      ? encodeCodexModelSelectionId(runtimeModel) : model;
   },
 
-  getCustomModelIds(envVars: Record<string, string>): Set<string> {
-    const ids = new Set<string>();
-    if (envVars.OPENAI_MODEL && !looksLikeCodexModel(envVars.OPENAI_MODEL)) {
-      ids.add(envVars.OPENAI_MODEL);
-    }
-    return ids;
+  getCustomModelIds(): Set<string> {
+    return new Set();
   },
 
   getPermissionModeToggle(): ProviderPermissionModeToggleConfig {
@@ -176,10 +165,11 @@ export const codexChatUIConfig: ProviderChatUIConfig = {
     }
 
     return {
-      inactiveValue: model.defaultServiceTier ?? DEFAULT_SERVICE_TIER_VALUE,
+      inactiveValue: CODEX_DEFAULT_SERVICE_TIER,
       inactiveLabel: DEFAULT_SERVICE_TIER_LABEL,
       activeValue: tier.id,
       activeLabel: tier.name,
+      isActive: resolveCodexModelServiceTier(model, settings.serviceTier) === tier.id,
       description: tier.description || undefined,
     };
   },

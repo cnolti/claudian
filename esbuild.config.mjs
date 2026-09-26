@@ -10,12 +10,17 @@ import {
   readFileSync,
   rmSync,
 } from 'fs';
+import { assertRuntimeDependencyParity } from './scripts/runtimeDependencyParity.mjs';
 import rendererSafeUnrefHelpers from './scripts/rendererSafeUnref.js';
+import desktopRuntimeAliasHelpers from './scripts/desktopRuntimeAliases.js';
+import compressedStaticAssetsHelpers from './scripts/compressedStaticAssets.js';
 
 const {
   findUnsafeTimerUnrefSites,
   patchRendererUnsafeUnrefSites,
 } = rendererSafeUnrefHelpers;
+const { createDesktopRuntimeAliases } = desktopRuntimeAliasHelpers;
+const { createCompressedStaticAssetsPlugin } = compressedStaticAssetsHelpers;
 
 // Load .env.local if it exists
 if (existsSync('.env.local')) {
@@ -29,6 +34,7 @@ if (existsSync('.env.local')) {
 }
 
 const prod = process.argv[2] === 'production';
+if (prod) assertRuntimeDependencyParity(process.cwd());
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -95,34 +101,39 @@ const patchSdkImportMeta = {
   },
 };
 
-const patchRendererUnsafeUnref = {
-  name: 'patch-renderer-unsafe-unref',
-  setup(build) {
-    build.onEnd(async (result) => {
-      if (result.errors.length > 0 || !existsSync('main.js')) return;
+function createPatchRendererUnsafeUnref(outputPaths) {
+  return {
+    name: 'patch-renderer-unsafe-unref',
+    setup(build) {
+      build.onEnd(async (result) => {
+        if (result.errors.length > 0) return;
 
-      const bundlePath = path.join(process.cwd(), 'main.js');
-      const originalContents = await fsPromises.readFile(bundlePath, 'utf8');
-      const patchedBundle = patchRendererUnsafeUnrefSites(originalContents);
+        for (const outputPath of outputPaths) {
+          if (!existsSync(outputPath)) continue;
+          const bundlePath = path.join(process.cwd(), outputPath);
+          const originalContents = await fsPromises.readFile(bundlePath, 'utf8');
+          const patchedBundle = patchRendererUnsafeUnrefSites(originalContents);
 
-      if (patchedBundle.contents !== originalContents) {
-        await fsPromises.writeFile(bundlePath, patchedBundle.contents, 'utf8');
-      }
+          if (patchedBundle.contents !== originalContents) {
+            await fsPromises.writeFile(bundlePath, patchedBundle.contents, 'utf8');
+          }
 
-      const unsafeMatches = findUnsafeTimerUnrefSites(patchedBundle.contents);
-      if (unsafeMatches.length > 0) {
-        const details = unsafeMatches
-          .slice(0, 5)
-          .map((match) => `line ${match.line}: ${match.snippet}`)
-          .join('\n');
+          const unsafeMatches = findUnsafeTimerUnrefSites(patchedBundle.contents);
+          if (unsafeMatches.length > 0) {
+            const details = unsafeMatches
+              .slice(0, 5)
+              .map((match) => `line ${match.line}: ${match.snippet}`)
+              .join('\n');
 
-        throw new Error(
-          `Renderer-unsafe timer .unref() calls remain in main.js:\n${details}`,
-        );
-      }
-    });
-  },
-};
+            throw new Error(
+              `Renderer-unsafe timer .unref() calls remain in ${outputPath}:\n${details}`,
+            );
+          }
+        }
+      });
+    },
+  };
+}
 
 // Obsidian plugin folder path (set via OBSIDIAN_VAULT env var or .env.local)
 const OBSIDIAN_VAULT = process.env.OBSIDIAN_VAULT;
@@ -158,38 +169,52 @@ const copyToObsidian = {
   }
 };
 
-const context = await esbuild.context({
+const external = [
+  'obsidian',
+  'electron',
+  '@codemirror/autocomplete',
+  '@codemirror/collab',
+  '@codemirror/commands',
+  '@codemirror/language',
+  '@codemirror/lint',
+  '@codemirror/search',
+  '@codemirror/state',
+  '@codemirror/view',
+  '@lezer/common',
+  '@lezer/highlight',
+  '@lezer/lr',
+  ...builtinModules,
+  // Older build hosts omit prefix-only modules such as node:sqlite from builtinModules.
+  'node:*',
+];
+
+const mainContext = await esbuild.context({
   entryPoints: ['src/main.ts'],
+  alias: {
+    ...createDesktopRuntimeAliases(),
+  },
   bundle: true,
-  plugins: [patchSdkImportMeta, patchRendererUnsafeUnref, copyToObsidian],
-  external: [
-    'obsidian',
-    'electron',
-    '@codemirror/autocomplete',
-    '@codemirror/collab',
-    '@codemirror/commands',
-    '@codemirror/language',
-    '@codemirror/lint',
-    '@codemirror/search',
-    '@codemirror/state',
-    '@codemirror/view',
-    '@lezer/common',
-    '@lezer/highlight',
-    '@lezer/lr',
-    ...builtinModules,
-    ...builtinModules.map(m => `node:${m}`),
+  plugins: [
+    patchSdkImportMeta,
+    createCompressedStaticAssetsPlugin(),
+    createPatchRendererUnsafeUnref(['main.js']),
+    copyToObsidian,
   ],
+  external,
   format: 'cjs',
-  target: 'es2018',
+  loader: { '.wasm': 'binary' },
+  target: 'es2022',
+  charset: 'utf8',
   logLevel: 'info',
+  minify: prod,
   sourcemap: prod ? false : 'inline',
   treeShaking: true,
   outfile: 'main.js',
 });
 
 if (prod) {
-  await context.rebuild();
+  await mainContext.rebuild();
   process.exit(0);
 } else {
-  await context.watch();
+  await mainContext.watch();
 }

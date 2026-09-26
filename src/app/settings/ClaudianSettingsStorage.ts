@@ -1,11 +1,13 @@
 import {
   CLAUDIAN_SETTINGS_PATH,
   LEGACY_CLAUDIAN_SETTINGS_PATH,
-} from '../../core/bootstrap/StoragePaths';
+} from '../../core/bootstrap/storagePaths';
+import { normalizeLinkedContentPath } from '../../core/path/LinkedContentPath';
 import {
   normalizeHiddenCommandList,
   normalizeHiddenProviderCommands,
 } from '../../core/providers/commands/hiddenCommands';
+import { decodeProviderModelSelectionId, toProviderRuntimeModelId } from '../../core/providers/modelSelection';
 import {
   getSharedEnvironmentVariables,
   inferEnvironmentSnippetScope,
@@ -17,11 +19,16 @@ import {
   CHAT_VIEW_PLACEMENTS,
   type ChatViewPlacement,
   type ClaudianSettings,
+  DUAL_PANE_SIDES,
+  type DualPaneSide,
   type EnvironmentScope,
   type EnvSnippet,
   type HiddenProviderCommands,
   type ProviderConfigMap,
+  type SessionManagerOrganization,
+  type StoredChatModelSelection,
 } from '../../core/types/settings';
+import { getHostnameKey, getLegacyDeviceSettingsKey } from '../../utils/env';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './defaultSettings';
 
 export {
@@ -41,6 +48,9 @@ const LEGACY_STRIPPED_SHARED_SETTING_FIELDS = [
   'enableBlocklist',
   'blockedCommands',
   'openInMainTab',
+  'pinnedLinkedNotePaths',
+  'enableFilePane',
+  'persistentExternalContextPaths',
 ] as const;
 
 function getProviderSettingsAdapters() {
@@ -96,6 +106,66 @@ function shouldPersistChatViewPlacementMigration(
     );
 }
 
+function normalizeEnableDualPane(value: unknown): boolean {
+  return typeof value === 'boolean'
+    ? value
+    : DEFAULT_CLAUDIAN_SETTINGS.enableDualPane;
+}
+
+function normalizeDualPaneSide(value: unknown): DualPaneSide {
+  return typeof value === 'string'
+    && (DUAL_PANE_SIDES as readonly string[]).includes(value)
+    ? value as DualPaneSide
+    : DEFAULT_CLAUDIAN_SETTINGS.dualPaneSide;
+}
+
+function normalizeRestoreTabsOnStartup(value: unknown): boolean {
+  return typeof value === 'boolean'
+    ? value
+    : DEFAULT_CLAUDIAN_SETTINGS.restoreTabsOnStartup;
+}
+
+function normalizeSessionManagerOrganization(
+  value: unknown,
+): SessionManagerOrganization {
+  if (value === 'linked-note') return 'linked-content';
+  return value === 'linked-content' || value === 'list'
+    ? value
+    : DEFAULT_CLAUDIAN_SETTINGS.sessionManagerOrganization ?? 'list';
+}
+
+function normalizePinnedLinkedContentPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  const normalizedPaths: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value) {
+    const path = normalizeLinkedContentPath(candidate);
+    if (path === null || seen.has(path)) continue;
+    seen.add(path);
+    normalizedPaths.push(path);
+  }
+  return normalizedPaths;
+}
+
+function shouldPersistChatViewNormalization(
+  stored: Record<string, unknown>,
+  enableDualPane: boolean,
+  dualPaneSide: DualPaneSide,
+  restoreTabsOnStartup: boolean,
+): boolean {
+  return 'enableFilePane' in stored || (
+    'enableDualPane' in stored
+    && stored.enableDualPane !== enableDualPane
+  ) || (
+    'dualPaneSide' in stored
+    && stored.dualPaneSide !== dualPaneSide
+  ) || (
+    'restoreTabsOnStartup' in stored
+    && stored.restoreTabsOnStartup !== restoreTabsOnStartup
+  );
+}
+
 function normalizeProviderConfigs(value: unknown): ProviderConfigMap {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
@@ -110,11 +180,44 @@ function normalizeProviderConfigs(value: unknown): ProviderConfigMap {
   return result;
 }
 
-function projectPersistableProviderConfigs(value: unknown): {
+function migrateCurrentDeviceProviderConfigKeys(
+  providerConfigs: ProviderConfigMap,
+): { changed: boolean; providerConfigs: ProviderConfigMap } {
+  const currentKey = getHostnameKey();
+  const legacyKey = getLegacyDeviceSettingsKey();
+  if (!legacyKey || legacyKey === currentKey) {
+    return { changed: false, providerConfigs };
+  }
+
+  let changed = false;
+  for (const { adapter, providerId } of getProviderSettingsAdapters()) {
+    const config = providerConfigs[providerId];
+    if (!config) continue;
+
+    for (const field of adapter.hostScopedFields ?? []) {
+      const value = config[field];
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const entries = value as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(entries, legacyKey)) continue;
+
+      const migrated = Object.fromEntries(Object.entries(entries));
+      if (!Object.prototype.hasOwnProperty.call(migrated, currentKey)) {
+        migrated[currentKey] = entries[legacyKey];
+      }
+      delete migrated[legacyKey];
+      config[field] = migrated;
+      changed = true;
+    }
+  }
+
+  return { changed, providerConfigs };
+}
+
+function normalizeLoadedProviderConfigs(settings: Record<string, unknown>): {
   changed: boolean;
   providerConfigs: ProviderConfigMap;
 } {
-  const providerConfigs = normalizeProviderConfigs(value);
+  const providerConfigs = normalizeProviderConfigs(settings.providerConfigs);
   let changed = false;
 
   for (const { adapter, providerId } of getProviderSettingsAdapters()) {
@@ -122,6 +225,11 @@ function projectPersistableProviderConfigs(value: unknown): {
     const config = providerConfigs[providerId];
     if (!config) {
       continue;
+    }
+
+    const projected = adapter.projectPersistedConfig?.(settings);
+    if (projected) {
+      changed = JSON.stringify(projected) !== JSON.stringify(config) || changed;
     }
 
     for (const field of fields) {
@@ -133,6 +241,62 @@ function projectPersistableProviderConfigs(value: unknown): {
   }
 
   return { changed, providerConfigs };
+}
+
+function projectPersistableProviderConfigs(settings: Record<string, unknown>): ProviderConfigMap {
+  const providerConfigs = normalizeProviderConfigs(settings.providerConfigs);
+  for (const { adapter, providerId } of getProviderSettingsAdapters()) {
+    const config = providerConfigs[providerId];
+    if (!config) continue;
+    const persisted = adapter.projectPersistedConfig?.(settings) ?? config;
+    for (const field of adapter.runtimeOnlyFields ?? []) delete persisted[field];
+    providerConfigs[providerId] = persisted;
+  }
+  return providerConfigs;
+}
+
+/** Drop saved model-dependent projections when their model was explicitly deselected. */
+function pruneDeselectedProviderProjections(settings: Record<string, unknown>): Record<string, unknown> {
+  const cleaned = { ...settings };
+  const configs = normalizeProviderConfigs(settings.providerConfigs);
+  const contextLimitMatchers: Array<(model: string) => boolean> = [];
+  for (const providerId of ProviderRegistry.getRegisteredProviderIds()) {
+    const selected = configs[providerId]?.visibleModels;
+    if (!Array.isArray(selected)) continue;
+    const ui = ProviderRegistry.getChatUIConfig(providerId);
+    const normalize = (id: string) => toProviderRuntimeModelId(providerId, ui.normalizeModelVariant(
+      ui.normalizeAvailableModelSelection?.(id, settings) ?? id,
+      settings,
+    ));
+    const normalizeContextModel = (id: string) => {
+      const normalized = normalize(id);
+      return (ui.normalizeCustomContextLimitModel?.(normalized) ?? normalized).toLowerCase();
+    };
+    const selectedContextModels = new Set(selected.filter((id): id is string => typeof id === 'string')
+      .map(normalizeContextModel));
+    contextLimitMatchers.push(model => {
+      const owner = decodeProviderModelSelectionId(model)?.providerId;
+      return (!owner || owner === providerId) && selectedContextModels.has(normalizeContextModel(model));
+    });
+    const savedModels = settings.savedProviderModel as Record<string, unknown> | undefined;
+    const model = savedModels?.[providerId];
+    if (typeof model !== 'string') continue;
+    if (selected.some(id => typeof id === 'string' && normalize(id) === normalize(model))) continue;
+    for (const key of ['savedProviderModel', 'savedProviderEffort', 'savedProviderThinkingBudget', 'savedProviderServiceTier']) {
+      const values = cleaned[key];
+      if (!values || typeof values !== 'object' || Array.isArray(values)) continue;
+      const remaining = { ...values } as Record<string, unknown>;
+      delete remaining[providerId];
+      cleaned[key] = remaining;
+    }
+  }
+  const limits = settings.customContextLimits;
+  if (limits && typeof limits === 'object' && !Array.isArray(limits)) {
+    const entries = Object.entries(limits);
+    const selected = entries.filter(([model]) => contextLimitMatchers.some(matches => matches(model)));
+    if (selected.length !== entries.length) cleaned.customContextLimits = Object.fromEntries(selected);
+  }
+  return cleaned;
 }
 
 function hasHostScopedProviderConfigNormalization(
@@ -268,30 +432,107 @@ function mergeLegacyClaudeHiddenCommands(
   };
 }
 
+function trimStoredString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeStoredChatModelSelection(
+  value: unknown,
+): StoredChatModelSelection | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const providerId = trimStoredString(candidate.providerId);
+  const model = trimStoredString(candidate.model);
+  if (
+    !providerId
+    || !model
+    || !ProviderRegistry.getRegisteredProviderIds().includes(providerId)
+  ) {
+    return null;
+  }
+
+  return { providerId, model };
+}
+
+function migrateLegacyChatModelSelection(
+  stored: Record<string, unknown>,
+): StoredChatModelSelection | null {
+  const registeredProviderIds = new Set(ProviderRegistry.getRegisteredProviderIds());
+  const storedProviderId = trimStoredString(stored.settingsProvider);
+  const providerId = registeredProviderIds.has(storedProviderId)
+    ? storedProviderId
+    : 'claude';
+  if (!registeredProviderIds.has(providerId)) {
+    return null;
+  }
+
+  const projectedModel = trimStoredString(stored.model);
+  const savedProviderModels = stored.savedProviderModel;
+  const savedModel = savedProviderModels
+    && typeof savedProviderModels === 'object'
+    && !Array.isArray(savedProviderModels)
+    ? trimStoredString((savedProviderModels as Record<string, unknown>)[providerId])
+    : '';
+  const model = projectedModel || savedModel;
+  return model ? { providerId, model } : null;
+}
+
 export class ClaudianSettingsStorage {
   constructor(private adapter: VaultFileAdapter) {}
 
   async load(): Promise<StoredClaudianSettings> {
-    const settingsPath = await this.getLoadPath();
+    const settingsPath = await this.#getLoadPath();
     if (!settingsPath) {
-      return this.getDefaults();
+      return this.#getDefaults();
     }
 
     const content = await this.adapter.read(settingsPath);
     const stored = JSON.parse(content) as Record<string, unknown>;
+    const hasStoredChatModelSelection = Object.prototype.hasOwnProperty.call(
+      stored,
+      'lastSelectedChatModel',
+    );
+    const lastSelectedChatModel = hasStoredChatModelSelection
+      ? normalizeStoredChatModelSelection(stored.lastSelectedChatModel)
+      : migrateLegacyChatModelSelection(stored);
+    const didNormalizeChatModelSelection = !hasStoredChatModelSelection
+      || JSON.stringify(lastSelectedChatModel) !== JSON.stringify(stored.lastSelectedChatModel);
     const hiddenProviderCommands = mergeLegacyClaudeHiddenCommands(
       normalizeHiddenProviderCommands(stored.hiddenProviderCommands),
       stored.hiddenSlashCommands,
     );
     const envSnippets = normalizeEnvSnippets(stored.envSnippets);
-    const customModelAliases = normalizeModelAliases(stored.customModelAliases);
     const {
       changed: didStripRuntimeProviderConfig,
+      providerConfigs: projectedProviderConfigs,
+    } = normalizeLoadedProviderConfigs(stored);
+    const {
+      changed: didMigrateCurrentDeviceProviderConfigs,
       providerConfigs,
-    } = projectPersistableProviderConfigs(stored.providerConfigs);
+    } = migrateCurrentDeviceProviderConfigKeys(projectedProviderConfigs);
     const chatViewPlacement = normalizeChatViewPlacement(
       stored.chatViewPlacement,
       stored.openInMainTab,
+    );
+    const enableDualPane = normalizeEnableDualPane(stored.enableDualPane);
+    const dualPaneSide = normalizeDualPaneSide(stored.dualPaneSide);
+    const restoreTabsOnStartup = normalizeRestoreTabsOnStartup(
+      stored.restoreTabsOnStartup,
+    );
+    const hasCanonicalPinnedPaths = Object.prototype.hasOwnProperty.call(
+      stored,
+      'pinnedLinkedContentPaths',
+    );
+    const pinnedLinkedContentPaths = normalizePinnedLinkedContentPaths(
+      hasCanonicalPinnedPaths
+        ? stored.pinnedLinkedContentPaths
+        : stored.pinnedLinkedNotePaths,
+    );
+    const sessionManagerOrganization = normalizeSessionManagerOrganization(
+      stored.sessionManagerOrganization,
     );
     const legacyProviderSettings = {
       ...stored,
@@ -306,14 +547,19 @@ export class ClaudianSettingsStorage {
       ...storedWithoutLegacy,
       sharedEnvironmentVariables: getSharedEnvironmentVariables(legacyProviderSettings),
       envSnippets,
-      customModelAliases,
       hiddenProviderCommands,
       providerConfigs,
       chatViewPlacement,
+      enableDualPane,
+      dualPaneSide,
+      restoreTabsOnStartup,
+      sessionManagerOrganization,
+      pinnedLinkedContentPaths,
+      lastSelectedChatModel,
     };
 
     const merged = {
-      ...this.getDefaults(),
+      ...this.#getDefaults(),
       ...legacyNormalized,
     };
 
@@ -324,6 +570,10 @@ export class ClaudianSettingsStorage {
         legacyProviderSettings,
       ) || didNormalizeProviderSettings;
     }
+    const pruned = pruneDeselectedProviderProjections(merged);
+    const didPruneDeselectedModels = pruned.savedProviderModel !== merged.savedProviderModel
+      || pruned.customContextLimits !== merged.customContextLimits;
+    Object.assign(merged, pruned);
     const didNormalizeHostScopedProviderConfigs = hasHostScopedProviderConfigNormalization(
       providerConfigs,
       merged.providerConfigs,
@@ -339,17 +589,34 @@ export class ClaudianSettingsStorage {
       || 'activeConversationId' in stored
       || 'allowExternalAccess' in stored
       || 'allowedExportPaths' in stored
+      || 'persistentExternalContextPaths' in stored
       || 'enableBlocklist' in stored
       || 'blockedCommands' in stored
       || shouldPersistChatViewPlacementMigration(stored, chatViewPlacement)
-      || JSON.stringify(envSnippets) !== JSON.stringify(stored.envSnippets ?? [])
-      || (
-        'customModelAliases' in stored
-        && JSON.stringify(customModelAliases) !== JSON.stringify(stored.customModelAliases ?? {})
+      || shouldPersistChatViewNormalization(
+        stored,
+        enableDualPane,
+        dualPaneSide,
+        restoreTabsOnStartup,
       )
+
+      || (
+        'sessionManagerOrganization' in stored
+        && stored.sessionManagerOrganization !== sessionManagerOrganization
+      )
+      || 'pinnedLinkedNotePaths' in stored
+      || (
+        'pinnedLinkedContentPaths' in stored
+        && JSON.stringify(stored.pinnedLinkedContentPaths)
+          !== JSON.stringify(pinnedLinkedContentPaths)
+      )
+      || JSON.stringify(envSnippets) !== JSON.stringify(stored.envSnippets ?? [])
       || didNormalizeProviderSettings
       || didStripRuntimeProviderConfig
+      || didMigrateCurrentDeviceProviderConfigs
       || didNormalizeHostScopedProviderConfigs
+      || didNormalizeChatModelSelection
+      || didPruneDeselectedModels
       )
     ) {
       await this.save(merged);
@@ -359,37 +626,30 @@ export class ClaudianSettingsStorage {
   }
 
   async save(settings: StoredClaudianSettings): Promise<void> {
-    const { providerConfigs } = projectPersistableProviderConfigs(settings.providerConfigs);
+    const providerConfigs = projectPersistableProviderConfigs(settings);
     const content = JSON.stringify(
-      stripLegacyFields({
+      stripLegacyFields(pruneDeselectedProviderProjections({
         ...settings,
         providerConfigs,
-      }),
+        sessionManagerOrganization: normalizeSessionManagerOrganization(
+          settings.sessionManagerOrganization,
+        ),
+        pinnedLinkedContentPaths: normalizePinnedLinkedContentPaths(
+          settings.pinnedLinkedContentPaths,
+        ),
+      })),
       null,
       2,
     );
     await this.adapter.write(CLAUDIAN_SETTINGS_PATH, content);
-    await this.deleteLegacyFileIfPresent();
+    await this.#deleteLegacyFileIfPresent();
   }
 
-  async exists(): Promise<boolean> {
-    if (await this.adapter.exists(CLAUDIAN_SETTINGS_PATH)) {
-      return true;
-    }
-
-    return this.adapter.exists(LEGACY_CLAUDIAN_SETTINGS_PATH);
-  }
-
-  async update(updates: Partial<StoredClaudianSettings>): Promise<void> {
-    const current = await this.load();
-    await this.save({ ...current, ...updates });
-  }
-
-  private getDefaults(): StoredClaudianSettings {
+  #getDefaults(): StoredClaudianSettings {
     return DEFAULT_CLAUDIAN_SETTINGS;
   }
 
-  private async getLoadPath(): Promise<string | null> {
+  async #getLoadPath(): Promise<string | null> {
     if (await this.adapter.exists(CLAUDIAN_SETTINGS_PATH)) {
       return CLAUDIAN_SETTINGS_PATH;
     }
@@ -401,7 +661,7 @@ export class ClaudianSettingsStorage {
     return null;
   }
 
-  private async deleteLegacyFileIfPresent(): Promise<void> {
+  async #deleteLegacyFileIfPresent(): Promise<void> {
     if (await this.adapter.exists(LEGACY_CLAUDIAN_SETTINGS_PATH)) {
       await this.adapter.delete(LEGACY_CLAUDIAN_SETTINGS_PATH);
     }

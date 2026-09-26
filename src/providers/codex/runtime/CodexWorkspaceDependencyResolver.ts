@@ -33,7 +33,7 @@ export interface CodexWorkspaceDependencies {
   fallbackBinaries: string;
 }
 
-function targetPathApi(context: CodexRuntimeContext): typeof path.posix | typeof path.win32 {
+function targetPathApi(context: CodexRuntimeContext): typeof path {
   return context.launchSpec.target.platformFamily === 'windows' ? path.win32 : path.posix;
 }
 
@@ -162,7 +162,7 @@ async function isDirectory(context: CodexRuntimeContext, targetPath: string): Pr
   }
 }
 
-async function readJson<T>(
+async function readJSON<T>(
   context: CodexRuntimeContext,
   targetPath: string,
 ): Promise<T | null> {
@@ -230,7 +230,7 @@ async function resolveCandidate(
   context: CodexRuntimeContext,
   candidate: { runtimeRoot: string; dependenciesRoot: string },
 ): Promise<CodexWorkspaceDependencies | null> {
-  const manifest = await readJson<RuntimeManifest>(
+  const manifest = await readJSON<RuntimeManifest>(
     context,
     joinTargetPath(context, candidate.runtimeRoot, 'runtime.json'),
   );
@@ -275,7 +275,7 @@ async function resolveCandidate(
     pythonPackages,
     context.launchSpec.target.platformFamily === 'windows' ? ['python.exe'] : [],
   );
-  const artifactManifest = await readJson<PackageManifest>(context, artifactManifestPath);
+  const artifactManifest = await readJSON<PackageManifest>(context, artifactManifestPath);
   const requiredDirectoriesExist = await Promise.all([
     isDirectory(context, nodePackages),
     isDirectory(context, pythonPackages),

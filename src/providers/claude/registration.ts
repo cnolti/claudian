@@ -1,18 +1,17 @@
 import { getProviderConfig } from '../../core/providers/providerConfig';
+import { hasStoredConfigNormalization } from '../../core/providers/settings/storedSettings';
 import type { ProviderModule } from '../../core/providers/types';
-import {
-  claudeWorkspaceRegistration,
-  getClaudeWorkspaceServices,
-} from './app/ClaudeWorkspaceServices';
-import { InlineEditService as ClaudeInlineEditService } from './auxiliary/ClaudeInlineEditService';
-import { InstructionRefineService as ClaudeInstructionRefineService } from './auxiliary/ClaudeInstructionRefineService';
-import { TitleGenerationService as ClaudeTitleGenerationService } from './auxiliary/ClaudeTitleGenerationService';
+import { claudeWorkspaceRegistration } from './app/ClaudeWorkspaceServices';
 import { CLAUDE_PROVIDER_CAPABILITIES } from './capabilities';
 import { claudeSettingsReconciler } from './env/ClaudeSettingsReconciler';
+import { ClaudeExecutionBackend } from './execution/ClaudeExecutionBackend';
 import { ClaudeConversationHistoryService } from './history/ClaudeConversationHistoryService';
-import { ClaudianService as ClaudeChatRuntime } from './runtime/ClaudeChatRuntime';
+import { ClaudeSubagentHistoryService } from './history/ClaudeSubagentHistoryService';
+import { findClaudeModelOption, getClaudeVisibleModelIds } from './modelOptions';
+import { projectClaudeModelSettings } from './modelPersistence';
 import { ClaudeTaskResultInterpreter } from './runtime/ClaudeTaskResultInterpreter';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from './settings';
+import { claudeSubagentAdapter } from './subagentAdapter';
 import { claudeChatUIConfig } from './ui/ClaudeChatUIConfig';
 
 const LEGACY_CLAUDE_1M_SETTINGS = ['enableOpus1M', 'enableSonnet1M'] as const;
@@ -21,14 +20,24 @@ export const claudeProviderRegistration: ProviderModule = {
   id: 'claude',
   displayName: 'Claude',
   blankTabOrder: 20,
-  isEnabled: () => true,
+  isEnabled: settings => getClaudeProviderSettings(settings).enabled,
+  setEnabled: (settings, enabled) => updateClaudeProviderSettings(settings, { enabled }),
   capabilities: CLAUDE_PROVIDER_CAPABILITIES,
   environmentKeyPatterns: [/^ANTHROPIC_/i, /^CLAUDE_/i],
   chatUIConfig: claudeChatUIConfig,
   settingsReconciler: claudeSettingsReconciler,
   settingsStorage: {
+    projectPersistedConfig: projectClaudeModelSettings,
+    needsReasoningMetadata(settings) {
+      const models = getClaudeProviderSettings(settings).discoveredModels;
+      return getClaudeVisibleModelIds(settings).some(id => {
+        const model = findClaudeModelOption(models, id);
+        return !model || (!model.supportedEffortLevels?.length && !model.reasoningMetadataResolved);
+      });
+    },
     hostScopedFields: ['cliPathsByHost'],
     legacyTopLevelFields: [
+      'customModelAliases',
       'claudeSafeMode',
       'claudeCliPath',
       'claudeCliPathsByHost',
@@ -43,27 +52,22 @@ export const claudeProviderRegistration: ProviderModule = {
     normalizeStored(target, stored) {
       const storedConfig = getProviderConfig(stored, 'claude');
       const removedLegacy1MSettings = LEGACY_CLAUDE_1M_SETTINGS.some(key => key in storedConfig);
-      updateClaudeProviderSettings(target, getClaudeProviderSettings(stored));
-      return removedLegacy1MSettings;
+      const storedSettings = getClaudeProviderSettings(stored);
+      updateClaudeProviderSettings(target, {
+        ...storedSettings,
+        visibleModels: getClaudeVisibleModelIds(stored),
+      });
+      return removedLegacy1MSettings || 'effortMetadataMigrated' in storedConfig || hasStoredConfigNormalization(
+        storedConfig,
+        getProviderConfig(target, 'claude'),
+      );
     },
   },
-  createRuntime: ({ plugin }) => {
-    const workspace = getClaudeWorkspaceServices();
-    const resolvedMcpManager = workspace?.mcpManager;
-    if (!resolvedMcpManager) {
-      throw new Error('Claude workspace services are not initialized.');
-    }
+  createExecutionBackend: plugin => new ClaudeExecutionBackend(plugin),
+  createSubagentHistoryService: plugin => new ClaudeSubagentHistoryService(plugin),
 
-    return new ClaudeChatRuntime(plugin, {
-      mcpManager: resolvedMcpManager,
-      pluginManager: workspace?.pluginManager,
-      agentManager: workspace?.agentManager,
-    });
-  },
-  createTitleGenerationService: (plugin) => new ClaudeTitleGenerationService(plugin),
-  createInstructionRefineService: (plugin) => new ClaudeInstructionRefineService(plugin),
-  createInlineEditService: (plugin) => new ClaudeInlineEditService(plugin),
   historyService: new ClaudeConversationHistoryService(),
   taskResultInterpreter: new ClaudeTaskResultInterpreter(),
+  subagentAdapter: claudeSubagentAdapter,
   workspace: claudeWorkspaceRegistration,
 };

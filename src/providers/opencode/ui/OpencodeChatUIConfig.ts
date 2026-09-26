@@ -1,3 +1,5 @@
+import { formatReasoningValueLabel } from '@/core/providers/reasoning';
+
 import type {
   ProviderChatUIConfig,
   ProviderPermissionModeToggleConfig,
@@ -5,13 +7,14 @@ import type {
   ProviderUIOption,
 } from '../../../core/providers/types';
 import { OPENCODE_PROVIDER_ICON } from '../../../shared/icons';
+import { maybeGetOpencodeWorkspaceServices } from '../app/OpencodeWorkspaceServices';
+import { OpencodeMetadataService } from '../metadata/OpencodeMetadataService';
 import {
   buildOpencodeBaseModels,
   decodeOpencodeModelId,
   encodeOpencodeModelId,
   isOpencodeModelSelectionId,
   OPENCODE_DEFAULT_THINKING_LEVEL,
-  OPENCODE_SYNTHETIC_MODEL_ID,
   resolveOpencodeBaseModelRawId,
   resolveOpencodeDefaultThinkingLevel,
 } from '../models';
@@ -19,21 +22,13 @@ import {
   resolveOpencodeModeForPermissionMode,
   resolvePermissionModeForManagedOpencodeMode,
 } from '../modes';
-import { OpencodeChatRuntime } from '../runtime/OpencodeChatRuntime';
 import { getOpencodeProviderSettings, updateOpencodeProviderSettings } from '../settings';
 
-const OPENCODE_MODELS: ProviderUIOption[] = [
-  { value: OPENCODE_SYNTHETIC_MODEL_ID, label: 'OpenCode', description: 'ACP runtime' },
-];
-const DEFAULT_CONTEXT_WINDOW = 200_000;
-const OPENCODE_METADATA_WARMUP_DB = ':memory:';
 const OPENCODE_PERMISSION_MODE_TOGGLE: ProviderPermissionModeToggleConfig = {
   inactiveValue: 'normal',
   inactiveLabel: 'Safe',
   activeValue: 'yolo',
   activeLabel: 'YOLO',
-  planValue: 'plan',
-  planLabel: 'Plan',
 };
 
 export const opencodeChatUIConfig: ProviderChatUIConfig = {
@@ -51,65 +46,21 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
         value: encodeOpencodeModelId(model.rawId),
       }),
     ]));
-    const savedProviderModel = (
-      settings.savedProviderModel
-      && typeof settings.savedProviderModel === 'object'
-      && !Array.isArray(settings.savedProviderModel)
-    )
-      ? settings.savedProviderModel as Record<string, unknown>
-      : null;
-
     const seenValues = new Set<string>();
     const options: ProviderUIOption[] = [];
     for (const rawModelId of [...opencodeSettings.visibleModels].reverse()) {
       const encodedModelId = encodeOpencodeModelId(rawModelId);
-      pushOption(
-        options,
-        seenValues,
-        encodedModelId,
-        discoveredModels.get(encodedModelId)
-          ?? applyAlias(rawModelId, {
-            description: 'Configured model',
-            label: rawModelId,
-            value: encodedModelId,
-          }),
-      );
+      const option = discoveredModels.get(encodedModelId);
+      if (option) pushOption(options, seenValues, encodedModelId, option);
     }
 
-    const selectedModelValues = [
-      typeof settings.model === 'string' ? settings.model : '',
-      typeof savedProviderModel?.opencode === 'string'
-        ? savedProviderModel.opencode
-        : '',
-    ];
+    return options;
+  },
 
-    for (const model of selectedModelValues) {
-      const rawModelId = decodeOpencodeModelId(model);
-      if (
-        !model
-        || !isOpencodeModelSelectionId(model)
-        || model === OPENCODE_SYNTHETIC_MODEL_ID
-        || !rawModelId
-      ) {
-        continue;
-      }
-
-      const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
-      const baseModelId = encodeOpencodeModelId(baseRawId);
-      pushOption(
-        options,
-        seenValues,
-        baseModelId,
-        discoveredModels.get(baseModelId)
-          ?? applyAlias(baseRawId, {
-            description: 'Selected in an existing session',
-            label: baseRawId,
-            value: baseModelId,
-          }),
-      );
-    }
-
-    return options.length > 0 ? options : [...OPENCODE_MODELS];
+  getDefaultModel(settings: Record<string, unknown>): string | null {
+    const current = getOpencodeProviderSettings(settings);
+    const rawModelId = current.visibleModels.find(id => buildOpencodeBaseModels(current.discoveredModels).some(model => model.rawId === id));
+    return rawModelId ? encodeOpencodeModelId(rawModelId) : null;
   },
 
   ownsModel(model: string): boolean {
@@ -121,10 +72,11 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
   },
 
   getReasoningOptions(model: string, settings: Record<string, unknown>): ProviderReasoningOption[] {
-    return getOpencodeThinkingOptions(model, settings)
-      .map((variant) => ({
+    const options = getOpencodeThinkingOptions(model, settings);
+    if (options.every(option => option.value === OPENCODE_DEFAULT_THINKING_LEVEL)) return [];
+    return options.map((variant) => ({
         description: variant.description,
-        label: variant.label,
+        label: formatReasoningValueLabel(variant.label),
         value: variant.value,
       }));
   },
@@ -140,31 +92,13 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
     return getDefaultThinkingLevelForModel(baseRawId, settings);
   },
 
-  getContextWindowSize(model: string, customLimits?: Record<string, number>): number {
-    return customLimits?.[model] ?? DEFAULT_CONTEXT_WINDOW;
-  },
-
   isDefaultModel(model: string): boolean {
     return isOpencodeModelSelectionId(model);
   },
 
-  applyModelDefaults(model: string, settings: unknown): void {
-    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
-      return;
-    }
+  applyModelDefaults: applyOpencodeModelDefaults,
 
-    const settingsBag = settings as Record<string, unknown>;
-    const rawModelId = decodeOpencodeModelId(model);
-    if (!rawModelId) {
-      settingsBag.effortLevel = OPENCODE_DEFAULT_THINKING_LEVEL;
-      return;
-    }
-
-    const opencodeSettings = getOpencodeProviderSettings(settingsBag);
-    const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
-    settingsBag.model = encodeOpencodeModelId(baseRawId);
-    settingsBag.effortLevel = getDefaultThinkingLevelForModel(baseRawId, settingsBag);
-  },
+  applyModelProjectionDefaults: applyOpencodeModelDefaults,
 
   async prepareModelMetadata(model: string, _settings: Record<string, unknown>, context): Promise<void> {
     const rawModelId = decodeOpencodeModelId(model);
@@ -178,17 +112,15 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
       return;
     }
 
-    const runtime = new OpencodeChatRuntime(context.plugin);
+    const workspaceService = maybeGetOpencodeWorkspaceServices()?.metadataService;
+    const metadataService = workspaceService
+      ?? new OpencodeMetadataService(context.plugin);
     try {
-      runtime.syncConversationState({
-        providerState: { databasePath: OPENCODE_METADATA_WARMUP_DB },
-        sessionId: null,
-      });
-      await runtime.warmModelMetadata(model);
+      await metadataService.warmModelMetadata(model);
     } catch {
       // Metadata warmup is opportunistic; the first real turn can still discover it.
     } finally {
-      runtime.cleanup();
+      if (!workspaceService) await metadataService.dispose();
     }
   },
 
@@ -212,7 +144,7 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
       ...opencodeSettings.preferredThinkingByModel,
     };
 
-    if (!value || value === OPENCODE_DEFAULT_THINKING_LEVEL || !supportedValues.has(value)) {
+    if (!value || !supportedValues.has(value)) {
       delete nextPreferredThinkingByModel[baseRawId];
     } else {
       nextPreferredThinkingByModel[baseRawId] = value;
@@ -221,6 +153,12 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
     updateOpencodeProviderSettings(settingsBag, {
       preferredThinkingByModel: nextPreferredThinkingByModel,
     });
+  },
+
+  normalizeAvailableModelSelection(model: string): string {
+    return isOpencodeModelSelectionId(model)
+      ? model
+      : encodeOpencodeModelId(model);
   },
 
   normalizeModelVariant(model: string, settings: Record<string, unknown>): string {
@@ -270,6 +208,24 @@ export const opencodeChatUIConfig: ProviderChatUIConfig = {
     return OPENCODE_PROVIDER_ICON;
   },
 };
+
+function applyOpencodeModelDefaults(model: string, settings: unknown): void {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    return;
+  }
+
+  const settingsBag = settings as Record<string, unknown>;
+  const rawModelId = decodeOpencodeModelId(model);
+  if (!rawModelId) {
+    settingsBag.effortLevel = OPENCODE_DEFAULT_THINKING_LEVEL;
+    return;
+  }
+
+  const opencodeSettings = getOpencodeProviderSettings(settingsBag);
+  const baseRawId = resolveOpencodeBaseModelRawId(rawModelId, opencodeSettings.discoveredModels);
+  settingsBag.model = encodeOpencodeModelId(baseRawId);
+  settingsBag.effortLevel = getDefaultThinkingLevelForModel(baseRawId, settingsBag);
+}
 
 function getDefaultThinkingLevelForModel(
   baseRawId: string,

@@ -1,8 +1,10 @@
 import type {
   ProviderCommandCatalog,
   ProviderCommandDropdownConfig,
+  ProviderCommandListContext,
 } from '../../../core/providers/commands/ProviderCommandCatalog';
 import type { ProviderCommandEntry } from '../../../core/providers/commands/ProviderCommandEntry';
+import type { ProviderVaultEntryRepository } from '../../../core/providers/commands/ProviderVaultEntryRepository';
 import type { SlashCommand } from '../../../core/types';
 import { isSkill } from '../../../utils/slashCommand';
 import type { SkillStorage } from '../storage/SkillStorage';
@@ -59,11 +61,27 @@ const BUILTIN_HIDDEN_COMMANDS = new Set([
   'insights', 'loop', 'schedule', 'security-review', 'simplify', 'update-config',
 ]);
 
-export type CommandProbe = () => Promise<SlashCommand[]>;
+// A cold CLI start plus capped MCP startup can exceed the shared picker deadline.
+const CLAUDE_COMMAND_DISCOVERY_TIMEOUT_MS = 30_000;
 
-export class ClaudeCommandCatalog implements ProviderCommandCatalog {
-  private sdkCommands: SlashCommand[] = [];
-  private probePromise: Promise<void> | null = null;
+export type CommandProbe = (signal?: AbortSignal) => Promise<SlashCommand[]>;
+
+interface ActiveCommandProbe {
+  readonly completion: Promise<void>;
+  readonly controller: AbortController;
+  resolveCompletion(): void;
+}
+
+export class ClaudeCommandCatalog implements ProviderCommandCatalog, ProviderVaultEntryRepository {
+  private readonly activeProbes = new Set<ActiveCommandProbe>();
+  private cacheGeneration = 0;
+  private commandSnapshot: SlashCommand[] = [];
+  private disposed = false;
+  private disposePromise: Promise<void> | null = null;
+  private quiescenceDepth = 0;
+  private probedCommands: SlashCommand[] | null = null;
+  private probePromise: Promise<SlashCommand[]> | null = null;
+  private transitionActive = false;
 
   constructor(
     private commandStorage: SlashCommandStorage,
@@ -71,48 +89,90 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
     private probe?: CommandProbe,
   ) {}
 
-  setRuntimeCommands(commands: SlashCommand[]): void {
-    this.sdkCommands = commands;
+  setCommandSnapshot(commands: SlashCommand[]): void {
+    if (this.probesBlocked) return;
+    this.#invalidateProbeCache();
+    this.commandSnapshot = commands.map(command => ({ ...command }));
   }
 
-  async listDropdownEntries(context: { includeBuiltIns: boolean }): Promise<ProviderCommandEntry[]> {
-    void context;
+  async listDropdownEntries(context: ProviderCommandListContext): Promise<ProviderCommandEntry[]> {
+    context.signal?.throwIfAborted();
     // SDK commands already include vault commands/skills (the SDK scans
     // .claude/commands/ and .claude/skills/ internally). No file scan needed.
-    // When the cache is empty (cold start, no active runtime), probe the SDK.
-    if (this.sdkCommands.length === 0 && this.probe) {
-      await this.ensureProbed();
+    let commands = context.commandSnapshot;
+    if (commands === undefined) {
+      const allowCachedCommandSnapshot = context.allowCachedCommandSnapshot !== false;
+      if (allowCachedCommandSnapshot && this.commandSnapshot.length > 0) {
+        commands = this.commandSnapshot;
+      } else {
+        const probedCommands = await this.#ensureProbed(context.signal);
+        commands = allowCachedCommandSnapshot && this.commandSnapshot.length > 0
+          ? this.commandSnapshot
+          : probedCommands;
+      }
     }
-    const runtimeEntries = this.sdkCommands
+    return commands
       .filter(cmd => !BUILTIN_HIDDEN_COMMANDS.has(cmd.name.toLowerCase()))
       .map(slashCommandToEntry);
-    if (runtimeEntries.length > 0) {
-      return runtimeEntries;
-    }
-    return this.listVaultEntries();
   }
 
   /** Probe the SDK for commands. Deduplicates concurrent calls. */
-  private async ensureProbed(): Promise<void> {
-    if (!this.probe) return;
-    if (!this.probePromise) {
-      this.probePromise = this.probe().then((commands) => {
-        // Only apply probe results if the runtime hasn't provided fresher data
-        if (this.sdkCommands.length === 0 && commands.length > 0) {
-          this.sdkCommands = commands;
-        }
-      }).catch(() => {
-        // Probe is best-effort
-      }).finally(() => {
-        this.probePromise = null;
-      });
+  async #ensureProbed(signal?: AbortSignal): Promise<SlashCommand[]> {
+    signal?.throwIfAborted();
+    if (this.probesBlocked) return [];
+    if (this.probedCommands) return this.probedCommands;
+    if (!this.probe) return [];
+    if (signal) {
+      return await this.#runProbe(signal);
     }
-    await this.probePromise;
+    if (!this.probePromise) {
+      const probePromise = this.#runProbe().finally(() => {
+        if (this.probePromise === probePromise) {
+          this.probePromise = null;
+        }
+      });
+      this.probePromise = probePromise;
+    }
+    return await this.probePromise;
   }
 
-  async listVaultEntries(): Promise<ProviderCommandEntry[]> {
+  async #runProbe(signal?: AbortSignal): Promise<SlashCommand[]> {
+    const generation = this.cacheGeneration;
+    let resolveCompletion!: () => void;
+    const entry: ActiveCommandProbe = {
+      completion: new Promise(resolve => { resolveCompletion = resolve; }),
+      controller: new AbortController(),
+      resolveCompletion: () => resolveCompletion(),
+    };
+    const onAbort = (): void => entry.controller.abort(signal?.reason);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    this.activeProbes.add(entry);
+    try {
+      entry.controller.signal.throwIfAborted();
+      const commands = await this.probe?.(entry.controller.signal) ?? [];
+      entry.controller.signal.throwIfAborted();
+      if (this.disposed || generation !== this.cacheGeneration) return [];
+      this.probedCommands = commands.map(command => ({ ...command }));
+      return this.probedCommands;
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (this.disposed || generation !== this.cacheGeneration) return [];
+      // Failures stay uncached so a retry re-probes.
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      this.activeProbes.delete(entry);
+      entry.resolveCompletion();
+    }
+  }
+
+  async listVaultEntries(signal?: AbortSignal): Promise<ProviderCommandEntry[]> {
+    signal?.throwIfAborted();
     const commands = await this.commandStorage.loadAll();
+    signal?.throwIfAborted();
     const skills = await this.skillStorage.loadAll();
+    signal?.throwIfAborted();
     return [...commands, ...skills].map(slashCommandToEntry);
   }
 
@@ -140,10 +200,59 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
       builtInPrefix: '/',
       skillPrefix: '/',
       commandPrefix: '/',
+      discoveryTimeoutMs: CLAUDE_COMMAND_DISCOVERY_TIMEOUT_MS,
     };
   }
 
   async refresh(): Promise<void> {
-    // Claude revalidation happens externally via setRuntimeCommands
+    await this.quiesceForEnvironmentChange();
+  }
+
+  async quiesceForEnvironmentChange(): Promise<void> {
+    this.quiescenceDepth += 1;
+    try {
+      await this.#drainProbes();
+    } finally {
+      this.quiescenceDepth -= 1;
+    }
+  }
+
+  async beginEnvironmentTransition(): Promise<void> {
+    this.transitionActive = true;
+    await this.#drainProbes();
+  }
+
+  endEnvironmentTransition(): void {
+    this.transitionActive = false;
+  }
+
+  async #drainProbes(): Promise<void> {
+    const sharedProbe = this.probePromise;
+    this.#invalidateProbeCache();
+    this.commandSnapshot = [];
+    const active = [...this.activeProbes];
+    await Promise.all([
+      ...active.map(entry => entry.completion),
+      ...(sharedProbe ? [sharedProbe.then(() => undefined)] : []),
+    ]);
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposed = true;
+    this.disposePromise = this.quiesceForEnvironmentChange();
+    return this.disposePromise;
+  }
+
+  #invalidateProbeCache(): void {
+    this.cacheGeneration += 1;
+    this.probedCommands = null;
+    for (const entry of this.activeProbes) {
+      entry.controller.abort();
+    }
+  }
+
+  private get probesBlocked(): boolean {
+    return this.disposed || this.transitionActive || this.quiescenceDepth > 0;
   }
 }

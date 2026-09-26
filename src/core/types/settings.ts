@@ -62,25 +62,46 @@ export const CHAT_VIEW_PLACEMENTS = [
 /** Workspace location used when opening the Claudian chat view. */
 export type ChatViewPlacement = typeof CHAT_VIEW_PLACEMENTS[number];
 
-/** Result from instruction refinement agent query. */
-export interface InstructionRefineResult {
-  success: boolean;
-  refinedInstruction?: string;  // The refined instruction text
-  clarification?: string;       // Agent's clarifying question (if any)
-  error?: string;               // Error message (if failed)
+export const DUAL_PANE_SIDES = ['left', 'right'] as const;
+
+/** Side of the chat occupied by the session manager in dual-pane mode. */
+export type DualPaneSide = typeof DUAL_PANE_SIDES[number];
+
+export type SessionManagerOrganization = 'list' | 'linked-content';
+export type SessionManagerSort = 'last-updated' | 'created';
+
+export interface LegacyLinkedContentSettingsInput {
+  sessionManagerOrganization?: SessionManagerOrganization | 'linked-note';
+  pinnedLinkedNotePaths?: unknown;
+}
+
+/** Forced provider transition invalidated a parked auxiliary continuation. */
+export interface AuxiliaryContinuityReset {
+  success: false;
+  resetRequired: true;
+  error: string;
+  editedText?: never;
+  insertedText?: never;
+  clarification?: never;
 }
 
 /** Permission mode for tool execution. */
-export type PermissionMode = 'yolo' | 'plan' | 'normal';
+export type PermissionMode = 'yolo' | 'normal';
 
 /** Scope for environment variable storage and snippets. */
 export type EnvironmentScope = 'shared' | `provider:${string}`;
 
 /** Opaque device-keyed CLI paths for per-device configuration. */
-export type HostnameCliPaths = Record<string, string>;
+export type HostnameCLIPaths = Record<string, string>;
 
 /** Opaque provider-owned settings bags keyed by provider id. */
 export type ProviderConfigMap = Partial<Record<string, Record<string, unknown>>>;
+
+/** Provider-qualified model explicitly selected in chat and used to seed future tabs. */
+export interface StoredChatModelSelection {
+  providerId: string;
+  model: string;
+}
 
 /**
  * Application settings stored in .claudian/claudian-settings.json.
@@ -102,19 +123,18 @@ export interface ClaudianSettings {
   effortLevel: string;
   serviceTier: string;
   enableAutoTitleGeneration: boolean;
+  titleGenerationLocale: string;
   titleGenerationModel: string;
 
   // Content settings
   excludedTags: string[];
   mediaFolder: string;
   systemPrompt: string;
-  persistentExternalContextPaths: string[];
 
   // Environment
   sharedEnvironmentVariables: string;
   envSnippets: EnvSnippet[];
   customContextLimits: Record<string, number>;
-  customModelAliases: Record<string, string>;
 
   // UI settings
   keyboardNavigation: KeyboardNavigationSettings;
@@ -137,21 +157,29 @@ export interface ClaudianSettings {
 
   // Provider selection
   settingsProvider: string;  // ProviderId — which provider's model/effort/budget is projected to top-level fields
+  lastSelectedChatModel: StoredChatModelSelection | null;
   savedProviderModel: Partial<Record<string, string>>;
   savedProviderEffort: Partial<Record<string, string>>;
   savedProviderServiceTier: Partial<Record<string, string>>;
   savedProviderThinkingBudget: Partial<Record<string, string>>;
   savedProviderPermissionMode: Partial<Record<string, string>>;
 
-  // State (provider-specific, round-tripped opaquely)
-  lastCustomModel?: string;
+  // Internal lifecycle state. Entries remain until all affected session metadata is durable.
+  pendingProviderSessionInvalidations: Partial<Record<string, number>>;
 
   // UI preferences
-  maxTabs: number;
+  maxWarmAgentProcesses: number;
   enableAutoScroll: boolean;
+  showMessageTimestamps?: boolean;
   deferMathRenderingDuringStreaming: boolean;
   expandFileEditsByDefault: boolean;
   chatViewPlacement: ChatViewPlacement;
+  enableDualPane: boolean;
+  dualPaneSide: DualPaneSide;
+  restoreTabsOnStartup: boolean;
+  sessionManagerOrganization?: SessionManagerOrganization;
+  sessionManagerSort?: SessionManagerSort;
+  pinnedLinkedContentPaths?: string[];
 
   // Provider command visibility
   hiddenProviderCommands: HiddenProviderCommands;

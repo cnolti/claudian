@@ -1,3 +1,8 @@
+import '@/providers';
+
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+
+import { isVersionedRuntimeInputFingerprint } from '../../../../src/core/providers/settings/RuntimeInputFingerprint';
 import { getOpencodeDiscoveryState, updateOpencodeDiscoveryState } from '../../../../src/providers/opencode/discoveryState';
 import { opencodeSettingsReconciler } from '../../../../src/providers/opencode/env/OpencodeSettingsReconciler';
 
@@ -38,18 +43,18 @@ describe('opencodeSettingsReconciler.normalizeModelVariantSettings', () => {
   });
 });
 
-describe('opencodeSettingsReconciler.handleEnvironmentChange', () => {
-  it('clears provider-owned discovery state when environment changes', () => {
+describe('coordinated OpenCode environment changes', () => {
+  it('retains provider-owned discovery state when environment changes', () => {
     const settings: Record<string, unknown> = {};
     updateOpencodeDiscoveryState(settings, {
       availableModes: [{ id: 'build', name: 'Build' }],
       discoveredModels: [{ label: 'OpenAI/GPT-5', rawId: 'openai/gpt-5' }],
     });
 
-    expect(opencodeSettingsReconciler.handleEnvironmentChange?.(settings)).toBe(true);
+    expect(ProviderSettingsCoordinator.handleEnvironmentChange(settings, ['opencode'])).toBe(false);
     expect(getOpencodeDiscoveryState(settings)).toEqual({
-      availableModes: [],
-      discoveredModels: [],
+      availableModes: [{ id: 'build', name: 'Build' }],
+      discoveredModels: [{ label: 'OpenAI/GPT-5', rawId: 'openai/gpt-5' }],
       thinkingOptionsByModel: {},
     });
   });
@@ -89,8 +94,8 @@ describe('opencodeSettingsReconciler.reconcileModelWithEnvironment', () => {
     expect(result.invalidatedConversations).toHaveLength(1);
     expect(conversations[0].sessionId).toBeNull();
     expect(conversations[0].providerState).toBeUndefined();
-    expect((settings.providerConfigs as any).opencode.environmentHash).toBe(
-      'OPENCODE_CONFIG=/tmp/opencode.json|OPENCODE_DB=/new/opencode.db',
-    );
+    const fingerprint = (settings.providerConfigs as any).opencode.environmentHash;
+    expect(isVersionedRuntimeInputFingerprint(fingerprint)).toBe(true);
+    expect(fingerprint).not.toContain('/new/opencode.db');
   });
 });

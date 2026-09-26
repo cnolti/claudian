@@ -1,8 +1,12 @@
 import type { Component, WorkspaceLeaf } from 'obsidian';
 
-import type { InstructionRefineService, ProviderId, TitleGenerationService } from '../../../core/providers/types';
-import type { ChatRuntime } from '../../../core/runtime/ChatRuntime';
-import type { SlashCommandDropdown } from '../../../shared/components/SlashCommandDropdown';
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
+
+import type { ProviderCommandDropdownConfig } from '../../../core/providers/commands/ProviderCommandCatalog';
+import type { ProviderCommandDiscoveryController } from '../../../core/providers/commands/ProviderCommandDiscoveryStore';
+import type { ProviderCommandEntry } from '../../../core/providers/commands/ProviderCommandEntry';
+import type { ProviderId, TitleGenerationService } from '../../../core/providers/types';
+import type { MainChatComposerDropdown } from '../composer/MainChatComposerDropdown';
 import type { BrowserSelectionController } from '../controllers/BrowserSelectionController';
 import type { CanvasSelectionController } from '../controllers/CanvasSelectionController';
 import type { ConversationController } from '../controllers/ConversationController';
@@ -10,49 +14,26 @@ import type { InputController } from '../controllers/InputController';
 import type { NavigationController } from '../controllers/NavigationController';
 import type { SelectionController } from '../controllers/SelectionController';
 import type { StreamController } from '../controllers/StreamController';
+import type { ChatExecutionCoordinator } from '../execution/ChatExecutionCoordinator';
+import type { LinkedContentController } from '../linked-content';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
+import type { SideChatController } from '../side-chat/SideChatController';
 import type { ChatState } from '../state/ChatState';
-import type { BangBashModeManager } from '../ui/BangBashModeManager';
+import type { TabAttention, TabReviewOutcome } from '../state/types';
 import type { ComposerContextTray } from '../ui/ComposerContextTray';
 import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
 import type {
   ContextUsageMeter,
-  ExternalContextSelector,
-  McpServerSelector,
   ModelSelector,
   ModeSelector,
   PermissionToggle,
   ServiceTierToggle,
   ThinkingBudgetSelector,
 } from '../ui/InputToolbar';
-import type { InstructionModeManager } from '../ui/InstructionModeManager';
 import type { NavigationSidebar } from '../ui/NavigationSidebar';
-import type { StatusPanel } from '../ui/StatusPanel';
-import type { RuntimeSupervisor } from './RuntimeSupervisor';
 import type { TabSession } from './TabSession';
-
-/**
- * Default number of tabs allowed.
- *
- * Set to 3 to balance usability with resource usage:
- * - Each tab has its own chat runtime and persistent query
- * - More tabs = more memory and potential SDK processes
- * - 3 tabs allows multi-tasking without excessive overhead
- */
-export const DEFAULT_MAX_TABS = 3;
-
-/**
- * Minimum number of tabs allowed (settings floor).
- */
-export const MIN_TABS = 3;
-
-/**
- * Maximum number of tabs allowed (settings ceiling).
- * Users can configure up to this many tabs via settings.
- */
-export const MAX_TABS = 10;
 
 /**
  * Minimal interface for the ClaudianView methods used by TabManager and Tab.
@@ -68,6 +49,9 @@ export interface TabManagerViewHost extends Component {
 
   /** Gets view-owned elements that should preserve active tab selection context. */
   getSharedSelectionFocusScopeEls?(): HTMLElement[];
+
+  /** Handles /clear and /new when the active layout gives New different semantics. */
+  handleNewConversationCommand?(): Promise<boolean>;
 }
 
 /**
@@ -79,11 +63,21 @@ export interface TabManagerInterface {
   switchToTab(tabId: TabId): Promise<void>;
 
   /** Gets all tabs. */
-  getAllTabs(): TabData[];
+  getAllTabs(): AssembledTabRuntime[];
+
+  /** Reports aggregate user-visible work for a runtime tab. */
+  isTabWorking(tabId: TabId): boolean;
 }
 
 /** Tab identifier type. */
 export type TabId = string;
+
+export type ProviderCatalogInfo = {
+  config: ProviderCommandDropdownConfig;
+  discovery: ProviderCommandDiscoveryController<ProviderCommandEntry>;
+} | null;
+
+export type ProviderCatalogResolver = () => ProviderCatalogInfo;
 
 /** Generates a unique tab ID. */
 export function generateTabId(): TabId {
@@ -95,95 +89,110 @@ export function generateTabId(): TabId {
  * Each tab has its own set of controllers for independent operation.
  */
 export interface TabControllers {
-  selectionController: SelectionController | null;
-  browserSelectionController: BrowserSelectionController | null;
-  canvasSelectionController: CanvasSelectionController | null;
-  conversationController: ConversationController | null;
-  streamController: StreamController | null;
-  inputController: InputController | null;
-  navigationController: NavigationController | null;
+  readonly selectionController: SelectionController;
+  readonly browserSelectionController: BrowserSelectionController;
+  readonly canvasSelectionController: CanvasSelectionController;
+  readonly conversationController: ConversationController;
+  readonly streamController: StreamController;
+  readonly inputController: InputController;
+  readonly navigationController: NavigationController;
+  /** Owner of this tab's single temporary side chat and composer destination. */
+  readonly sideChatController: SideChatController;
 }
 
 /**
  * Services managed per-tab.
  */
 export interface TabServices {
-  subagentManager: SubagentManager;
-  instructionRefineService: InstructionRefineService | null;
-  titleGenerationService: TitleGenerationService | null;
+  readonly subagentManager: SubagentManager;
+  readonly titleGenerationService: TitleGenerationService;
 }
 
 /**
  * UI components managed per-tab.
  */
 export interface TabUIComponents {
-  contextTray: ComposerContextTray | null;
-  fileContextManager: FileContextManager | null;
-  imageContextManager: ImageContextManager | null;
-  modelSelector: ModelSelector | null;
-  modeSelector: ModeSelector | null;
-  thinkingBudgetSelector: ThinkingBudgetSelector | null;
-  externalContextSelector: ExternalContextSelector | null;
-  mcpServerSelector: McpServerSelector | null;
-  permissionToggle: PermissionToggle | null;
-  serviceTierToggle: ServiceTierToggle | null;
-  slashCommandDropdown: SlashCommandDropdown | null;
-  instructionModeManager: InstructionModeManager | null;
-  bangBashModeManager: BangBashModeManager | null;
-  contextUsageMeter: ContextUsageMeter | null;
-  statusPanel: StatusPanel | null;
-  navigationSidebar: NavigationSidebar | null;
+  readonly contextTray: ComposerContextTray;
+  readonly fileContextManager: FileContextManager;
+  readonly linkedContentController: LinkedContentController;
+  readonly imageContextManager: ImageContextManager;
+  readonly modelSelector: ModelSelector;
+  readonly modeSelector: ModeSelector;
+  readonly thinkingBudgetSelector: ThinkingBudgetSelector;
+  readonly permissionToggle: PermissionToggle;
+  readonly serviceTierToggle: ServiceTierToggle;
+  readonly composerDropdown: MainChatComposerDropdown;
+  readonly contextUsageMeter: ContextUsageMeter;
+  readonly navigationSidebar: NavigationSidebar;
 }
 
 /**
  * DOM elements managed per-tab.
  */
 export interface TabDOMElements {
-  contentEl: HTMLElement;
-  messagesEl: HTMLElement;
+  readonly contentEl: HTMLElement;
+  readonly messagesWrapperEl: HTMLElement;
+  readonly messagesEl: HTMLElement;
   welcomeEl: HTMLElement | null;
 
-  /** Container for status panel (fixed between messages and input). */
-  statusPanelContainerEl: HTMLElement;
-
   /** Per-tab composer root. Inline prompts render here as siblings of the input container. */
-  inputComposerEl: HTMLElement;
-  inputContainerEl: HTMLElement;
-  queueIndicatorEl: HTMLElement;
-  inputWrapper: HTMLElement;
-  inputEl: HTMLTextAreaElement;
+  readonly inputComposerEl: HTMLElement;
+  readonly inputContainerEl: HTMLElement;
+  readonly queueIndicatorEl: HTMLElement;
+  readonly inputWrapper: HTMLElement;
+  readonly inputEl: ComposerInputElement;
 
   /** Nav row for tab badges and header icons (above input wrapper). */
-  navRowEl: HTMLElement;
+  readonly navRowEl: HTMLElement;
 
   /** Composer-owned context tray container inside the input wrapper. */
-  contextRowEl: HTMLElement;
-
-  /** Cleanup functions for event listeners (prevents memory leaks). */
-  eventCleanups: Array<() => void>;
+  readonly contextRowEl: HTMLElement;
 }
 
 /**
- * Tab lifecycle states:
- * - `blank`: No conversation binding, no runtime. Draft model selection only.
- * - `bound_cold`: Bound to a conversation, but runtime not started yet.
- * - `bound_active`: Bound to a conversation with a running runtime.
+ * Runtime tab lifecycle states, independent from conversation binding:
+ * - `provisional`: Replaceable session preview created by dual-mode navigation.
+ * - `cold`: Retained working state without provider execution resources.
+ * - `warm`: Retained working state holding provider execution resources.
  * - `closing`: Tab is being torn down.
  */
-export type TabLifecycleState = 'blank' | 'bound_cold' | 'bound_active' | 'closing';
+export type TabLifecycleState = 'provisional' | 'cold' | 'warm' | 'closing';
+
+/** Conversation hydration state, independent from runtime activation. */
+export type TabHydrationState = 'idle' | 'loading' | 'ready' | 'failed';
 
 /**
  * Represents a single tab in the multi-tab system.
  * Each tab is an independent chat session with its own runtime instance.
  */
-export interface TabData {
+export interface TabInputBindings {
+  readonly installed: true;
+}
+
+export interface TabRuntimeCleanupFailure {
+  readonly resource: string;
+  readonly error: unknown;
+}
+
+export interface TabRuntimeResourceState {
+  readonly isDisposed: boolean;
+}
+
+export interface TabRuntimeResourceOwner extends TabRuntimeResourceState {
+  dispose(): Promise<readonly TabRuntimeCleanupFailure[]>;
+}
+
+export interface AssembledTabRuntime {
   /** Authoritative identity and runtime owner for the tab. */
-  session: TabSession;
+  readonly session: TabSession;
   /** Unique tab identifier. */
-  id: TabId;
+  readonly id: TabId;
 
   /** Explicit lifecycle state. */
   lifecycleState: TabLifecycleState;
+
+  /** State of loading the provider-owned conversation into the tab UI. */
+  hydrationState: TabHydrationState;
 
   /**
    * Draft model selected in a blank tab (before first send).
@@ -192,68 +201,71 @@ export interface TabData {
   draftModel: string | null;
 
   /** Active provider for this tab's current conversation/runtime. */
-  providerId: ProviderId;
+  providerId: ProviderId | null;
 
   /** Conversation ID bound to this tab (null for new/empty tabs). */
   conversationId: string | null;
 
-  /** Per-tab chat runtime instance for independent streaming. */
-  service: ChatRuntime | null;
+  /** Per-tab owner of provider execution and session lifecycle. */
+  readonly executionCoordinator: ChatExecutionCoordinator;
 
-  /** Named owner of the per-tab runtime reference. */
-  runtimeSupervisor: RuntimeSupervisor;
+  /** Tab-manager-owned provider discovery callback retained across UI/runtime refreshes. */
+  readonly providerCatalogResolver: ProviderCatalogResolver;
 
-  /** Whether the service has been initialized (lazy start). */
-  serviceInitialized: boolean;
+  /** Captures whether completed runtime work will need review after finalization. */
+  readonly captureReviewableSettlement: ((outcome: TabReviewOutcome) => () => void) | null;
 
   /** Per-tab chat state. */
-  state: ChatState;
+  readonly state: ChatState;
 
   /** Per-tab controllers. */
-  controllers: TabControllers;
+  readonly controllers: TabControllers;
 
   /** Per-tab services. */
-  services: TabServices;
+  readonly services: TabServices;
 
   /** Per-tab UI components. */
-  ui: TabUIComponents;
+  readonly ui: TabUIComponents;
 
   /** Per-tab DOM elements. */
-  dom: TabDOMElements;
+  readonly dom: TabDOMElements;
 
   /** Per-tab renderer. */
-  renderer: MessageRenderer | null;
+  readonly renderer: MessageRenderer;
+
+  /** Confirms that input/event wiring completed before publication. */
+  readonly inputBindings: TabInputBindings;
+
+  /** Reports operational disposal without exposing teardown authority. */
+  readonly resources: TabRuntimeResourceState;
 }
 
-export type TabProviderContext = Pick<TabData, 'conversationId' | 'service' | 'providerId' | 'lifecycleState' | 'draftModel'>;
+export type TabProviderContext = Pick<
+  AssembledTabRuntime,
+  'conversationId' | 'providerId' | 'lifecycleState' | 'draftModel'
+>;
 
-/**
- * Persisted tab state for restoration on plugin reload.
- */
-export interface PersistedTabState {
-  tabId: TabId;
-  conversationId: string | null;
-  draftModel?: string | null;
-}
-
-/**
- * Tab manager state persisted to data.json.
- */
-export interface PersistedTabManagerState {
-  openTabs: PersistedTabState[];
-  activeTabId: TabId | null;
-  expandedTitleTabIds?: TabId[];
-}
+/** Stable session projection available while a tab runtime is being assembled. */
+export type TabProviderCatalogContext = Readonly<Pick<
+  AssembledTabRuntime,
+  'id' | 'conversationId' | 'providerId' | 'lifecycleState' | 'draftModel'
+>>;
 
 /**
  * Callbacks for tab state changes.
  */
 export interface TabManagerCallbacks {
-  /** Called when a tab is created. */
-  onTabCreated?: (tab: TabData) => void;
+  /** Skips the target prompt when the active layout always forks into a new runtime tab. */
+  shouldForkToNewTab?: () => boolean;
+
+  /** Called after a newly created tab completes admission. */
+  onTabCreated?: (tab: AssembledTabRuntime) => void;
 
   /** Called immediately after the active tab changes, before async tab loading completes. */
   onActiveTabChanged?: (fromTabId: TabId | null, toTabId: TabId) => void;
+
+  /** Called after an explicit active-tab switch completes without rollback. */
+  onActiveTabCommitted?: (fromTabId: TabId | null, toTabId: TabId) => void;
 
   /** Called when switching to a different tab. */
   onTabSwitched?: (fromTabId: TabId | null, toTabId: TabId) => void;
@@ -264,17 +276,26 @@ export interface TabManagerCallbacks {
   /** Called when tab streaming state changes. */
   onTabStreamingChanged?: (tabId: TabId, isStreaming: boolean) => void;
 
+  /** Called when foreground, continuation, provider-background, or async-subagent work changes. */
+  onTabWorkChanged?: (tabId: TabId) => void;
+
+  /** Called when tab rewind transaction state changes. */
+  onTabRewindingChanged?: (tabId: TabId, isRewinding: boolean) => void;
+
   /** Called when tab title changes. */
   onTabTitleChanged?: (tabId: TabId, title: string) => void;
 
   /** Called when tab attention state changes (approval pending, etc.). */
-  onTabAttentionChanged?: (tabId: TabId, needsAttention: boolean) => void;
+  onTabAttentionChanged?: (tabId: TabId, attention: TabAttention) => void;
 
   /** Called when a tab's conversation changes (loaded different conversation in same tab). */
   onTabConversationChanged?: (tabId: TabId, conversationId: string | null) => void;
 
+  /** Called when the selected model for a blank retained tab changes. */
+  onTabDraftChanged?: (tabId: TabId, draftModel: string | null) => void;
+
   /** Called when the active provider changes within a tab (blank tab model selection). */
-  onTabProviderChanged?: (tabId: TabId, providerId: ProviderId) => void;
+  onTabProviderChanged?: (tabId: TabId, providerId: ProviderId | null) => void;
 }
 
 /**
@@ -285,9 +306,9 @@ export interface TabBarItem {
   /** 1-based index for display. */
   index: number;
   title: string;
-  providerId: ProviderId;
   isActive: boolean;
-  isStreaming: boolean;
-  needsAttention: boolean;
+  /** True while any foreground, continuation, provider-background, or async-subagent work remains. */
+  isWorking: boolean;
+  attention: TabAttention;
   canClose: boolean;
 }

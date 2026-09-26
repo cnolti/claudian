@@ -8,8 +8,8 @@ const mockProcessStart = jest.fn();
 const mockProcessShutdown = jest.fn().mockResolvedValue(undefined);
 const mockResolveLaunchSpec = jest.fn();
 
-jest.mock('@/providers/codex/runtime/CodexRpcTransport', () => ({
-  CodexRpcTransport: jest.fn().mockImplementation(() => ({
+jest.mock('@/providers/codex/runtime/CodexRPCTransport', () => ({
+  CodexRPCTransport: jest.fn().mockImplementation(() => ({
     request: mockTransportRequest,
     dispose: mockTransportDispose,
     start: mockTransportStart,
@@ -46,6 +46,13 @@ function makeSkill(name: string): SkillMetadata {
   };
 }
 
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20 && !condition(); attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(condition()).toBe(true);
+}
+
 describe('CodexSkillListingService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -57,7 +64,7 @@ describe('CodexSkillListingService', () => {
       ttlMs,
       now: () => currentTime,
     });
-    const fetchSkills = jest.fn<Promise<SkillMetadata[]>, [boolean]>();
+    const fetchSkills = jest.fn<Promise<SkillMetadata[]>, [boolean, AbortSignal?]>();
     jest.spyOn(service as any, 'fetchSkills').mockImplementation(fetchSkills as (...args: unknown[]) => Promise<SkillMetadata[]>);
 
     return {
@@ -79,7 +86,7 @@ describe('CodexSkillListingService', () => {
     await expect(service.listSkills()).resolves.toEqual(alpha);
     await expect(service.listSkills()).resolves.toEqual(alpha);
     expect(fetchSkills).toHaveBeenCalledTimes(1);
-    expect(fetchSkills).toHaveBeenNthCalledWith(1, false);
+    expect(fetchSkills).toHaveBeenNthCalledWith(1, false, expect.any(AbortSignal));
 
     setNow(5_999);
     await expect(service.listSkills()).resolves.toEqual(alpha);
@@ -88,7 +95,7 @@ describe('CodexSkillListingService', () => {
     setNow(6_000);
     await expect(service.listSkills()).resolves.toEqual(beta);
     expect(fetchSkills).toHaveBeenCalledTimes(2);
-    expect(fetchSkills).toHaveBeenNthCalledWith(2, false);
+    expect(fetchSkills).toHaveBeenNthCalledWith(2, false, expect.any(AbortSignal));
   });
 
   it('forceReload bypasses the cache and replaces it', async () => {
@@ -103,8 +110,8 @@ describe('CodexSkillListingService', () => {
     await expect(service.listSkills()).resolves.toEqual(beta);
 
     expect(fetchSkills).toHaveBeenCalledTimes(2);
-    expect(fetchSkills).toHaveBeenNthCalledWith(1, false);
-    expect(fetchSkills).toHaveBeenNthCalledWith(2, true);
+    expect(fetchSkills).toHaveBeenNthCalledWith(1, false, expect.any(AbortSignal));
+    expect(fetchSkills).toHaveBeenNthCalledWith(2, true, expect.any(AbortSignal));
   });
 
   it('invalidate clears the cache before the TTL expires', async () => {
@@ -119,8 +126,125 @@ describe('CodexSkillListingService', () => {
     await expect(service.listSkills()).resolves.toEqual(beta);
 
     expect(fetchSkills).toHaveBeenCalledTimes(2);
-    expect(fetchSkills).toHaveBeenNthCalledWith(1, false);
-    expect(fetchSkills).toHaveBeenNthCalledWith(2, false);
+    expect(fetchSkills).toHaveBeenNthCalledWith(1, false, expect.any(AbortSignal));
+    expect(fetchSkills).toHaveBeenNthCalledWith(2, false, expect.any(AbortSignal));
+  });
+
+  it('does not let a pre-invalidation response repopulate the cache', async () => {
+    const { service, fetchSkills } = createService(5_000);
+    let resolveStale!: (skills: SkillMetadata[]) => void;
+    fetchSkills
+      .mockImplementationOnce(() => new Promise(resolve => { resolveStale = resolve; }))
+      .mockResolvedValueOnce([makeSkill('fresh')]);
+
+    const staleRequest = service.listSkills();
+    service.invalidate();
+    resolveStale([makeSkill('stale')]);
+    await expect(staleRequest).resolves.toEqual([makeSkill('stale')]);
+
+    await expect(service.listSkills()).resolves.toEqual([makeSkill('fresh')]);
+    expect(fetchSkills).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts and awaits held listings while clearing their environment cache', async () => {
+    const { service, fetchSkills } = createService(5_000);
+    const staleSkills = [makeSkill('stale')];
+    let resolveStale!: (skills: SkillMetadata[]) => void;
+    let ownedSignal: AbortSignal | undefined;
+    fetchSkills
+      .mockImplementationOnce((_forceReload, signal) => {
+        ownedSignal = signal;
+        return new Promise(resolve => { resolveStale = resolve; });
+      })
+      .mockResolvedValueOnce([makeSkill('fresh')]);
+    const staleListing = service.listSkills();
+    await waitForCondition(() => ownedSignal !== undefined);
+
+    const quiesce = service.quiesceForEnvironmentChange();
+    let quiesceSettled = false;
+    void quiesce.then(() => { quiesceSettled = true; });
+    await Promise.resolve();
+
+    expect(ownedSignal).toBeDefined();
+    expect(ownedSignal!.aborted).toBe(true);
+    expect(quiesceSettled).toBe(false);
+
+    resolveStale(staleSkills);
+    await expect(staleListing).resolves.toEqual(staleSkills);
+    await quiesce;
+
+    await expect(service.listSkills()).resolves.toEqual([makeSkill('fresh')]);
+    expect(fetchSkills).toHaveBeenCalledTimes(2);
+  });
+
+  it('blocks skill listing during an environment transition and reloads from the new state', async () => {
+    const { service, fetchSkills } = createService(5_000);
+    let environment = 'old';
+    fetchSkills.mockImplementation(async () => [makeSkill(environment)]);
+    await expect(service.listSkills()).resolves.toEqual([makeSkill('old')]);
+
+    service.beginEnvironmentTransition();
+    await service.quiesceForEnvironmentChange();
+    const listing = service.listSkills();
+    try {
+      await Promise.resolve();
+      expect(fetchSkills).toHaveBeenCalledTimes(1);
+
+      environment = 'new';
+      service.endEnvironmentTransition();
+      await expect(listing).resolves.toEqual([makeSkill('new')]);
+    } finally {
+      service.endEnvironmentTransition();
+      await Promise.allSettled([listing]);
+      await service.dispose();
+    }
+    expect(fetchSkills).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases transition-blocked skill requests without starting a probe on disposal', async () => {
+    const { service, fetchSkills } = createService(5_000);
+    service.beginEnvironmentTransition();
+
+    const listing = service.listSkills();
+    await service.dispose();
+
+    await expect(listing).resolves.toEqual([]);
+    expect(fetchSkills).not.toHaveBeenCalled();
+  });
+
+  it('does not let an older normal response overwrite a newer forced refresh', async () => {
+    const { service, fetchSkills } = createService(5_000);
+    let resolveStale!: (skills: SkillMetadata[]) => void;
+    fetchSkills
+      .mockImplementationOnce(() => new Promise(resolve => { resolveStale = resolve; }))
+      .mockResolvedValueOnce([makeSkill('fresh')]);
+
+    const staleRequest = service.listSkills();
+    await expect(service.listSkills({ forceReload: true })).resolves.toEqual([makeSkill('fresh')]);
+    resolveStale([makeSkill('stale')]);
+    await expect(staleRequest).resolves.toEqual([makeSkill('stale')]);
+
+    await expect(service.listSkills()).resolves.toEqual([makeSkill('fresh')]);
+  });
+
+  it('coalesces a normal request behind an in-flight forced refresh', async () => {
+    const { service, fetchSkills } = createService(5_000);
+    let resolveForced!: (skills: SkillMetadata[]) => void;
+    fetchSkills.mockImplementationOnce(() => new Promise(resolve => {
+      resolveForced = resolve;
+    }));
+
+    const forcedRequest = service.listSkills({ forceReload: true });
+    const normalRequest = service.listSkills();
+
+    expect(fetchSkills).toHaveBeenCalledTimes(1);
+    expect(fetchSkills).toHaveBeenCalledWith(true, expect.any(AbortSignal));
+
+    resolveForced([makeSkill('fresh')]);
+    await expect(forcedRequest).resolves.toEqual([makeSkill('fresh')]);
+    await expect(normalRequest).resolves.toEqual([makeSkill('fresh')]);
+    await expect(service.listSkills()).resolves.toEqual([makeSkill('fresh')]);
+    expect(fetchSkills).toHaveBeenCalledTimes(1);
   });
 
   it('uses the launch spec target cwd when fetching skills from Codex', async () => {
@@ -174,5 +298,48 @@ describe('CodexSkillListingService', () => {
       cwds: ['/mnt/c/repo'],
       forceReload: true,
     });
+  });
+
+  it('stops an app-server skill listing when its caller aborts', async () => {
+    mockResolveLaunchSpec.mockReturnValue({
+      target: { method: 'host', platformFamily: 'unix', platformOs: 'linux' },
+      command: 'codex',
+      args: ['app-server', '--listen', 'stdio://'],
+      spawnCwd: '/workspace',
+      targetCwd: '/workspace',
+      env: {},
+      pathMapper: {
+        target: { method: 'host', platformFamily: 'unix', platformOs: 'linux' },
+        toTargetPath: jest.fn((value: string) => value),
+        toHostPath: jest.fn((value: string) => value),
+        mapTargetPathList: jest.fn(),
+        canRepresentHostPath: jest.fn(),
+      },
+    });
+    let rejectRequest!: (error: Error) => void;
+    mockTransportRequest.mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectRequest = reject;
+    }));
+    mockTransportDispose.mockImplementation(() => rejectRequest?.(new Error('aborted')));
+    const service = new CodexSkillListingService({
+      settings: {},
+      getResolvedProviderCliPath: jest.fn(),
+      getActiveEnvironmentVariables: jest.fn(),
+      app: {
+        vault: {
+          adapter: { basePath: '/workspace' },
+        },
+      },
+    } as any);
+    const abortController = new AbortController();
+
+    const listing = service.listSkills({ signal: abortController.signal });
+    await Promise.resolve();
+    abortController.abort();
+
+    await expect(listing).rejects.toThrow('aborted');
+    expect(abortController.signal.aborted).toBe(true);
+    expect(mockTransportDispose).toHaveBeenCalled();
+    expect(mockProcessShutdown).toHaveBeenCalledTimes(1);
   });
 });

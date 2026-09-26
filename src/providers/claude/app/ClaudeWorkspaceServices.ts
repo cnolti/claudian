@@ -1,93 +1,72 @@
-import { McpServerManager } from '../../../core/mcp/McpServerManager';
 import type { ProviderCommandCatalog } from '../../../core/providers/commands/ProviderCommandCatalog';
+import type { ProviderVaultEntryRepository } from '../../../core/providers/commands/ProviderVaultEntryRepository';
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
-import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
-  AppAgentManager,
-  AppAgentStorage,
-  AppMcpStorage,
-  AppPluginManager,
-  ProviderCliResolver,
+  ProviderCLIResolver,
   ProviderWorkspaceRegistration,
   ProviderWorkspaceServices,
 } from '../../../core/providers/types';
 import type { VaultFileAdapter } from '../../../core/storage/VaultFileAdapter';
-import { parseEnvironmentVariables } from '../../../utils/env';
-import { getVaultPath } from '../../../utils/path';
-import { AgentManager } from '../agents/AgentManager';
-import { ClaudeCommandCatalog } from '../commands/ClaudeCommandCatalog';
+import {
+  ClaudeCommandCatalog,
+  type CommandProbe,
+} from '../commands/ClaudeCommandCatalog';
 import { probeRuntimeCommands } from '../commands/probeRuntimeCommands';
-import { resolveClaudeConfigDir } from '../config/ClaudeConfigDir';
-import { PluginManager } from '../plugins/PluginManager';
-import { ClaudeCliResolver } from '../runtime/ClaudeCliResolver';
-import { StorageService } from '../storage/StorageService';
-import { claudeSettingsTabRenderer } from '../ui/ClaudeSettingsTab';
+import { ClaudeCLIResolver } from '../runtime/ClaudeCLIResolver';
+import { ClaudeModelCatalog } from '../runtime/ClaudeModelCatalog';
+import { createClaudeModels } from '../runtime/ClaudeModels';
+import { SkillStorage } from '../storage/SkillStorage';
+import { SlashCommandStorage } from '../storage/SlashCommandStorage';
+import { createClaudeSettingsTabRenderer } from '../ui/ClaudeSettingsTab';
 
 export interface ClaudeWorkspaceServices extends ProviderWorkspaceServices {
-  claudeStorage: StorageService;
-  cliResolver: ProviderCliResolver;
-  mcpStorage: AppMcpStorage;
-  mcpManager: McpServerManager;
-  pluginManager: AppPluginManager;
-  agentStorage: AppAgentStorage;
-  agentManager: AppAgentManager;
+  cliResolver: ProviderCLIResolver;
   commandCatalog: ProviderCommandCatalog;
-  agentMentionProvider: AppAgentManager;
+  vaultCommandRepository: ProviderVaultEntryRepository;
+  dispose(): Promise<void>;
+}
+
+export interface ClaudeWorkspaceServicesOptions {
+  readonly commandProbe?: CommandProbe;
+  readonly modelProbe?: ConstructorParameters<typeof ClaudeModelCatalog>[1];
 }
 
 export async function createClaudeWorkspaceServices(
   plugin: ProviderHost,
   adapter: VaultFileAdapter,
+  options: ClaudeWorkspaceServicesOptions = {},
 ): Promise<ClaudeWorkspaceServices> {
-  const claudeStorage = new StorageService(plugin, adapter);
-  await claudeStorage.ensureDirectories();
-
-  const cliResolver = new ClaudeCliResolver();
-  const mcpStorage = claudeStorage.mcp;
-  const mcpManager = new McpServerManager(mcpStorage);
-  await mcpManager.loadServers();
-
-  const vaultPath = getVaultPath(plugin.app) ?? '';
-  const getClaudeConfigDir = () => resolveClaudeConfigDir({
-    environment: {
-      ...process.env,
-      ...parseEnvironmentVariables(plugin.getActiveEnvironmentVariables('claude')),
-    },
-    hostPlatform: process.platform,
-    vaultPath,
-  });
-  const pluginManager = new PluginManager(
-    vaultPath,
-    claudeStorage.ccSettings,
-    getClaudeConfigDir,
-  );
-  await pluginManager.loadPlugins();
-
-  const agentStorage = claudeStorage.agents;
-  const agentManager = new AgentManager(vaultPath, pluginManager, getClaudeConfigDir);
-  await agentManager.loadAgents();
+  const cliResolver = new ClaudeCLIResolver();
+  const nativeCatalog = new ClaudeModelCatalog(plugin, options.modelProbe);
+  const modelCatalog = createClaudeModels(plugin, nativeCatalog);
 
   const commandCatalog = new ClaudeCommandCatalog(
-    claudeStorage.commands,
-    claudeStorage.skills,
-    () => probeRuntimeCommands(plugin),
+    new SlashCommandStorage(adapter),
+    new SkillStorage(adapter),
+    options.commandProbe ?? (signal => probeRuntimeCommands(plugin, signal)),
   );
+  const unregisterTransitionHook = plugin.executionLifecycleRegistry
+    .registerTransitionHook('claude', {
+      beforeTransition: async () => {
+        modelCatalog.beginTransition();
+        await nativeCatalog.cancel();
+        await commandCatalog.beginEnvironmentTransition();
+      },
+      afterTransition: () => { commandCatalog.endEnvironmentTransition(); modelCatalog.endTransition(); },
+    });
+  let disposePromise: Promise<void> | null = null;
 
   return {
-    claudeStorage,
     cliResolver,
-    mcpStorage,
-    mcpServerManager: mcpManager,
-    mcpManager,
-    pluginManager,
-    agentStorage,
-    agentManager,
     commandCatalog,
-    agentMentionProvider: agentManager,
-    settingsTabRenderer: claudeSettingsTabRenderer,
-    refreshAgentMentions: async () => {
-      await pluginManager.loadPlugins();
-      await agentManager.loadAgents();
+    vaultCommandRepository: commandCatalog,
+    settingsTabRenderer: createClaudeSettingsTabRenderer({ cliResolver, vaultCommandRepository: commandCatalog, modelCatalog }),
+    modelCatalog,
+    dispose() {
+      if (disposePromise) return disposePromise;
+      unregisterTransitionHook();
+      disposePromise = Promise.all([commandCatalog.dispose(), modelCatalog.dispose(), nativeCatalog.dispose()]).then(() => undefined);
+      return disposePromise;
     },
   };
 }
@@ -95,11 +74,3 @@ export async function createClaudeWorkspaceServices(
 export const claudeWorkspaceRegistration: ProviderWorkspaceRegistration<ClaudeWorkspaceServices> = {
   initialize: async ({ plugin, vaultAdapter }) => createClaudeWorkspaceServices(plugin, vaultAdapter),
 };
-
-export function maybeGetClaudeWorkspaceServices(): ClaudeWorkspaceServices | null {
-  return ProviderWorkspaceRegistry.getServices('claude') as ClaudeWorkspaceServices | null;
-}
-
-export function getClaudeWorkspaceServices(): ClaudeWorkspaceServices {
-  return ProviderWorkspaceRegistry.requireServices('claude') as ClaudeWorkspaceServices;
-}

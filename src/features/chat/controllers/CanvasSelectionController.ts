@@ -21,6 +21,7 @@ export class CanvasSelectionController {
   private contextTray: ComposerContextTray;
   private inputEl: HTMLElement;
   private onVisibilityChange: (() => void) | null;
+  private onUserSelectionChanged: (() => void) | null;
   private storedSelection: CanvasSelectionContext | null = null;
   private pollInterval: number | null = null;
 
@@ -28,17 +29,19 @@ export class CanvasSelectionController {
     app: App,
     contextTray: ComposerContextTray,
     inputEl: HTMLElement,
-    onVisibilityChange?: () => void
+    onVisibilityChange?: () => void,
+    onUserSelectionChanged?: () => void,
   ) {
     this.app = app;
     this.contextTray = contextTray;
     this.inputEl = inputEl;
     this.onVisibilityChange = onVisibilityChange ?? null;
+    this.onUserSelectionChanged = onUserSelectionChanged ?? null;
   }
 
   start(): void {
     if (this.pollInterval) return;
-    this.pollInterval = window.setInterval(() => this.poll(), CANVAS_POLL_INTERVAL);
+    this.pollInterval = window.setInterval(() => this.#poll(), CANVAS_POLL_INTERVAL);
   }
 
   stop(): void {
@@ -49,8 +52,8 @@ export class CanvasSelectionController {
     this.clear();
   }
 
-  private poll(): void {
-    const canvasView = this.getCanvasView();
+  #poll(): void {
+    const canvasView = this.#getCanvasView();
     if (!canvasView) return;
 
     const canvas = canvasView.canvas;
@@ -73,20 +76,22 @@ export class CanvasSelectionController {
       if (!sameSelection) {
         this.storedSelection = { canvasPath, nodeIds };
         this.updateIndicator();
+        this.onUserSelectionChanged?.();
       }
-    } else if (this.getActiveElement() !== this.inputEl) {
+    } else if (!this.inputEl.contains(this.#getActiveElement())) {
       if (this.storedSelection) {
         this.storedSelection = null;
         this.updateIndicator();
+        this.onUserSelectionChanged?.();
       }
     }
   }
 
-  private getActiveElement(): Element | null {
+  #getActiveElement(): Element | null {
     return this.inputEl.ownerDocument?.activeElement ?? null;
   }
 
-  private getCanvasView(): CanvasViewLike | null {
+  #getCanvasView(): CanvasViewLike | null {
     const activeLeaf = this.app.workspace.getMostRecentLeaf?.();
     const activeView = activeLeaf?.view as CanvasViewLike | undefined;
     if (activeView?.getViewType?.() === 'canvas' && activeView.file) {
@@ -110,7 +115,10 @@ export class CanvasSelectionController {
         label,
         icon: 'network',
         ariaLabel: label,
-        onRemove: () => this.clear(),
+        onRemove: () => {
+          this.clear();
+          this.onUserSelectionChanged?.();
+        },
       }]);
     } else {
       this.contextTray.clearItems('canvas-selection');

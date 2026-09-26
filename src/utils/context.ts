@@ -4,13 +4,9 @@
  * Note and context file formatting for prompts.
  */
 
-const LINKED_NOTE_TAG = 'linked_note';
-const NOTE_CONTEXT_TAG_PATTERN = '(linked_note|current_note)';
+import { escapePromptXMLAttribute, formatPromptXMLCdata } from './promptXML';
 
-// Matches note context at the START of prompt (legacy placement)
-const NOTE_CONTEXT_PREFIX_REGEX = new RegExp(`^<${NOTE_CONTEXT_TAG_PATTERN}>\\n[\\s\\S]*?<\\/\\1>\\n\\n`);
-// Matches note context at the END of prompt (current placement)
-const NOTE_CONTEXT_SUFFIX_REGEX = new RegExp(`\\n\\n<${NOTE_CONTEXT_TAG_PATTERN}>\\n[\\s\\S]*?<\\/\\1>$`);
+const LINKED_CONTENT_TAG = 'linked_content';
 
 /**
  * Pattern to match XML context tags appended to prompts.
@@ -18,27 +14,29 @@ const NOTE_CONTEXT_SUFFIX_REGEX = new RegExp(`\\n\\n<${NOTE_CONTEXT_TAG_PATTERN}
  * Matches: linked_note/current_note, editor_selection (with attributes), editor_cursor (with attributes),
  * context_files, canvas_selection, browser_selection
  */
-export const XML_CONTEXT_PATTERN = /\n\n<(?:linked_note|current_note|editor_selection|editor_cursor|context_files|canvas_selection|browser_selection)[\s>]/;
+const XML_CONTEXT_PATTERN = /\n\n<(?:linked_content|linked_note|current_note|editor_selection|editor_cursor|context_files|canvas_selection|browser_selection)[\s>]/;
 const BRACKET_CONTEXT_PATTERN = /\n\[(?:Current note|Editor selection from|Browser selection from|Canvas selection from)\b/;
 
-export function formatCurrentNote(notePath: string): string {
-  return `<${LINKED_NOTE_TAG}>\n${notePath}\n</${LINKED_NOTE_TAG}>`;
+export function formatLinkedContent(contentPath: string): string {
+  return `<${LINKED_CONTENT_TAG} path="${escapePromptXMLAttribute(contentPath)}" />`;
 }
 
-export function appendCurrentNote(prompt: string, notePath: string): string {
-  return `${prompt}\n\n${formatCurrentNote(notePath)}`;
+export function appendLinkedContent(prompt: string, contentPath: string): string {
+  return `${prompt}\n\n${formatLinkedContent(contentPath)}`;
 }
 
-/**
- * Strips note context from a prompt.
- * Handles legacy <current_note> tags and canonical <linked_note> tags.
- */
-export function stripCurrentNoteContext(prompt: string): string {
-  const strippedPrefix = prompt.replace(NOTE_CONTEXT_PREFIX_REGEX, '');
-  if (strippedPrefix !== prompt) {
-    return strippedPrefix;
-  }
-  return prompt.replace(NOTE_CONTEXT_SUFFIX_REGEX, '');
+export function formatLinkedContentBody(contentPath: string, content: string): string {
+  return `<${LINKED_CONTENT_TAG} path="${escapePromptXMLAttribute(contentPath)}">\n${formatPromptXMLCdata(
+    content,
+  )}\n</${LINKED_CONTENT_TAG}>`;
+}
+
+export function appendLinkedContentBody(
+  prompt: string,
+  contentPath: string,
+  content: string,
+): string {
+  return `${prompt}\n\n${formatLinkedContentBody(contentPath, content)}`;
 }
 
 /**
@@ -47,7 +45,7 @@ export function stripCurrentNoteContext(prompt: string): string {
  * 1. Legacy: content inside <query> tags
  * 2. Current: user content first, context XML appended after
  */
-export function extractContentBeforeXmlContext(text: string): string | undefined {
+function extractContentBeforeXMLContext(text: string): string | undefined {
   if (!text) return undefined;
 
   // Legacy format: content inside <query> tags
@@ -69,7 +67,7 @@ export function extractContentBeforeXmlContext(text: string): string | undefined
 export function extractUserDisplayContent(text: string): string | undefined {
   if (!text) return undefined;
 
-  const xmlDisplayContent = extractContentBeforeXmlContext(text);
+  const xmlDisplayContent = extractContentBeforeXMLContext(text);
   if (xmlDisplayContent !== undefined) {
     return xmlDisplayContent;
   }
@@ -93,14 +91,15 @@ export function extractUserQuery(prompt: string): string {
   if (!prompt) return '';
 
   // Try to extract content before XML context
-  const extracted = extractContentBeforeXmlContext(prompt);
+  const extracted = extractContentBeforeXMLContext(prompt);
   if (extracted !== undefined) {
     return extracted;
   }
 
   // No XML context - return the whole prompt stripped of any remaining tags
   return prompt
-    .replace(/<(linked_note|current_note)>[\s\S]*?<\/\1>\s*/g, '')
+    .replace(/<(?:linked_content|linked_note|current_note)(?:\s[^>]*)?\s*\/>\s*/g, '')
+    .replace(/<(linked_content|linked_note|current_note)(?:\s[^>]*)?>[\s\S]*?<\/\1>\s*/g, '')
     .replace(/<editor_selection[\s\S]*?<\/editor_selection>\s*/g, '')
     .replace(/<editor_cursor[\s\S]*?<\/editor_cursor>\s*/g, '')
     .replace(/<context_files>[\s\S]*?<\/context_files>\s*/g, '')
@@ -110,7 +109,10 @@ export function extractUserQuery(prompt: string): string {
 }
 
 function formatContextFilesLine(files: string[]): string {
-  return `<context_files>\n${files.join(', ')}\n</context_files>`;
+  const entries = files
+    .map(file => `<context_file path="${escapePromptXMLAttribute(file)}" />`)
+    .join('\n');
+  return `<context_files>\n${entries}\n</context_files>`;
 }
 
 export function appendContextFiles(prompt: string, files: string[]): string {

@@ -30,8 +30,19 @@ type ActiveListContext = Pick<ParagraphContext, 'blockquoteDepth' | 'listIndents
 interface MarkdownSegment {
   text: string;
   transformable: boolean;
+  fence?: MarkdownFenceOpening;
   rawHtml?: boolean;
   sealed?: boolean;
+  wikilink?: MarkdownWikilink;
+}
+
+export interface MarkdownFenceOpening {
+  info: string;
+  infoStart: number;
+}
+
+export interface MarkdownWikilink {
+  embedded: boolean;
 }
 
 interface InlineContinuation {
@@ -155,7 +166,7 @@ function startsNonParagraphBlock(content: string): boolean {
     || /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$/.test(content);
 }
 
-function startsInterruptingHtmlBlock(content: string): boolean {
+function startsInterruptingHTMLBlock(content: string): boolean {
   return RAW_HTML_TAG_PATTERN.test(content)
     || HTML_BLOCK_TAG_PATTERN.test(content)
     || /^ {0,3}(?:<!--|<\?|<![A-Za-z]|<!\[CDATA\[)/.test(content);
@@ -238,6 +249,37 @@ function appendSegment(
   } else {
     segments.push({ text, transformable, rawHtml });
   }
+}
+
+function appendFenceOpeningSegment(
+  segments: MarkdownSegment[],
+  line: string,
+  lineWithoutNewline: string,
+  fenceRun: FenceRun,
+): void {
+  const runStart = lineWithoutNewline.indexOf(fenceRun.run);
+  const infoStart = runStart + fenceRun.run.length;
+  segments.push({
+    text: line,
+    transformable: false,
+    fence: {
+      info: lineWithoutNewline.slice(infoStart),
+      infoStart,
+    },
+    sealed: true,
+  });
+}
+
+function appendWikilinkSegment(
+  segments: MarkdownSegment[],
+  text: string,
+  embedded: boolean,
+): void {
+  segments.push({
+    text,
+    transformable: false,
+    wikilink: { embedded },
+  });
 }
 
 function sealLastSegment(segments: MarkdownSegment[]): void {
@@ -340,7 +382,7 @@ function findInlineBlockEnd(
       || /^[ \t\r]*$/.test(blockContent)
       || getFenceRun(nextLine) !== null
       || startsNonParagraphBlock(blockContent)
-      || startsInterruptingHtmlBlock(blockContent)
+      || startsInterruptingHTMLBlock(blockContent)
     ) {
       return lineEnd;
     }
@@ -405,12 +447,12 @@ function findAutolinkEnd(line: string, start: number): number | null {
   return uri || email ? end : null;
 }
 
-function isAtHtmlBlockStart(markdown: string, start: number): boolean {
+function isAtHTMLBlockStart(markdown: string, start: number): boolean {
   const lineStart = markdown.lastIndexOf('\n', start - 1) + 1;
   return /^[ \t]*$/.test(parseContainerPrefix(markdown.slice(lineStart, start)).content);
 }
 
-function findHtmlEnd(line: string, start: number): number | null {
+function findHTMLEnd(line: string, start: number): number | null {
   const specialTerminators: Array<[string, string]> = [
     ['<!--', '-->'],
     ['<![CDATA[', ']]>'],
@@ -422,7 +464,7 @@ function findHtmlEnd(line: string, start: number): number | null {
       if (end !== -1) {
         return end + closer.length - 1;
       }
-      return isAtHtmlBlockStart(line, start) ? line.length - 1 : null;
+      return isAtHTMLBlockStart(line, start) ? line.length - 1 : null;
     }
   }
 
@@ -431,7 +473,7 @@ function findHtmlEnd(line: string, start: number): number | null {
     if (end !== -1) {
       return end;
     }
-    return isAtHtmlBlockStart(line, start) ? line.length - 1 : null;
+    return isAtHTMLBlockStart(line, start) ? line.length - 1 : null;
   }
 
   let index = start + 1;
@@ -529,14 +571,20 @@ function splitInlineMarkdown(
       continue;
     }
 
-    if (char === '[') {
-      const wikilinkEnd = findWikilinkEnd(line, index);
+    const embeddedWikilink = char === '!' && line.startsWith('![[', index);
+    if (embeddedWikilink || char === '[') {
+      const wikilinkStart = embeddedWikilink ? index + 1 : index;
+      const wikilinkEnd = findWikilinkEnd(line, wikilinkStart);
       if (wikilinkEnd !== null) {
         appendSegment(segments, line.slice(segmentStart, index), true);
-        appendSegment(segments, line.slice(index, wikilinkEnd + 1), false);
+        appendWikilinkSegment(
+          segments,
+          line.slice(index, wikilinkEnd + 1),
+          embeddedWikilink,
+        );
         segmentStart = wikilinkEnd + 1;
         index = wikilinkEnd;
-      } else if (!isBackslashEscaped(line, index)) {
+      } else if (char === '[' && !isBackslashEscaped(line, index)) {
         bracketDepth += 1;
       }
       continue;
@@ -566,7 +614,7 @@ function splitInlineMarkdown(
         continue;
       }
 
-      const sourceHtmlEnd = findHtmlEnd(markdown, lineStart + index);
+      const sourceHtmlEnd = findHTMLEnd(markdown, lineStart + index);
       const htmlEnd = sourceHtmlEnd === null ? null : sourceHtmlEnd - lineStart;
       if (htmlEnd !== null) {
         appendSegment(segments, line.slice(segmentStart, index), true);
@@ -743,7 +791,7 @@ function splitMarkdown(markdown: string): MarkdownSegment[] {
     const fenceRun = contextualFenceRun ?? getFenceRun(lineWithoutNewline);
     if (fenceRun) {
       paragraphContext = null;
-      appendSegment(segments, line, false);
+      appendFenceOpeningSegment(segments, line, lineWithoutNewline, fenceRun);
       fence = {
         marker: fenceRun.run[0] as '`' | '~',
         length: fenceRun.run.length,
@@ -798,7 +846,7 @@ function splitMarkdown(markdown: string): MarkdownSegment[] {
     inlineHtmlEnd = continuation.htmlEnd ?? null;
     inlineMathRunLength = continuation.mathRunLength ?? null;
     paragraphContext = startsNonParagraphBlock(blockContent)
-      || startsInterruptingHtmlBlock(blockContent)
+      || startsInterruptingHTMLBlock(blockContent)
       ? null
       : currentContext;
     lineStart = lineEnd;
@@ -808,8 +856,10 @@ function splitMarkdown(markdown: string): MarkdownSegment[] {
 }
 
 interface MarkdownTransforms {
+  fence?: (opener: string, fence: MarkdownFenceOpening) => string;
   text?: (text: string) => string;
   rawHtml?: (text: string) => string;
+  wikilink?: (wikilink: string, metadata: MarkdownWikilink) => string;
 }
 
 /** Applies targeted transforms while preserving protected Markdown syntax. */
@@ -819,6 +869,12 @@ export function transformMarkdownSegments(
 ): string {
   return splitMarkdown(markdown)
     .map(segment => {
+      if (segment.fence) {
+        return transforms.fence?.(segment.text, segment.fence) ?? segment.text;
+      }
+      if (segment.wikilink) {
+        return transforms.wikilink?.(segment.text, segment.wikilink) ?? segment.text;
+      }
       if (segment.rawHtml) {
         return transforms.rawHtml?.(segment.text) ?? segment.text;
       }

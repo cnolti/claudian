@@ -9,7 +9,7 @@ function createConversation(overrides: Partial<Conversation> = {}): Conversation
     providerId: 'claude',
     title: 'Conversation',
     createdAt: 1,
-    updatedAt: 1,
+    lastActivityAt: 1,
     sessionId: 'session-1',
     messages: [],
     ...overrides,
@@ -17,6 +17,35 @@ function createConversation(overrides: Partial<Conversation> = {}): Conversation
 }
 
 describe('ClaudeConversationHistoryService', () => {
+  describe('legacy conversation backup recovery', () => {
+    it('reads a matching safe session id from the metadata header', () => {
+      const content = [
+        JSON.stringify({
+          type: 'meta',
+          id: 'conversation-1',
+          sessionId: 'recovered-session',
+        }),
+        JSON.stringify({ type: 'message', message: { content: 'History' } }),
+      ].join('\r\n');
+
+      expect(historyStore.parseLegacyConversationSessionId(
+        content,
+        'conversation-1',
+      )).toBe('recovered-session');
+    });
+
+    it.each([
+      ['mismatched conversation', { type: 'meta', id: 'other', sessionId: 'session-1' }],
+      ['cleared session', { type: 'meta', id: 'conversation-1', sessionId: null }],
+      ['unsafe session', { type: 'meta', id: 'conversation-1', sessionId: '../session' }],
+    ])('rejects a %s header', (_label, header) => {
+      expect(historyStore.parseLegacyConversationSessionId(
+        JSON.stringify(header),
+        'conversation-1',
+      )).toBeNull();
+    });
+  });
+
   describe('getConversationSessionAvailability', () => {
     it('reports a missing native session', async () => {
       const availabilitySpy = jest.spyOn(historyStore, 'locateSDKSession')
@@ -32,19 +61,6 @@ describe('ClaudeConversationHistoryService', () => {
       availabilitySpy.mockRestore();
     });
 
-    it('reports an available native session', async () => {
-      const availabilitySpy = jest.spyOn(historyStore, 'locateSDKSession')
-        .mockResolvedValue({ availability: 'available', sessionPath: '/vault/session-1.jsonl' });
-      const service = new ClaudeConversationHistoryService();
-
-      await expect(service.getConversationSessionAvailability(
-        createConversation(),
-        '/vault',
-      )).resolves.toBe('available');
-
-      availabilitySpy.mockRestore();
-    });
-
     it('uses the effective SDK environment when locating a native session', async () => {
       const availabilitySpy = jest.spyOn(historyStore, 'locateSDKSession')
         .mockResolvedValue({ availability: 'available', sessionPath: '/custom/session-1.jsonl' });
@@ -54,29 +70,13 @@ describe('ClaudeConversationHistoryService', () => {
         vaultPath: '/vault',
       };
 
-      await service.getConversationSessionAvailability(
-        createConversation(),
-        '/vault',
-        pathContext,
-      );
-
-      expect(availabilitySpy).toHaveBeenCalledWith('/vault', 'session-1', pathContext);
-      availabilitySpy.mockRestore();
-    });
-
-    it('reports a native session from a previous vault path as relocated', async () => {
-      const availabilitySpy = jest.spyOn(historyStore, 'locateSDKSession')
-        .mockResolvedValue({
-          availability: 'relocated',
-          sessionPath: '/old-vault/session-1.jsonl',
-        });
-      const service = new ClaudeConversationHistoryService();
-
       await expect(service.getConversationSessionAvailability(
         createConversation(),
         '/vault',
-      )).resolves.toBe('relocated');
+        pathContext,
+      )).resolves.toBe('available');
 
+      expect(availabilitySpy).toHaveBeenCalledWith('/vault', 'session-1', pathContext);
       availabilitySpy.mockRestore();
     });
 
@@ -110,6 +110,124 @@ describe('ClaudeConversationHistoryService', () => {
       expect(availabilitySpy).toHaveBeenCalledWith('/vault', 'source-session');
 
       availabilitySpy.mockRestore();
+    });
+  });
+
+  describe('recoverConversationModelSelection', () => {
+    it('recovers the last model across transcript segments at the resume checkpoint', async () => {
+      const locationsSpy = jest.spyOn(historyStore, 'locateSDKSessions')
+        .mockResolvedValue(new Map([
+          ['session-previous', {
+            availability: 'available',
+            sessionPath: '/vault/session-previous.jsonl',
+          }],
+          ['session-current', {
+            availability: 'available',
+            sessionPath: '/vault/session-current.jsonl',
+          }],
+        ]));
+      const modelSpy = jest.spyOn(historyStore, 'loadSDKSessionModel')
+        .mockResolvedValueOnce('claude-sonnet-4-5')
+        .mockResolvedValueOnce('claude-opus-4-6');
+      const service = new ClaudeConversationHistoryService();
+      const conversation = createConversation({
+        sessionId: 'session-current',
+        resumeAtMessageId: 'assistant-checkpoint',
+        providerState: {
+          previousProviderSessionIds: ['session-previous'],
+          providerSessionId: 'session-current',
+        },
+      });
+
+      await expect(service.recoverConversationModelSelection(
+        conversation,
+        '/vault',
+      )).resolves.toBe('claude-code/claude-opus-4-6');
+      expect(modelSpy).toHaveBeenNthCalledWith(
+        1,
+        '/vault',
+        'session-previous',
+        undefined,
+        '/vault/session-previous.jsonl',
+        undefined,
+      );
+      expect(modelSpy).toHaveBeenNthCalledWith(
+        2,
+        '/vault',
+        'session-current',
+        'assistant-checkpoint',
+        '/vault/session-current.jsonl',
+        undefined,
+      );
+
+      locationsSpy.mockRestore();
+      modelSpy.mockRestore();
+    });
+
+    it('does not recover an older model when the current segment is unresolved', async () => {
+      const locationsSpy = jest.spyOn(historyStore, 'locateSDKSessions')
+        .mockResolvedValue(new Map([
+          ['session-previous', {
+            availability: 'available',
+            sessionPath: '/vault/session-previous.jsonl',
+          }],
+          ['session-current', {
+            availability: 'available',
+            sessionPath: '/vault/session-current.jsonl',
+          }],
+        ]));
+      const modelSpy = jest.spyOn(historyStore, 'loadSDKSessionModel')
+        .mockResolvedValueOnce('claude-sonnet-4-5')
+        .mockResolvedValueOnce(null);
+      const service = new ClaudeConversationHistoryService();
+      const conversation = createConversation({
+        sessionId: 'session-current',
+        resumeAtMessageId: 'missing-checkpoint',
+        providerState: {
+          previousProviderSessionIds: ['session-previous'],
+          providerSessionId: 'session-current',
+        },
+      });
+
+      await expect(service.recoverConversationModelSelection(
+        conversation,
+        '/vault',
+      )).resolves.toBeNull();
+
+      locationsSpy.mockRestore();
+      modelSpy.mockRestore();
+    });
+
+    it('does not recover an older model when the final preserved segment is unresolved', async () => {
+      const locationsSpy = jest.spyOn(historyStore, 'locateSDKSessions')
+        .mockResolvedValue(new Map([
+          ['session-older', {
+            availability: 'available',
+            sessionPath: '/vault/session-older.jsonl',
+          }],
+          ['session-newest', {
+            availability: 'available',
+            sessionPath: '/vault/session-newest.jsonl',
+          }],
+        ]));
+      const modelSpy = jest.spyOn(historyStore, 'loadSDKSessionModel')
+        .mockResolvedValueOnce('claude-sonnet-4-5')
+        .mockResolvedValueOnce(null);
+      const service = new ClaudeConversationHistoryService();
+      const conversation = createConversation({
+        sessionId: null,
+        providerState: {
+          previousProviderSessionIds: ['session-older', 'session-newest'],
+        },
+      });
+
+      await expect(service.recoverConversationModelSelection(
+        conversation,
+        '/vault',
+      )).resolves.toBeNull();
+
+      locationsSpy.mockRestore();
+      modelSpy.mockRestore();
     });
   });
 
@@ -227,6 +345,74 @@ describe('ClaudeConversationHistoryService', () => {
   });
 
   describe('hydrateConversationHistory', () => {
+    it('recovers an unlinked native transcript from the conversation timestamps', async () => {
+      const service = new ClaudeConversationHistoryService();
+      const conversation = createConversation({
+        sessionId: null,
+        providerState: undefined,
+        createdAt: 1_000,
+        lastActivityAt: 2_000,
+      });
+      const legacySpy = jest.spyOn(historyStore, 'readLegacyConversationSessionId')
+        .mockResolvedValue(null);
+      const recoverySpy = jest.spyOn(historyStore, 'recoverSDKSessionIdByTime')
+        .mockResolvedValue('recovered-session');
+
+      await expect(service.recoverConversationSessionReference(
+        conversation,
+        '/vault',
+      )).resolves.toBe(true);
+
+      expect(recoverySpy).toHaveBeenCalledWith('/vault', {
+        createdAt: 1_000,
+        lastActivityAt: 2_000,
+      });
+      expect(conversation).toMatchObject({
+        sessionId: 'recovered-session',
+        providerState: { providerSessionId: 'recovered-session' },
+      });
+
+      legacySpy.mockRestore();
+      recoverySpy.mockRestore();
+    });
+
+    it('recovers a cleared session pointer from the legacy conversation backup', async () => {
+      const service = new ClaudeConversationHistoryService();
+      const conversation = createConversation({
+        sessionId: null,
+        providerState: undefined,
+      });
+      const legacySpy = jest.spyOn(historyStore, 'readLegacyConversationSessionId')
+        .mockResolvedValue('recovered-session');
+      const locationSpy = jest.spyOn(historyStore, 'locateSDKSessions')
+        .mockResolvedValue(new Map([['recovered-session', {
+          availability: 'available',
+          sessionPath: '/vault/recovered-session.jsonl',
+        }]]));
+      const loadSpy = jest.spyOn(historyStore, 'loadSDKSessionMessages')
+        .mockResolvedValue({
+          messages: [{
+            id: 'recovered-message',
+            role: 'user',
+            content: 'Recovered',
+            timestamp: 1,
+          }],
+          skippedLines: 0,
+        });
+
+      await service.hydrateConversationHistory(conversation, '/vault');
+
+      expect(legacySpy).toHaveBeenCalledWith('/vault', conversation.id);
+      expect(conversation.providerState).toEqual({
+        previousProviderSessionIds: ['recovered-session'],
+      });
+      expect(conversation.messages.map(message => message.content)).toEqual(['Recovered']);
+
+      legacySpy.mockRestore();
+      locationSpy.mockRestore();
+      loadSpy.mockRestore();
+    });
+
     it('re-resolves history when the effective Claude config directory changes', async () => {
       const service = new ClaudeConversationHistoryService();
       const conversation = createConversation();
@@ -315,7 +501,8 @@ describe('ClaudeConversationHistoryService', () => {
       const loadSpy = jest.spyOn(historyStore, 'loadSDKSessionMessages')
         .mockResolvedValue({ messages: [], skippedLines: 0 });
 
-      await service.getConversationSessionAvailability(conversation, '/vault');
+      await expect(service.getConversationSessionAvailability(conversation, '/vault'))
+        .resolves.toBe('relocated');
       await service.getConversationSessionAvailability(conversation, '/vault');
       await service.hydrateConversationHistory(conversation, '/vault');
 
