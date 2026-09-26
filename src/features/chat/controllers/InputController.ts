@@ -49,6 +49,7 @@ import {
 } from '../rendering/InlineInteractionPrompts';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
 import { continueResponseAfterNotification } from '../rendering/ResponseContinuation';
+import { groupToolBlocks } from '../rendering/toolCallGrouping';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { SideChatController } from '../side-chat/SideChatController';
 import type { ChatState } from '../state/ChatState';
@@ -1375,6 +1376,8 @@ export class InputController {
       state.toolCallElements.clear();
     }
 
+    // Fork: the previous assistant message of this turn is complete; group it.
+    groupToolBlocks(state.currentContentEl);
     state.currentContentEl = contentEl;
     state.currentTextEl = null;
     state.currentTextContent = '';

@@ -47,6 +47,7 @@ import {
   renderStoredSubagent,
 } from './SubagentRenderer';
 import { renderStoredThinkingBlock } from './ThinkingBlockRenderer';
+import { groupToolBlocks } from './toolCallGrouping';
 import { renderStoredToolCall } from './ToolCallRenderer';
 import { createWelcomeElement } from './WelcomeRenderer';
 import { renderStoredWriteEdit } from './WriteEditRenderer';
@@ -328,6 +329,8 @@ export class MessageRenderer {
       if (msg.isInterrupt || hadLegacyInterruptIndicator) {
         this.appendInterruptIndicator(contentEl);
       }
+      // Fork: replayed messages get the same tool-call groups as live ones.
+      groupToolBlocks(contentEl);
     }
 
     this.#appendMessageTimestamp(msgEl, msg.role === 'user' ? msg.timestamp : msg.completedAt);
@@ -343,6 +346,8 @@ export class MessageRenderer {
     const msgEl = this.messagesEl.querySelector<HTMLElement>(`[data-message-id="${msg.id}"]`);
     const contentEl = msgEl?.querySelector<HTMLElement>('.claudian-message-content');
     if (!msgEl || !contentEl || msgEl.querySelector('.claudian-work')) return;
+    // Fork: final grouping pass before completed work collapses into history.
+    groupToolBlocks(contentEl);
 
     const blocks = msg.contentBlocks?.length
       ? msg.contentBlocks

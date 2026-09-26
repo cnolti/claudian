@@ -60,6 +60,7 @@ import {
   finalizeThinkingBlock,
   type ThinkingBlockState,
 } from '../rendering/ThinkingBlockRenderer';
+import { groupToolBlocks, STREAMING_TRAILING_VISIBLE } from '../rendering/toolCallGrouping';
 import {
   getToolName,
   getToolSummary,
@@ -553,6 +554,18 @@ export class StreamController {
     }
 
     state.pendingTools.clear();
+    this.#collapseStreamingToolRun();
+  }
+
+  /**
+   * Fork: keeps long uninterrupted tool runs tidy while streaming; everything
+   * but the newest few calls collapses into the (growing) group above.
+   */
+  #collapseStreamingToolRun(): void {
+    groupToolBlocks(this.deps.state.currentContentEl, {
+      keepTrailingOpen: true,
+      maxTrailingVisible: STREAMING_TRAILING_VISIBLE,
+    });
   }
 
   #flushPendingToolsBefore(toolId: string): void {
@@ -1045,6 +1058,8 @@ export class StreamController {
       }
     }
 
+    // Tool-only runs never flush pending tools; cap the visible run here too.
+    this.#collapseStreamingToolRun();
     this.showThinkingIndicator();
   }
 
@@ -1062,6 +1077,8 @@ export class StreamController {
       this.textRenderCoordinator.cancel();
       state.currentTextEl = state.currentContentEl.createDiv({ cls: 'claudian-text-block' });
       state.currentTextContent = '';
+      // Fork: a text block closes the preceding tool run; collapse it now.
+      groupToolBlocks(state.currentContentEl, { keepTrailingOpen: true });
     }
 
     state.currentTextContent += text;
@@ -1821,6 +1838,8 @@ export class StreamController {
     this.hideThinkingIndicator();
     const el = state.currentContentEl.createDiv({ cls: 'claudian-compact-boundary' });
     el.createSpan({ cls: 'claudian-compact-boundary-label', text: 'Conversation compacted' });
+    // Fork: the boundary closes the preceding tool run; collapse it now.
+    groupToolBlocks(state.currentContentEl, { keepTrailingOpen: true });
   }
 
   // ============================================

@@ -265,3 +265,87 @@
 .claudian-tool-result-item:last-child {
   margin-bottom: 0;
 }
+
+/* ============================================
+   Tool group (fork-only) - collapsed consecutive tool calls
+   ============================================ */
+.claudian-tool-group {
+  margin: 8px 0;
+}
+
+button.claudian-tool-group-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: auto;
+  padding: 4px 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  user-select: none;
+}
+
+button.claudian-tool-group-summary:hover,
+button.claudian-tool-group-summary:focus-visible,
+button.claudian-tool-group-summary:active {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+}
+
+button.claudian-tool-group-summary:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.claudian-tool-group-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-align: center;
+  transition: transform 150ms ease;
+}
+
+.claudian-tool-group.expanded .claudian-tool-group-chevron {
+  transform: rotate(90deg);
+}
+
+.claudian-tool-group-label {
+  font-family: var(--font-monospace);
+  font-size: 13px;
+}
+
+.claudian-tool-group-status {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  margin-inline-start: auto;
+  color: var(--color-green);
+}
+
+.claudian-tool-group-status.has-errors {
+  color: var(--color-red);
+}
+
+.claudian-tool-group-status svg {
+  width: 14px;
+  height: 14px;
+}
+
+.claudian-tool-group-content {
+  margin-inline-start: 7px;
+  padding-inline-start: 16px;
+  border-inline-start: 2px solid var(--background-modifier-border);
+}
+
+.claudian-tool-group-content[hidden] {
+  display: none;
+}
