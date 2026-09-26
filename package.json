@@ -27,7 +27,8 @@
     "test:coverage": "node scripts/run-jest.js --coverage",
     "preversion": "bun install --frozen-lockfile",
     "version": "node scripts/sync-version.js && git add manifest.json",
-    "test:cross-platform": "node scripts/run-cross-platform-tests.js"
+    "test:cross-platform": "node scripts/run-cross-platform-tests.js",
+    "deploy": "node scripts/deploy.mjs"
   },
   "keywords": [
     "claude-code",
