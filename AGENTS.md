@@ -45,6 +45,8 @@ This is the `cnolti/claudian` fork of `YishenTu/claudian`, re-ported onto upstre
 - **Branding/deploy**: manifest id stays `claudian` (upstream uses `realclaudian`); `npm run deploy` bumps the `-fork.N` version, builds, copies to the vault (`OBSIDIAN_VAULT` in `.env.local`), commits, and pushes to all non-upstream remotes (`--skip-bump`, `--skip-git`).
 - **Test locale**: `scripts/run-jest.js` pins `en_US.UTF-8` so `toLocaleString` assertions pass on German hosts.
 
+**Heartbeat is disabled in the vault since 2026-09-26** (`heartbeatEnabled: false`): launchd + `heartbeat.sh` is the only daemon scheduler (decision: the daemon must run without Obsidian; both paths shared `state.json` without a common lock). On the next upstream re-port, do NOT re-port the heartbeat runner/manager; at most keep a read-only status indicator that reads `.agentfiles/daemon/state.json`. This shrinks the fork surface.
+
 Retired with 2.3.4 because upstream now covers them: external-context merging (upstream removed external context, #1283) and the onunload runtime cleanup (`executionLifecycleRegistry.dispose()`).
 
 When merging upstream again, re-port this surface onto a fresh upstream base instead of conflict-merging, then land it on `main` via `merge -s ours` plus `git read-tree -u --reset <port-branch>`.
