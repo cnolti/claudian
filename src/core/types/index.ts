@@ -65,3 +65,14 @@ export {
   type ToolProviderPayload,
 } from './tools';
 export { createTurnStats, isTokenCount } from './turnStats';
+
+// Heartbeat (fork-only)
+export {
+  type HeartbeatHost,
+  type HeartbeatQueryRequest,
+  type HeartbeatQueryResult,
+  type HeartbeatQueryRunner,
+  type HeartbeatStatus,
+  type HeartbeatStatusListener,
+  type HeartbeatSummary,
+} from './heartbeat';

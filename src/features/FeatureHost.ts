@@ -8,6 +8,7 @@ import type {
   Conversation,
   ConversationMeta,
   ConversationMutablePatch,
+  HeartbeatHost,
   StoredChatModelSelection,
 } from '../core/types';
 
@@ -52,6 +53,8 @@ export interface FeatureHost {
   readonly settings: ClaudianSettings;
   readonly storage: SharedAppStorage;
   readonly warmExecutionPool: WarmExecutionLimitPort;
+  /** Heartbeat (fork-only) — app-owned background vault daemon. */
+  readonly heartbeat: HeartbeatHost;
 
   getMainAgentDynamicSystemPromptSections?(): Promise<readonly string[]>;
 

@@ -12,6 +12,7 @@ import { MarkdownView, Notice, Plugin, TFolder } from 'obsidian';
 
 import { ConversationRepository } from './app/conversations/ConversationRepository';
 import { SessionMetadataLoader } from './app/conversations/SessionMetadataLoader';
+import { HeartbeatManager } from './app/heartbeat/HeartbeatManager';
 import { ChatModelSelectionCoordinator } from './app/settings/ChatModelSelectionCoordinator';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './app/settings/defaultSettings';
 import { PinnedLinkedContentPathCoordinator } from './app/settings/PinnedLinkedContentPathCoordinator';
@@ -70,6 +71,7 @@ import { type InlineEditContext, InlineEditModal } from './features/inline-edit/
 import { ClaudianSettingTab } from './features/settings/ClaudianSettings';
 import { setLocale } from './i18n/i18n';
 import type { Locale } from './i18n/types';
+import { runClaudeHeartbeatQuery } from './providers/claude/heartbeat/runClaudeHeartbeatQuery';
 import { deleteLegacyMCPConfig } from './providers/claude/storage/LegacyMCPConfigCleanup';
 import { buildCursorContext } from './utils/editor';
 import { revealWorkspaceLeaf } from './utils/obsidianCompat';
@@ -84,6 +86,15 @@ export default class ClaudianPlugin extends Plugin {
   readonly warmExecutionPool = new WarmExecutionPool(
     () => this.settings?.maxWarmAgentProcesses ?? DEFAULT_MAX_WARM_AGENT_PROCESSES,
   );
+  // Heartbeat (fork-only): background vault daemon driven through Claude.
+  readonly heartbeat = new HeartbeatManager({
+    getSettings: () => this.settings,
+    getVaultPath: () => getVaultPath(this.app),
+    isAnyTabStreaming: () => this.getAllViews().some(view => (
+      view.getTabManager()?.getAllTabs().some(tab => tab.state.isStreaming) ?? false
+    )),
+    runQuery: request => runClaudeHeartbeatQuery(this.providerHost, request),
+  });
   private settingsCoordinator!: SettingsCoordinator<ClaudianSettings>;
   private chatModelSelectionCoordinator!: ChatModelSelectionCoordinator;
   private pinnedLinkedContentPaths!: PinnedLinkedContentPathCoordinator;
@@ -267,6 +278,9 @@ export default class ClaudianPlugin extends Plugin {
 
       this.settingsTab = new ClaudianSettingTab(this.app, this);
       this.addSettingTab(this.settingsTab);
+      if (this.settings.heartbeatEnabled) {
+        this.heartbeat.start();
+      }
       this.sessionMetadata.scheduleRemainingLoad();
       this.app.workspace.onLayoutReady(() => {
         if (this.isUnloading || this.modelMetadataMigration) return;
@@ -281,6 +295,7 @@ export default class ClaudianPlugin extends Plugin {
 
   onunload(): void {
     this.isUnloading = true;
+    this.heartbeat.destroy();
     this.modelMetadataMigrationAbort.abort();
     this.inlineEditSessions.dispose();
     this.sessionMetadata?.cancelScheduledLoad();

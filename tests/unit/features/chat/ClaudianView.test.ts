@@ -185,7 +185,12 @@ describe('ClaudianView tab controls', () => {
       handleTabClick: jest.fn(),
       handleTabClose: jest.fn(),
       persistTabWorkspaceState: jest.fn(),
-      plugin: {},
+      plugin: {
+        heartbeat: {
+          subscribe: jest.fn(() => jest.fn()),
+          getSummary: jest.fn(() => new Promise(() => undefined)),
+        },
+      },
       requestNewConversation,
       requestNewTab,
       toggleHistoryDropdown,
@@ -194,19 +199,23 @@ describe('ClaudianView tab controls', () => {
     const navContent = view.buildNavRowContent();
     const newTabButton = navContent.querySelector('.claudian-new-tab-btn')!;
     const newConversationButton = navContent.querySelector('.claudian-new-conversation-btn')!;
+    const heartbeatButton = navContent.querySelector('.claudian-heartbeat-status')!;
     const historyButton = navContent.querySelector('.claudian-history-container')!.children[0];
     const buttons = [newTabButton, newConversationButton, historyButton];
 
-    expect(buttons.map(button => button.tagName)).toEqual(['BUTTON', 'BUTTON', 'BUTTON']);
-    expect(buttons.map(button => button.getAttribute('type'))).toEqual([
+    expect([...buttons, heartbeatButton].map(button => button.tagName))
+      .toEqual(['BUTTON', 'BUTTON', 'BUTTON', 'BUTTON']);
+    expect([...buttons, heartbeatButton].map(button => button.getAttribute('type'))).toEqual([
+      'button',
       'button',
       'button',
       'button',
     ]);
-    expect(buttons.map(button => button.getAttribute('aria-label'))).toEqual([
+    expect([...buttons, heartbeatButton].map(button => button.getAttribute('aria-label'))).toEqual([
       'New tab',
       'New conversation',
       'Chat history',
+      'Heartbeat status',
     ]);
 
     buttons.forEach(button => button.click());

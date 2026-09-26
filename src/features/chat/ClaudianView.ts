@@ -38,6 +38,7 @@ import { commitProvisionalTab } from './tabs/TabLifecycle';
 import { TabManager } from './tabs/TabManager';
 import { refreshTabContextUsage } from './tabs/TabProviderState';
 import type { AssembledTabRuntime, TabId } from './tabs/types';
+import { HeartbeatStatusControl } from './ui/HeartbeatStatusControl';
 
 type LoadableView = {
   containerEl?: HTMLElement;
@@ -84,6 +85,7 @@ export class ClaudianView extends ItemView {
 
   // History elements
   private historyDropdown: HTMLElement | null = null;
+  private heartbeatStatus: HeartbeatStatusControl | null = null;
   private historyRenderAbortController: AbortController | null = null;
   private sessionSidebarEl: HTMLElement | null = null;
   private sidebarSurfaceTrackEl: HTMLElement | null = null;
@@ -458,6 +460,8 @@ export class ClaudianView extends ItemView {
   async onClose() {
     this.viewShutdownStarted = true;
     this.sessionBrowser.dispose();
+    this.heartbeatStatus?.dispose();
+    this.heartbeatStatus = null;
     const lifecycleRevision = (this.viewLifecycleRevision ?? 0) + 1;
     this.viewLifecycleRevision = lifecycleRevision;
     const tabManager = this.tabManager;
@@ -627,6 +631,9 @@ export class ClaudianView extends ItemView {
     setIcon(newBtn, 'square-pen');
     newBtn.setAttribute('aria-label', 'New conversation');
     newBtn.addEventListener('click', () => this.requestNewConversation());
+
+    this.heartbeatStatus?.dispose();
+    this.heartbeatStatus = new HeartbeatStatusControl(navActionsEl, this.plugin.heartbeat);
 
     // History dropdown
     const historyContainer = navActionsEl.createDiv({
@@ -2109,8 +2116,9 @@ export class ClaudianView extends ItemView {
     const activeDocument = this.containerEl.ownerDocument;
 
     // Document-level click to close dropdowns
-    this.registerDomEvent(activeDocument, 'click', () => {
+    this.registerDomEvent(activeDocument, 'click', (e) => {
       this.historyDropdown?.removeClass('visible');
+      this.heartbeatStatus?.handleDocumentClick(e.target);
     });
 
     // View scopes are the Obsidian-owned boundary for main-area tab hotkeys.

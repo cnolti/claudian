@@ -32,6 +32,14 @@ export const DEFAULT_CLAUDIAN_SETTINGS: ClaudianSettings = {
   },
   requireCommandOrControlEnterToSend: false,
 
+  heartbeatEnabled: false,
+  heartbeatIntervalMinutes: 15,
+  heartbeatMaxTurns: 8,
+  heartbeatModel: 'haiku',
+  heartbeatQuietStart: '22:00',
+  heartbeatQuietEnd: '06:00',
+  heartbeatPauseOnStreaming: true,
+
   locale: 'en',
 
   providerConfigs: getBuiltInProviderDefaultConfigs(),
